@@ -1,0 +1,6 @@
+numpy
+matplotlib
+pyrtlsdr
+pyadi-iio
+RPi.GPIO
+pyserial
