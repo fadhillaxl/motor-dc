@@ -410,6 +410,7 @@ def main():
         "\n=== DUAL TB6600 KEYBOARD STEPPER CONTROL ===\n"
         "Motor 1 (GPIO17/27/22): Arrow Left/Right atau A/D\n"
         "Motor 2 (GPIO23/24/25): Arrow Up/Down  atau W/S\n"
+        "Dual motor hold key  : U=++ , J=-- , H=-+ , K=+-\n"
         "Space            : Smooth stop kedua motor\n"
         "E                : Emergency stop kedua motor (latch)\n"
         "R                : Reset fault kedua motor\n"
@@ -450,6 +451,26 @@ def main():
                     last_hold_m2 = now
                 elif key in ("\x1b[B", "s", "S"):
                     motor_2.set_target_speed(-abs(command_speed))
+                    last_hold_m2 = now
+                elif key in ("u", "U"):
+                    motor_1.set_target_speed(abs(command_speed))
+                    motor_2.set_target_speed(abs(command_speed))
+                    last_hold_m1 = now
+                    last_hold_m2 = now
+                elif key in ("j", "J"):
+                    motor_1.set_target_speed(-abs(command_speed))
+                    motor_2.set_target_speed(-abs(command_speed))
+                    last_hold_m1 = now
+                    last_hold_m2 = now
+                elif key in ("h", "H"):
+                    motor_1.set_target_speed(-abs(command_speed))
+                    motor_2.set_target_speed(abs(command_speed))
+                    last_hold_m1 = now
+                    last_hold_m2 = now
+                elif key in ("k", "K"):
+                    motor_1.set_target_speed(abs(command_speed))
+                    motor_2.set_target_speed(-abs(command_speed))
+                    last_hold_m1 = now
                     last_hold_m2 = now
                 elif key == " ":
                     motor_1.stop_smooth()
