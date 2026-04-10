@@ -1,0 +1,7 @@
+# Core math/time dependencies for TLE tracking
+skyfield>=1.49
+
+# Raspberry Pi GPIO (install on Pi/Linux only)
+RPi.GPIO>=0.7.1; platform_system == "Linux"
+
+# tkinter is part of standard library (python3-tk package on Debian/Raspberry Pi OS)
