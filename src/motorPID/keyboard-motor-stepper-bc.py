@@ -338,25 +338,37 @@ class TB6600Stepper:
         self.enable_driver(False)
 
 
-def get_key(timeout_s: float = 0.02) -> str | None:
+def setup_keyboard_raw() -> tuple[int, list]:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
-        if not ready:
-            return None
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            # Tangkap sisa escape sequence panah jika tersedia.
-            for _ in range(2):
-                nxt_ready, _, _ = select.select([sys.stdin], [], [], 0.001)
-                if not nxt_ready:
-                    break
-                ch += sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    return ch
+    tty.setraw(fd)
+    return fd, old
+
+
+def restore_keyboard(fd: int, old: list):
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def get_key(fd: int, timeout_s: float = 0.02) -> str | None:
+    ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+    if not ready:
+        return None
+
+    ch = sys.stdin.read(1)
+    if ch != "\x1b":
+        return ch
+
+    # Robust untuk escape sequence (arrow keys), hindari pecah byte.
+    seq = ch
+    t_end = time.perf_counter() + 0.03
+    while time.perf_counter() < t_end:
+        nxt_ready, _, _ = select.select([sys.stdin], [], [], 0.001)
+        if not nxt_ready:
+            break
+        seq += sys.stdin.read(1)
+        if seq in ("\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"):
+            break
+    return seq
 
 
 def main():
@@ -390,7 +402,7 @@ def main():
 
     command_speed = 600.0
     last_report = 0.0
-    hold_timeout_s = 0.18
+    hold_timeout_s = 0.35
     last_hold_m1 = 0.0
     last_hold_m2 = 0.0
 
@@ -406,6 +418,7 @@ def main():
         "Q               : Quit\n"
     )
 
+    kb_fd, kb_old = setup_keyboard_raw()
     try:
         while True:
             now = time.time()
@@ -422,7 +435,7 @@ def main():
                 sys.stdout.flush()
                 last_report = now
 
-            key = get_key(timeout_s=0.02)
+            key = get_key(kb_fd, timeout_s=0.02)
             now = time.time()
 
             if key is not None:
@@ -480,6 +493,7 @@ def main():
     except Exception as exc:
         print(f"\nERROR runtime: {exc}")
     finally:
+        restore_keyboard(kb_fd, kb_old)
         print("\nShutdown controller...")
         motor_1.close()
         motor_2.close()
