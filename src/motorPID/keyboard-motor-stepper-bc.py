@@ -38,6 +38,7 @@ import sys
 import time
 import tty
 import termios
+import select
 import threading
 from dataclasses import dataclass
 
@@ -337,14 +338,22 @@ class TB6600Stepper:
         self.enable_driver(False)
 
 
-def get_key() -> str:
+def get_key(timeout_s: float = 0.02) -> str | None:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
+        ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+        if not ready:
+            return None
         ch = sys.stdin.read(1)
         if ch == "\x1b":
-            ch += sys.stdin.read(2)  # arrow key sequence
+            # Tangkap sisa escape sequence panah jika tersedia.
+            for _ in range(2):
+                nxt_ready, _, _ = select.select([sys.stdin], [], [], 0.001)
+                if not nxt_ready:
+                    break
+                ch += sys.stdin.read(1)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     return ch
@@ -381,6 +390,9 @@ def main():
 
     command_speed = 600.0
     last_report = 0.0
+    hold_timeout_s = 0.18
+    last_hold_m1 = 0.0
+    last_hold_m2 = 0.0
 
     print(
         "\n=== DUAL TB6600 KEYBOARD STEPPER CONTROL ===\n"
@@ -410,41 +422,59 @@ def main():
                 sys.stdout.flush()
                 last_report = now
 
-            key = get_key()
+            key = get_key(timeout_s=0.02)
+            now = time.time()
 
-            if key in ("\x1b[C", "d", "D"):
-                motor_1.set_target_speed(abs(command_speed))
-            elif key in ("\x1b[D", "a", "A"):
-                motor_1.set_target_speed(-abs(command_speed))
-            elif key in ("\x1b[A", "w", "W"):
-                motor_2.set_target_speed(abs(command_speed))
-            elif key in ("\x1b[B", "s", "S"):
-                motor_2.set_target_speed(-abs(command_speed))
-            elif key == " ":
+            if key is not None:
+                if key in ("\x1b[C", "d", "D"):
+                    motor_1.set_target_speed(abs(command_speed))
+                    last_hold_m1 = now
+                elif key in ("\x1b[D", "a", "A"):
+                    motor_1.set_target_speed(-abs(command_speed))
+                    last_hold_m1 = now
+                elif key in ("\x1b[A", "w", "W"):
+                    motor_2.set_target_speed(abs(command_speed))
+                    last_hold_m2 = now
+                elif key in ("\x1b[B", "s", "S"):
+                    motor_2.set_target_speed(-abs(command_speed))
+                    last_hold_m2 = now
+                elif key == " ":
+                    motor_1.stop_smooth()
+                    motor_2.stop_smooth()
+                    last_hold_m1 = 0.0
+                    last_hold_m2 = 0.0
+                elif key in ("e", "E"):
+                    motor_1.emergency_stop("Emergency stop keyboard")
+                    motor_2.emergency_stop("Emergency stop keyboard")
+                    last_hold_m1 = 0.0
+                    last_hold_m2 = 0.0
+                elif key in ("r", "R"):
+                    motor_1.reset_fault()
+                    motor_2.reset_fault()
+                elif key == "+":
+                    command_speed = min(cfg_m1.max_speed_sps, command_speed + 100.0)
+                elif key == "-":
+                    command_speed = max(50.0, command_speed - 100.0)
+                elif key == "1":
+                    motor_1.set_microstep(1); motor_2.set_microstep(1)
+                elif key == "2":
+                    motor_1.set_microstep(2); motor_2.set_microstep(2)
+                elif key == "3":
+                    motor_1.set_microstep(4); motor_2.set_microstep(4)
+                elif key == "4":
+                    motor_1.set_microstep(8); motor_2.set_microstep(8)
+                elif key == "5":
+                    motor_1.set_microstep(16); motor_2.set_microstep(16)
+                elif key in ("q", "Q"):
+                    break
+
+            # Mode hold-to-run: motor berhenti saat tombol arah tidak lagi terbaca.
+            if last_hold_m1 > 0.0 and (now - last_hold_m1) > hold_timeout_s:
                 motor_1.stop_smooth()
+                last_hold_m1 = 0.0
+            if last_hold_m2 > 0.0 and (now - last_hold_m2) > hold_timeout_s:
                 motor_2.stop_smooth()
-            elif key in ("e", "E"):
-                motor_1.emergency_stop("Emergency stop keyboard")
-                motor_2.emergency_stop("Emergency stop keyboard")
-            elif key in ("r", "R"):
-                motor_1.reset_fault()
-                motor_2.reset_fault()
-            elif key == "+":
-                command_speed = min(cfg_m1.max_speed_sps, command_speed + 100.0)
-            elif key == "-":
-                command_speed = max(50.0, command_speed - 100.0)
-            elif key == "1":
-                motor_1.set_microstep(1); motor_2.set_microstep(1)
-            elif key == "2":
-                motor_1.set_microstep(2); motor_2.set_microstep(2)
-            elif key == "3":
-                motor_1.set_microstep(4); motor_2.set_microstep(4)
-            elif key == "4":
-                motor_1.set_microstep(8); motor_2.set_microstep(8)
-            elif key == "5":
-                motor_1.set_microstep(16); motor_2.set_microstep(16)
-            elif key in ("q", "Q"):
-                break
+                last_hold_m2 = 0.0
     except KeyboardInterrupt:
         pass
     except Exception as exc:

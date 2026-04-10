@@ -511,25 +511,13 @@ def get_key_nonblocking(timeout: float = 0.05):
         return None
     ch = sys.stdin.read(1)
     if ch == "\x1b":
-        # Robust escape-sequence parsing untuk arrow keys terminal.
         seq = ch
-        t_end = time.time() + 0.02
-        while time.time() < t_end:
-            r2, _, _ = select.select([sys.stdin], [], [], 0.001)
-            if not r2:
-                break
+        r, _, _ = select.select([sys.stdin], [], [], 0.002)
+        if r:
             seq += sys.stdin.read(1)
-
-        # Normalisasi varian umum terminal:
-        # ESC [ A/B/C/D atau ESC O A/B/C/D
-        if seq.endswith("[A") or seq.endswith("OA"):
-            return "\x1b[A"
-        if seq.endswith("[B") or seq.endswith("OB"):
-            return "\x1b[B"
-        if seq.endswith("[C") or seq.endswith("OC"):
-            return "\x1b[C"
-        if seq.endswith("[D") or seq.endswith("OD"):
-            return "\x1b[D"
+        r, _, _ = select.select([sys.stdin], [], [], 0.002)
+        if r:
+            seq += sys.stdin.read(1)
         return seq
     return ch
 
@@ -1190,8 +1178,7 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2):
         print("  Up/W: EL+      Down/S: EL-")
         print("  +/- speed, Space stop, Q exit arrow mode")
         print("  Hold key to move; release auto-stop.\n")
-        # Lebih longgar agar tidak terasa "macet" pada key-repeat terminal.
-        idle_timeout = 0.35
+        idle_timeout = 0.15
         last_input_t = time.time()
         with RawTerminal():
             while True:
