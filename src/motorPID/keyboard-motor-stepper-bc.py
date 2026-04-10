@@ -38,7 +38,6 @@ import sys
 import time
 import tty
 import termios
-import select
 import threading
 from dataclasses import dataclass
 
@@ -338,37 +337,17 @@ class TB6600Stepper:
         self.enable_driver(False)
 
 
-def setup_keyboard_raw() -> tuple[int, list]:
+def get_key() -> str:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    tty.setraw(fd)
-    return fd, old
-
-
-def restore_keyboard(fd: int, old: list):
-    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def get_key(fd: int, timeout_s: float = 0.02) -> str | None:
-    ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
-    if not ready:
-        return None
-
-    ch = sys.stdin.read(1)
-    if ch != "\x1b":
-        return ch
-
-    # Robust untuk escape sequence (arrow keys), hindari pecah byte.
-    seq = ch
-    t_end = time.perf_counter() + 0.03
-    while time.perf_counter() < t_end:
-        nxt_ready, _, _ = select.select([sys.stdin], [], [], 0.001)
-        if not nxt_ready:
-            break
-        seq += sys.stdin.read(1)
-        if seq in ("\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"):
-            break
-    return seq
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            ch += sys.stdin.read(2)  # arrow key sequence
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ch
 
 
 def main():
@@ -402,15 +381,11 @@ def main():
 
     command_speed = 600.0
     last_report = 0.0
-    hold_timeout_s = 0.35
-    last_hold_m1 = 0.0
-    last_hold_m2 = 0.0
 
     print(
         "\n=== DUAL TB6600 KEYBOARD STEPPER CONTROL ===\n"
         "Motor 1 (GPIO17/27/22): Arrow Left/Right atau A/D\n"
         "Motor 2 (GPIO23/24/25): Arrow Up/Down  atau W/S\n"
-        "Dual motor hold key  : U=++ , J=-- , H=-+ , K=+-\n"
         "Space            : Smooth stop kedua motor\n"
         "E                : Emergency stop kedua motor (latch)\n"
         "R                : Reset fault kedua motor\n"
@@ -419,7 +394,6 @@ def main():
         "Q               : Quit\n"
     )
 
-    kb_fd, kb_old = setup_keyboard_raw()
     try:
         while True:
             now = time.time()
@@ -436,85 +410,46 @@ def main():
                 sys.stdout.flush()
                 last_report = now
 
-            key = get_key(kb_fd, timeout_s=0.02)
-            now = time.time()
+            key = get_key()
 
-            if key is not None:
-                if key in ("\x1b[C", "d", "D"):
-                    motor_1.set_target_speed(abs(command_speed))
-                    last_hold_m1 = now
-                elif key in ("\x1b[D", "a", "A"):
-                    motor_1.set_target_speed(-abs(command_speed))
-                    last_hold_m1 = now
-                elif key in ("\x1b[A", "w", "W"):
-                    motor_2.set_target_speed(abs(command_speed))
-                    last_hold_m2 = now
-                elif key in ("\x1b[B", "s", "S"):
-                    motor_2.set_target_speed(-abs(command_speed))
-                    last_hold_m2 = now
-                elif key in ("u", "U"):
-                    motor_1.set_target_speed(abs(command_speed))
-                    motor_2.set_target_speed(abs(command_speed))
-                    last_hold_m1 = now
-                    last_hold_m2 = now
-                elif key in ("j", "J"):
-                    motor_1.set_target_speed(-abs(command_speed))
-                    motor_2.set_target_speed(-abs(command_speed))
-                    last_hold_m1 = now
-                    last_hold_m2 = now
-                elif key in ("h", "H"):
-                    motor_1.set_target_speed(-abs(command_speed))
-                    motor_2.set_target_speed(abs(command_speed))
-                    last_hold_m1 = now
-                    last_hold_m2 = now
-                elif key in ("k", "K"):
-                    motor_1.set_target_speed(abs(command_speed))
-                    motor_2.set_target_speed(-abs(command_speed))
-                    last_hold_m1 = now
-                    last_hold_m2 = now
-                elif key == " ":
-                    motor_1.stop_smooth()
-                    motor_2.stop_smooth()
-                    last_hold_m1 = 0.0
-                    last_hold_m2 = 0.0
-                elif key in ("e", "E"):
-                    motor_1.emergency_stop("Emergency stop keyboard")
-                    motor_2.emergency_stop("Emergency stop keyboard")
-                    last_hold_m1 = 0.0
-                    last_hold_m2 = 0.0
-                elif key in ("r", "R"):
-                    motor_1.reset_fault()
-                    motor_2.reset_fault()
-                elif key == "+":
-                    command_speed = min(cfg_m1.max_speed_sps, command_speed + 100.0)
-                elif key == "-":
-                    command_speed = max(50.0, command_speed - 100.0)
-                elif key == "1":
-                    motor_1.set_microstep(1); motor_2.set_microstep(1)
-                elif key == "2":
-                    motor_1.set_microstep(2); motor_2.set_microstep(2)
-                elif key == "3":
-                    motor_1.set_microstep(4); motor_2.set_microstep(4)
-                elif key == "4":
-                    motor_1.set_microstep(8); motor_2.set_microstep(8)
-                elif key == "5":
-                    motor_1.set_microstep(16); motor_2.set_microstep(16)
-                elif key in ("q", "Q"):
-                    break
-
-            # Mode hold-to-run: motor berhenti saat tombol arah tidak lagi terbaca.
-            if last_hold_m1 > 0.0 and (now - last_hold_m1) > hold_timeout_s:
+            if key in ("\x1b[C", "d", "D"):
+                motor_1.set_target_speed(abs(command_speed))
+            elif key in ("\x1b[D", "a", "A"):
+                motor_1.set_target_speed(-abs(command_speed))
+            elif key in ("\x1b[A", "w", "W"):
+                motor_2.set_target_speed(abs(command_speed))
+            elif key in ("\x1b[B", "s", "S"):
+                motor_2.set_target_speed(-abs(command_speed))
+            elif key == " ":
                 motor_1.stop_smooth()
-                last_hold_m1 = 0.0
-            if last_hold_m2 > 0.0 and (now - last_hold_m2) > hold_timeout_s:
                 motor_2.stop_smooth()
-                last_hold_m2 = 0.0
+            elif key in ("e", "E"):
+                motor_1.emergency_stop("Emergency stop keyboard")
+                motor_2.emergency_stop("Emergency stop keyboard")
+            elif key in ("r", "R"):
+                motor_1.reset_fault()
+                motor_2.reset_fault()
+            elif key == "+":
+                command_speed = min(cfg_m1.max_speed_sps, command_speed + 100.0)
+            elif key == "-":
+                command_speed = max(50.0, command_speed - 100.0)
+            elif key == "1":
+                motor_1.set_microstep(1); motor_2.set_microstep(1)
+            elif key == "2":
+                motor_1.set_microstep(2); motor_2.set_microstep(2)
+            elif key == "3":
+                motor_1.set_microstep(4); motor_2.set_microstep(4)
+            elif key == "4":
+                motor_1.set_microstep(8); motor_2.set_microstep(8)
+            elif key == "5":
+                motor_1.set_microstep(16); motor_2.set_microstep(16)
+            elif key in ("q", "Q"):
+                break
     except KeyboardInterrupt:
         pass
     except Exception as exc:
         print(f"\nERROR runtime: {exc}")
     finally:
-        restore_keyboard(kb_fd, kb_old)
         print("\nShutdown controller...")
         motor_1.close()
         motor_2.close()
