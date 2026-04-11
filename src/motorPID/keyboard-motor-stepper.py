@@ -678,28 +678,26 @@ class SimGuiApp:
         self.ent_az_offset.insert(0, f"{self.cfg_m1.az_offset_deg:.2f}")
         self.ent_az_offset.pack(side=tk.LEFT, padx=2)
 
-        tk.Label(cal, text="SW AZ-").pack(side=tk.LEFT, padx=(10, 2))
-        self.ent_az_min = tk.Entry(cal, width=6)
+        limit_row = tk.Frame(self.content)
+        limit_row.pack(pady=2, fill="x")
+        tk.Label(limit_row, text="Limit Switch Location (deg)", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(8, 12))
+        tk.Label(limit_row, text="AZ min").pack(side=tk.LEFT, padx=(2, 2))
+        self.ent_az_min = tk.Entry(limit_row, width=7)
         self.ent_az_min.insert(0, str(self.cfg_m1.soft_limit_min_deg if self.cfg_m1.soft_limit_min_deg is not None else 0))
         self.ent_az_min.pack(side=tk.LEFT, padx=2)
-        tk.Button(cal, text="Set AZ- Now", command=self._set_az_min_now).pack(side=tk.LEFT, padx=2)
-        tk.Label(cal, text="SW AZ+").pack(side=tk.LEFT, padx=(6, 2))
-        self.ent_az_max = tk.Entry(cal, width=6)
+        tk.Label(limit_row, text="AZ max").pack(side=tk.LEFT, padx=(8, 2))
+        self.ent_az_max = tk.Entry(limit_row, width=7)
         self.ent_az_max.insert(0, str(self.cfg_m1.soft_limit_max_deg if self.cfg_m1.soft_limit_max_deg is not None else 360))
         self.ent_az_max.pack(side=tk.LEFT, padx=2)
-        tk.Button(cal, text="Set AZ+ Now", command=self._set_az_max_now).pack(side=tk.LEFT, padx=2)
-
-        tk.Label(cal, text="SW EL-").pack(side=tk.LEFT, padx=(10, 2))
-        self.ent_el_min = tk.Entry(cal, width=6)
+        tk.Label(limit_row, text="EL min").pack(side=tk.LEFT, padx=(8, 2))
+        self.ent_el_min = tk.Entry(limit_row, width=7)
         self.ent_el_min.insert(0, str(self.cfg_m2.soft_limit_min_deg if self.cfg_m2.soft_limit_min_deg is not None else 0))
         self.ent_el_min.pack(side=tk.LEFT, padx=2)
-        tk.Button(cal, text="Set EL- Now", command=self._set_el_min_now).pack(side=tk.LEFT, padx=2)
-        tk.Label(cal, text="SW EL+").pack(side=tk.LEFT, padx=(6, 2))
-        self.ent_el_max = tk.Entry(cal, width=6)
+        tk.Label(limit_row, text="EL max").pack(side=tk.LEFT, padx=(8, 2))
+        self.ent_el_max = tk.Entry(limit_row, width=7)
         self.ent_el_max.insert(0, str(self.cfg_m2.soft_limit_max_deg if self.cfg_m2.soft_limit_max_deg is not None else 90))
         self.ent_el_max.pack(side=tk.LEFT, padx=2)
-        tk.Button(cal, text="Set EL+ Now", command=self._set_el_max_now).pack(side=tk.LEFT, padx=2)
-        tk.Button(cal, text="Apply SW Position", command=self._apply_limit_offset).pack(side=tk.LEFT, padx=8)
+        tk.Button(limit_row, text="Apply Limit Degrees", command=self._apply_limit_offset).pack(side=tk.LEFT, padx=10)
 
         self.lbl_status = tk.Label(self.content, text="", justify="left", font=("Consolas", 11))
         self.lbl_status.pack(pady=6)
@@ -951,30 +949,10 @@ class SimGuiApp:
                     if self.sat_az is not None and self.sat_el is not None
                     else f"SAT: {self.selected_sat_name} | AZ: - | EL: -"
                 )
-                + "  [Limit/Offset applied]"
+                + "  [Limit switch degree applied]"
             )
         except Exception as exc:
             self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [ERROR: {exc}]")
-
-    def _set_az_min_now(self):
-        v = self.motor_1.get_position_deg()
-        self.ent_az_min.delete(0, tk.END)
-        self.ent_az_min.insert(0, f"{v:.2f}")
-
-    def _set_az_max_now(self):
-        v = self.motor_1.get_position_deg()
-        self.ent_az_max.delete(0, tk.END)
-        self.ent_az_max.insert(0, f"{v:.2f}")
-
-    def _set_el_min_now(self):
-        v = self.motor_2.get_position_deg()
-        self.ent_el_min.delete(0, tk.END)
-        self.ent_el_min.insert(0, f"{v:.2f}")
-
-    def _set_el_max_now(self):
-        v = self.motor_2.get_position_deg()
-        self.ent_el_max.delete(0, tk.END)
-        self.ent_el_max.insert(0, f"{v:.2f}")
 
     def _toggle_tracking(self):
         self._set_tracking(not self.tracking_enabled)
