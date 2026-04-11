@@ -619,15 +619,29 @@ class SimGuiApp:
         self.root = tk.Tk()
         self.root.title("Rotator Stepper Simulation (NEMA23 + TB6600)")
         self.root.geometry("860x560")
+        self.root.minsize(760, 420)
+
+        # Scrollable container untuk semua elemen GUI.
+        self.scroll_canvas = tk.Canvas(self.root, highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(self.root, orient="vertical", command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.content = tk.Frame(self.scroll_canvas)
+        self.content_window = self.scroll_canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._on_content_configure)
+        self.scroll_canvas.bind("<Configure>", self._on_canvas_configure)
+        self._bind_mousewheel()
 
         self.lbl_title = tk.Label(
-            self.root,
+            self.content,
             text="Konfigurasi: NEMA23 | TB6600 | Microstep 2 (400 pulse/rev) | Current 2.0A",
             font=("Arial", 12, "bold"),
         )
         self.lbl_title.pack(pady=8)
 
-        tle_frame = tk.Frame(self.root)
+        tle_frame = tk.Frame(self.content)
         tle_frame.pack(pady=4, fill="x")
         tk.Label(tle_frame, text="Search TLE:").pack(side=tk.LEFT, padx=4)
         self.ent_search = tk.Entry(tle_frame, width=24)
@@ -648,16 +662,16 @@ class SimGuiApp:
         self.ent_alt.insert(0, "50")
         self.ent_alt.pack(side=tk.LEFT, padx=2)
 
-        self.lst_tle = tk.Listbox(self.root, height=5)
+        self.lst_tle = tk.Listbox(self.content, height=5)
         self.lst_tle.pack(fill="x", padx=10, pady=4)
         self.lst_tle.bind("<<ListboxSelect>>", self._on_select_tle)
 
-        self.lbl_sat = tk.Label(self.root, text="SAT: - | AZ: - | EL: -", font=("Consolas", 11, "bold"))
+        self.lbl_sat = tk.Label(self.content, text="SAT: - | AZ: - | EL: -", font=("Consolas", 11, "bold"))
         self.lbl_sat.pack(pady=4)
-        self.btn_track = tk.Button(self.root, text="TRACK: OFF", width=14, command=self._toggle_tracking, bg="#5a5a5a", fg="white")
+        self.btn_track = tk.Button(self.content, text="TRACK: OFF", width=14, command=self._toggle_tracking, bg="#5a5a5a", fg="white")
         self.btn_track.pack(pady=4)
 
-        cal = tk.Frame(self.root)
+        cal = tk.Frame(self.content)
         cal.pack(pady=4, fill="x")
         tk.Label(cal, text="AZ offset (deg)").pack(side=tk.LEFT, padx=(8, 2))
         self.ent_az_offset = tk.Entry(cal, width=8)
@@ -687,13 +701,13 @@ class SimGuiApp:
         tk.Button(cal, text="Set EL+ Now", command=self._set_el_max_now).pack(side=tk.LEFT, padx=2)
         tk.Button(cal, text="Apply SW Position", command=self._apply_limit_offset).pack(side=tk.LEFT, padx=8)
 
-        self.lbl_status = tk.Label(self.root, text="", justify="left", font=("Consolas", 11))
+        self.lbl_status = tk.Label(self.content, text="", justify="left", font=("Consolas", 11))
         self.lbl_status.pack(pady=6)
 
-        self.canvas = tk.Canvas(self.root, width=820, height=260, bg="#101820")
+        self.canvas = tk.Canvas(self.content, width=820, height=260, bg="#101820")
         self.canvas.pack(pady=6)
 
-        ctrl = tk.Frame(self.root)
+        ctrl = tk.Frame(self.content)
         ctrl.pack(pady=8)
         btn_az_ccw = tk.Button(ctrl, text="AZ CCW (A/←)", width=14)
         btn_az_ccw.grid(row=0, column=0, padx=4, pady=4)
@@ -721,7 +735,7 @@ class SimGuiApp:
         tk.Button(ctrl, text="+ SPEED", width=10, command=self._speed_up).grid(row=1, column=3, padx=4, pady=4)
         tk.Button(ctrl, text="- SPEED", width=10, command=self._speed_down).grid(row=1, column=4, padx=4, pady=4)
 
-        ms = tk.Frame(self.root)
+        ms = tk.Frame(self.content)
         ms.pack()
         tk.Label(ms, text="Microstep:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=8)
         for label, val in [("1", 1), ("2", 2), ("4", 4), ("8", 8), ("16", 16)]:
@@ -760,6 +774,32 @@ class SimGuiApp:
         self.root.protocol("WM_DELETE_WINDOW", self.root.quit)
         self._load_tle()
         self._update_ui()
+
+    def _on_content_configure(self, _event):
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        # Biar lebar konten mengikuti lebar viewport canvas.
+        self.scroll_canvas.itemconfig(self.content_window, width=event.width)
+
+    def _bind_mousewheel(self):
+        # Windows/macOS
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Linux/X11
+        self.root.bind_all("<Button-4>", self._on_mousewheel_linux_up)
+        self.root.bind_all("<Button-5>", self._on_mousewheel_linux_down)
+
+    def _on_mousewheel(self, event):
+        # event.delta biasanya kelipatan 120 (Windows) atau nilai kecil (macOS).
+        step = int(-1 * (event.delta / 120)) if event.delta else 0
+        if step != 0:
+            self.scroll_canvas.yview_scroll(step, "units")
+
+    def _on_mousewheel_linux_up(self, _event):
+        self.scroll_canvas.yview_scroll(-1, "units")
+
+    def _on_mousewheel_linux_down(self, _event):
+        self.scroll_canvas.yview_scroll(1, "units")
 
     def _load_tle(self):
         q = self.ent_search.get().strip()
