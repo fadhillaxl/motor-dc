@@ -42,6 +42,7 @@ import termios
 import threading
 import argparse
 import json
+import os
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -1329,7 +1330,8 @@ def main():
         soft_limit_max_deg=90.0,
     )
 
-    use_sim = args.sim or (not GPIO_AVAILABLE)
+    # --sim-gui semestinya selalu jalan di mode simulator.
+    use_sim = args.sim or args.sim_gui or (not GPIO_AVAILABLE)
     use_sim_gui = args.sim_gui
     if use_sim:
         motor_1 = SimStepper(cfg_m1, "AZ")
@@ -1346,7 +1348,9 @@ def main():
             run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2)
         elif use_sim and use_sim_gui:
             if not TK_AVAILABLE:
-                raise RuntimeError("tkinter tidak tersedia. Install tkinter atau gunakan --sim.")
+                raise RuntimeError("tkinter tidak tersedia. Install tkinter atau jalankan tanpa --sim-gui.")
+            if not os.environ.get("DISPLAY"):
+                raise RuntimeError("DISPLAY tidak terdeteksi. Jalankan dari desktop Raspberry Pi atau pakai X11 forwarding.")
             app = SimGuiApp(motor_1, motor_2, cfg_m1, cfg_m2)
             app.run()
         elif use_sim:
