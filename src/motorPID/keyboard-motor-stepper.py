@@ -46,6 +46,7 @@ import os
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from az_ls_utils import az_ls_allows_motion, validate_az_ls
 try:
     import tkinter as tk
     TK_AVAILABLE = True
@@ -111,6 +112,8 @@ class StepperConfig:
     soft_limit_max_deg: float | None = 360.0
     az_wrap_enabled: bool = False  # False: tidak boleh lintas 0/360 (sesuai rotator non-continous)
     az_offset_deg: float = 0.0     # Kalibrasi azimuth terhadap Utara kompas
+    az_ls_deg: float = 0.0         # 0=full range, non-zero=blok jika lintas titik AZ LS
+    az_ls_block_crossing: bool = False  # Default: AZ LS sebagai referensi, bukan hard-stop
 
 
 class TB6600Stepper:
@@ -133,6 +136,7 @@ class TB6600Stepper:
                 "Gunakan mode simulasi: python keyboard-motor-stepper.py --sim"
             )
         self.cfg = cfg
+        self.cfg.az_ls_deg = validate_az_ls(self.cfg.az_ls_deg)
         self._lock = threading.Lock()
         self._run = True
         self._fault_latched = False
@@ -284,6 +288,18 @@ class TB6600Stepper:
             return True
         return False
 
+    def _az_ls_reached(self, current_deg: float, next_deg: float, moving_positive: bool) -> bool:
+        if not self.cfg.az_ls_block_crossing:
+            return False
+        if az_ls_allows_motion(current_deg, next_deg, self.cfg.az_ls_deg):
+            return False
+        with self._lock:
+            self._current_speed_sps = 0.0
+            if (moving_positive and self._target_speed_sps > 0) or ((not moving_positive) and self._target_speed_sps < 0):
+                self._target_speed_sps = 0.0
+            self._fault_msg = f"AZ LS boundary reached at {self.cfg.az_ls_deg:.2f} deg"
+        return True
+
     def _set_direction(self, cw: bool):
         out = cw if self.cfg.dir_active_high else (not cw)
         self._set_output(self.cfg.dir_pin, out)
@@ -348,6 +364,7 @@ class TB6600Stepper:
 
             # Prediksi posisi berikut untuk soft-limit
             step_delta_full = (1.0 / float(microstep)) * (1.0 if cw else -1.0)
+            current_deg = (self.get_position_steps() / self.cfg.steps_per_rev) * 360.0
             next_deg = ((self.get_position_steps() + step_delta_full) / self.cfg.steps_per_rev) * 360.0
             if self._soft_limit_reached(next_deg):
                 with self._lock:
@@ -355,6 +372,8 @@ class TB6600Stepper:
                     # blok hanya arah yang melanggar soft-limit
                     if (cw and self._target_speed_sps > 0) or ((not cw) and self._target_speed_sps < 0):
                         self._target_speed_sps = 0.0
+                continue
+            if self._az_ls_reached(current_deg, next_deg, cw):
                 continue
 
             try:
@@ -382,6 +401,7 @@ class SimStepper:
 
     def __init__(self, cfg: StepperConfig, name: str = "SIM"):
         self.cfg = cfg
+        self.cfg.az_ls_deg = validate_az_ls(self.cfg.az_ls_deg)
         self.name = name
         self._lock = threading.Lock()
         self._run = True
@@ -459,6 +479,20 @@ class SimStepper:
             return True
         return False
 
+    def _check_az_ls(self, current_deg: float, next_deg: float):
+        if not self.cfg.az_ls_block_crossing:
+            return False
+        if az_ls_allows_motion(current_deg, next_deg, self.cfg.az_ls_deg):
+            return False
+        with self._lock:
+            self._current_speed_sps = 0.0
+            if self._target_speed_sps > 0:
+                self._target_speed_sps = 0.0
+            elif self._target_speed_sps < 0:
+                self._target_speed_sps = 0.0
+            self._fault_msg = f"AZ LS boundary reached at {self.cfg.az_ls_deg:.2f} deg"
+        return True
+
     def _loop(self):
         last_t = time.perf_counter()
         while self._run:
@@ -481,8 +515,9 @@ class SimStepper:
             # Integrasi posisi berbasis kecepatan pulse/s
             if abs(spd) > 1e-3:
                 step_delta_full = (spd * dt) / float(ms)
+                current_deg = (self.get_position_steps() / self.cfg.steps_per_rev) * 360.0
                 next_deg = ((self.get_position_steps() + step_delta_full) / self.cfg.steps_per_rev) * 360.0
-                if not self._check_soft_limit(next_deg):
+                if not self._check_soft_limit(next_deg) and not self._check_az_ls(current_deg, next_deg):
                     with self._lock:
                         self._position_full_steps += step_delta_full
             time.sleep(0.001)
@@ -609,6 +644,7 @@ class SimGuiApp:
         self.selected_sat_name = "-"
         self.sat_az = None
         self.sat_el = None
+        self.az_ls_deg = 36.0
         self.ts = load.timescale() if SKYFIELD_AVAILABLE else None
         self.tracking_enabled = False
         self._pid_state = {
@@ -681,21 +717,17 @@ class SimGuiApp:
         limit_row = tk.Frame(self.content)
         limit_row.pack(pady=2, fill="x")
         tk.Label(limit_row, text="Limit Switch Location (deg)", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(8, 12))
-        tk.Label(limit_row, text="AZ min").pack(side=tk.LEFT, padx=(2, 2))
-        self.ent_az_min = tk.Entry(limit_row, width=7)
-        self.ent_az_min.insert(0, str(self.cfg_m1.soft_limit_min_deg if self.cfg_m1.soft_limit_min_deg is not None else 0))
-        self.ent_az_min.pack(side=tk.LEFT, padx=2)
-        tk.Label(limit_row, text="AZ max").pack(side=tk.LEFT, padx=(8, 2))
-        self.ent_az_max = tk.Entry(limit_row, width=7)
-        self.ent_az_max.insert(0, str(self.cfg_m1.soft_limit_max_deg if self.cfg_m1.soft_limit_max_deg is not None else 360))
-        self.ent_az_max.pack(side=tk.LEFT, padx=2)
+        tk.Label(limit_row, text="AZ LS ref").pack(side=tk.LEFT, padx=(2, 2))
+        self.ent_az_ls = tk.Entry(limit_row, width=7)
+        self.ent_az_ls.insert(0, "36")
+        self.ent_az_ls.pack(side=tk.LEFT, padx=2)
         tk.Label(limit_row, text="EL min").pack(side=tk.LEFT, padx=(8, 2))
         self.ent_el_min = tk.Entry(limit_row, width=7)
-        self.ent_el_min.insert(0, str(self.cfg_m2.soft_limit_min_deg if self.cfg_m2.soft_limit_min_deg is not None else 0))
+        self.ent_el_min.insert(0, "0")
         self.ent_el_min.pack(side=tk.LEFT, padx=2)
         tk.Label(limit_row, text="EL max").pack(side=tk.LEFT, padx=(8, 2))
         self.ent_el_max = tk.Entry(limit_row, width=7)
-        self.ent_el_max.insert(0, str(self.cfg_m2.soft_limit_max_deg if self.cfg_m2.soft_limit_max_deg is not None else 90))
+        self.ent_el_max.insert(0, "90")
         self.ent_el_max.pack(side=tk.LEFT, padx=2)
         tk.Button(limit_row, text="Apply Limit Degrees", command=self._apply_limit_offset).pack(side=tk.LEFT, padx=10)
 
@@ -929,18 +961,17 @@ class SimGuiApp:
     def _apply_limit_offset(self):
         try:
             az_offset = float(self.ent_az_offset.get().strip())
-            az_min = float(self.ent_az_min.get().strip())
-            az_max = float(self.ent_az_max.get().strip())
+            az_ls = validate_az_ls(float(self.ent_az_ls.get().strip()))
             el_min = float(self.ent_el_min.get().strip())
             el_max = float(self.ent_el_max.get().strip())
-            if az_min >= az_max:
-                raise ValueError("SW AZ- harus lebih kecil dari SW AZ+")
             if el_min >= el_max:
-                raise ValueError("SW EL- harus lebih kecil dari SW EL+")
+                raise ValueError("EL min must be < EL max")
 
             self.cfg_m1.az_offset_deg = az_offset
-            self.cfg_m1.soft_limit_min_deg = az_min
-            self.cfg_m1.soft_limit_max_deg = az_max
+            self.az_ls_deg = az_ls
+            self.cfg_m1.az_ls_deg = az_ls
+            self.cfg_m1.soft_limit_min_deg = 0.0
+            self.cfg_m1.soft_limit_max_deg = 360.0
             self.cfg_m2.soft_limit_min_deg = el_min
             self.cfg_m2.soft_limit_max_deg = el_max
             self.lbl_sat.config(
@@ -949,7 +980,7 @@ class SimGuiApp:
                     if self.sat_az is not None and self.sat_el is not None
                     else f"SAT: {self.selected_sat_name} | AZ: - | EL: -"
                 )
-                + "  [Limit switch degree applied]"
+                + f"  [AZ LS ref={self.az_ls_deg:.2f} deg applied]"
             )
         except Exception as exc:
             self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [ERROR: {exc}]")

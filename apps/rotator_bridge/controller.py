@@ -1,5 +1,17 @@
 import time
 import threading
+import os
+import sys
+
+
+def _get_repo_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _add_motorpid_to_path():
+    motorpid_dir = os.path.join(_get_repo_root(), "src", "motorPID")
+    if motorpid_dir not in sys.path:
+        sys.path.insert(0, motorpid_dir)
 
 class MotorController:
     def __init__(self, mock=True):
@@ -44,3 +56,43 @@ class MotorController:
                         self._el = self._target_el
                 else:
                     pass
+
+
+class AdaptivePIDBridgeController:
+    """
+    Adapter agar rotctl_server bisa memakai AdaptiveStepperController.
+    """
+
+    def __init__(self, sim=False, imu_port=None, config_path=None):
+        _add_motorpid_to_path()
+        from AdaptivePID import AdaptiveStepperController, load_config_stepper
+
+        if config_path is None:
+            config_path = os.path.join(_get_repo_root(), "src", "motorPID", "config-stepper.conf")
+
+        az_cfg, el_cfg, ls_cfg = load_config_stepper(config_path)
+        self._ctl = AdaptiveStepperController(
+            use_sim=bool(sim),
+            imu_port=imu_port,
+            ls_cfg=ls_cfg,
+            az_cfg=az_cfg,
+            el_cfg=el_cfg,
+        )
+        self._thread = threading.Thread(
+            target=self._ctl.run,
+            kwargs={"enable_keyboard": False, "status_output": False},
+            daemon=True,
+        )
+        self._thread.start()
+
+    def set_target(self, az: float, el: float):
+        self._ctl.set_target(az, el)
+
+    def get_position(self):
+        return self._ctl.get_position()
+
+    def stop(self):
+        self._ctl.stop()
+
+    def close(self):
+        self._ctl.close()
