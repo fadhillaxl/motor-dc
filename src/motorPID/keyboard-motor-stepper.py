@@ -1414,7 +1414,7 @@ class SimGuiApp:
         self.selected_sat_name = "-"
         self.sat_az = None
         self.sat_el = None
-        self.az_ls_deg = 36.0
+        self.az_ls_deg = 0.0
         self.ts = load.timescale() if SKYFIELD_AVAILABLE else None
         self.tracking_enabled = False
         self._pid_state = {
@@ -1489,7 +1489,7 @@ class SimGuiApp:
         tk.Label(limit_row, text="Limit Switch Location (deg)", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(8, 12))
         tk.Label(limit_row, text="AZ LS ref").pack(side=tk.LEFT, padx=(2, 2))
         self.ent_az_ls = tk.Entry(limit_row, width=7)
-        self.ent_az_ls.insert(0, "36")
+        self.ent_az_ls.insert(0, "0")
         self.ent_az_ls.pack(side=tk.LEFT, padx=2)
         tk.Label(limit_row, text="EL min").pack(side=tk.LEFT, padx=(8, 2))
         self.ent_el_min = tk.Entry(limit_row, width=7)
@@ -2314,8 +2314,10 @@ def main():
         microstep=2,   # sesuai konfigurasi: microstep 2/A
         max_speed_sps=2200.0,
         accel_sps2=3000.0,
-        soft_limit_min_deg=0.0,
-        soft_limit_max_deg=360.0,
+        # Default AZ dibuka full-rotation; batasi via perintah "limit az" jika diperlukan.
+        soft_limit_min_deg=None,
+        soft_limit_max_deg=None,
+        az_wrap_enabled=True,
     )
     # Motor 2 (sesuai mapping user)
     cfg_m2 = StepperConfig(
@@ -2447,6 +2449,7 @@ def main():
                 "\n=== DUAL TB6600 KEYBOARD STEPPER CONTROL ===\n"
                 "Motor 1 (GPIO17/27/22): Arrow Left/Right atau A/D\n"
                 "Motor 2 (GPIO23/24/25): Arrow Up/Down  atau W/S\n"
+                "AZ default: full rotation (tanpa soft-limit)\n"
                 "Space            : Smooth stop kedua motor\n"
                 "E                : Emergency stop kedua motor (latch)\n"
                 "R                : Reset fault kedua motor\n"
