@@ -172,7 +172,7 @@ if __name__ == "__main__":
     if platform.system().lower() == "linux":
         device.serialConfig.portName = "/dev/ttyUSB0"
     else:
-        device.serialConfig.portName = "COM82"
+        device.serialConfig.portName = "/dev/tty.usbserial-1330"
     device.serialConfig.baud = 9600
     device.openDevice()
 
