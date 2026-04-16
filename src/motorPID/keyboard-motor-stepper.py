@@ -1361,6 +1361,7 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sim", action="store_true", help="Jalankan mode simulasi UI (tanpa GPIO)")
+    parser.add_argument("--gui", action="store_true", help="Jalankan GUI (bisa hardware atau simulasi)")
     parser.add_argument("--sim-gui", action="store_true", help="Jalankan simulasi GUI (window)")
     parser.add_argument("--cli", action="store_true", help="Run interactive CLI mode")
     args = parser.parse_args()
@@ -1390,9 +1391,10 @@ def main():
         soft_limit_max_deg=90.0,
     )
 
-    # --sim-gui semestinya selalu jalan di mode simulator.
+    # --sim-gui tetap memaksa mode simulator (kompatibilitas).
+    # --gui hanya mengaktifkan window; mode motor ditentukan oleh use_sim.
     use_sim = args.sim or args.sim_gui or (not GPIO_AVAILABLE)
-    use_sim_gui = args.sim_gui
+    use_gui = args.gui or args.sim_gui
     if use_sim:
         motor_1 = SimStepper(cfg_m1, "AZ")
         motor_2 = SimStepper(cfg_m2, "EL")
@@ -1406,9 +1408,9 @@ def main():
     try:
         if args.cli:
             run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2)
-        elif use_sim and use_sim_gui:
+        elif use_gui:
             if not TK_AVAILABLE:
-                raise RuntimeError("tkinter tidak tersedia. Install tkinter atau jalankan tanpa --sim-gui.")
+                raise RuntimeError("tkinter tidak tersedia. Install tkinter atau jalankan tanpa --gui/--sim-gui.")
             if not os.environ.get("DISPLAY"):
                 raise RuntimeError("DISPLAY tidak terdeteksi. Jalankan dari desktop Raspberry Pi atau pakai X11 forwarding.")
             app = SimGuiApp(motor_1, motor_2, cfg_m1, cfg_m2)

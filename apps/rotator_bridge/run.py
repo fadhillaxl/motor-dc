@@ -9,6 +9,7 @@ import sys
 import termios
 import threading
 import time
+import types
 import tty
 
 from rotctl_server import RotctlServer
@@ -30,6 +31,23 @@ def _default_imu_port() -> str:
 
 def _load_legacy_keyboard_module():
     path = os.path.join(_repo_root(), "src", "motorPID", "keyboard-motor-stepper.py")
+    motorpid_dir = os.path.dirname(path)
+    if motorpid_dir not in sys.path:
+        sys.path.insert(0, motorpid_dir)
+    if sys.version_info < (3, 10):
+        mod_name = "keyboard_motor_stepper"
+        mod = types.ModuleType(mod_name)
+        mod.__name__ = mod_name
+        mod.__file__ = path
+        mod.__package__ = ""
+        sys.modules[mod_name] = mod
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        # Python <3.10: avoid runtime evaluation of PEP604 annotations (int | None).
+        src = "from __future__ import annotations\n" + src
+        code = compile(src, path, "exec")
+        exec(code, mod.__dict__)
+        return mod
     spec = importlib.util.spec_from_file_location("keyboard_motor_stepper", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load legacy module from {path}")
