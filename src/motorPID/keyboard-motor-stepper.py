@@ -1389,12 +1389,22 @@ def tle_extract_lines(item: dict):
 
 
 class SimGuiApp:
-    def __init__(self, motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | None = None):
+    def __init__(
+        self,
+        motor_1,
+        motor_2,
+        cfg_m1,
+        cfg_m2,
+        imu_reader: WT901Reader | None = None,
+        imu_hold_ctrl: ImuAzElPositionController | None = None,
+    ):
         self.motor_1 = motor_1
         self.motor_2 = motor_2
         self.cfg_m1 = cfg_m1
         self.cfg_m2 = cfg_m2
         self.imu_reader = imu_reader
+        self.imu_hold_ctrl = imu_hold_ctrl
+        self.imu_hold_enabled = imu_hold_ctrl is not None
         self.command_speed = 600.0
         self.az_pos_pressed = False
         self.az_neg_pressed = False
@@ -1524,6 +1534,10 @@ class SimGuiApp:
         tk.Button(ctrl, text="RESET", width=10, command=self._reset).grid(row=1, column=2, padx=4, pady=4)
         tk.Button(ctrl, text="+ SPEED", width=10, command=self._speed_up).grid(row=1, column=3, padx=4, pady=4)
         tk.Button(ctrl, text="- SPEED", width=10, command=self._speed_down).grid(row=1, column=4, padx=4, pady=4)
+        self.btn_imu_hold = tk.Button(ctrl, text="IMU HOLD: OFF", width=14, command=self._toggle_imu_hold, bg="#5a5a5a", fg="white")
+        self.btn_imu_hold.grid(row=2, column=0, padx=4, pady=4)
+        tk.Button(ctrl, text="IMU ZERO", width=10, command=self._imu_zero).grid(row=2, column=1, padx=4, pady=4)
+        tk.Button(ctrl, text="HOLD HERE", width=10, command=self._imu_hold_here).grid(row=2, column=2, padx=4, pady=4)
 
         ms = tk.Frame(self.content)
         ms.pack()
@@ -1560,8 +1574,11 @@ class SimGuiApp:
         self.root.bind("r", lambda e: self._reset())
         self.root.bind("+", lambda e: self._speed_up())
         self.root.bind("-", lambda e: self._speed_down())
+        self.root.bind("z", lambda e: self._imu_zero())
+        self.root.bind("Z", lambda e: self._imu_zero())
 
         self.root.protocol("WM_DELETE_WINDOW", self.root.quit)
+        self._refresh_imu_hold_button()
         self._load_tle()
         self._update_ui()
 
@@ -1652,6 +1669,17 @@ class SimGuiApp:
             self.sat_el = None
 
     def _press_axis(self, axis: str):
+        if self.imu_hold_enabled and self.imu_hold_ctrl is not None:
+            step = max(0.05, float(self.imu_hold_ctrl.cfg.nudge_step_deg))
+            if axis == "az_pos":
+                self.imu_hold_ctrl.nudge_target("az", +step)
+            elif axis == "az_neg":
+                self.imu_hold_ctrl.nudge_target("az", -step)
+            elif axis == "el_pos":
+                self.imu_hold_ctrl.nudge_target("el", +step)
+            elif axis == "el_neg":
+                self.imu_hold_ctrl.nudge_target("el", -step)
+            return
         # Manual override otomatis mematikan tracking.
         if self.tracking_enabled:
             self._set_tracking(False)
@@ -1693,6 +1721,9 @@ class SimGuiApp:
             self.motor_2.stop_smooth()
 
     def _smooth_stop(self):
+        if self.imu_hold_enabled and self.imu_hold_ctrl is not None:
+            self.imu_hold_ctrl.hold_current()
+            return
         self.az_pos_pressed = False
         self.az_neg_pressed = False
         self.el_pos_pressed = False
@@ -1754,6 +1785,8 @@ class SimGuiApp:
             self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [ERROR: {exc}]")
 
     def _toggle_tracking(self):
+        if self.imu_hold_enabled:
+            self._set_imu_hold(False)
         self._set_tracking(not self.tracking_enabled)
 
     def _set_tracking(self, enabled: bool):
@@ -1769,6 +1802,46 @@ class SimGuiApp:
             self.btn_track.config(text="TRACK: OFF", bg="#5a5a5a")
             self.motor_1.stop_smooth()
             self.motor_2.stop_smooth()
+
+    def _refresh_imu_hold_button(self):
+        if self.imu_hold_ctrl is None:
+            self.btn_imu_hold.config(text="IMU HOLD: N/A", bg="#777777", state=tk.DISABLED)
+            return
+        if self.imu_hold_enabled:
+            self.btn_imu_hold.config(text="IMU HOLD: ON", bg="#0b8f3a", state=tk.NORMAL)
+        else:
+            self.btn_imu_hold.config(text="IMU HOLD: OFF", bg="#5a5a5a", state=tk.NORMAL)
+
+    def _set_imu_hold(self, enabled: bool):
+        if self.imu_hold_ctrl is None:
+            self.imu_hold_enabled = False
+            self._refresh_imu_hold_button()
+            return
+        self.imu_hold_enabled = bool(enabled)
+        if self.imu_hold_enabled:
+            self._set_tracking(False)
+            self.imu_hold_ctrl.hold_current()
+        else:
+            self.motor_1.stop_smooth()
+            self.motor_2.stop_smooth()
+        self._refresh_imu_hold_button()
+
+    def _toggle_imu_hold(self):
+        self._set_imu_hold(not self.imu_hold_enabled)
+
+    def _imu_zero(self):
+        if self.imu_hold_ctrl is None:
+            return
+        try:
+            self.imu_hold_ctrl.calibrate_zero_reference()
+            self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [IMU zeroed]")
+        except Exception as exc:
+            self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [IMU zero error: {exc}]")
+
+    def _imu_hold_here(self):
+        if self.imu_hold_ctrl is None:
+            return
+        self.imu_hold_ctrl.hold_current()
 
     def _az_shortest_error(self, target_deg: float, current_deg: float) -> float:
         # Jika rotator tidak bisa muter bebas 360, jangan gunakan shortest-wrap.
@@ -1874,6 +1947,9 @@ class SimGuiApp:
         az_disp = st1["position_deg"] % 360.0
         self._calc_selected_az_el()
         self._tracking_step()
+        imu_hold_row = None
+        if self.imu_hold_enabled and self.imu_hold_ctrl is not None:
+            imu_hold_row = self.imu_hold_ctrl.update()
         fault = ""
         if st1["fault_latched"] or st2["fault_latched"]:
             fault = f"\nFAULT: {st1['fault_msg']} {st2['fault_msg']}"
@@ -1895,11 +1971,21 @@ class SimGuiApp:
         if self.imu_reader is not None:
             imu = self.imu_reader.get_latest_dict()
             if imu:
+                taz = tel = 0.0
+                if self.imu_hold_ctrl is not None:
+                    taz, tel = self.imu_hold_ctrl.get_targets_rel()
+                hold_txt = "OFF"
+                if self.imu_hold_ctrl is not None:
+                    hold_txt = "ON" if self.imu_hold_enabled else "OFF"
+                extra = ""
+                if imu_hold_row and imu_hold_row.get("dropout"):
+                    extra = f" DROP={imu_hold_row.get('reason', '-')}"
                 self.lbl_status.config(
                     text=self.lbl_status.cget("text")
                     + (
                         f"\nIMU AZ={imu['azimuth_deg']:.2f}° EL={imu['elevation_deg']:.2f}° "
                         f"HDG={imu['compass_deg']:.2f}° T={imu['temperature_c']:.1f}C"
+                        f" | IMU-HOLD={hold_txt} TGTrel AZ={taz:.2f} EL={tel:.2f}{extra}"
                     )
                 )
         self._draw_rotator(st1, st2)
@@ -2282,7 +2368,7 @@ def main():
                 raise RuntimeError("tkinter tidak tersedia. Install tkinter atau jalankan tanpa --gui/--sim-gui.")
             if not os.environ.get("DISPLAY"):
                 raise RuntimeError("DISPLAY tidak terdeteksi. Jalankan dari desktop Raspberry Pi atau pakai X11 forwarding.")
-            app = SimGuiApp(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader=imu_reader)
+            app = SimGuiApp(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader=imu_reader, imu_hold_ctrl=imu_hold_ctrl)
             app.run()
         elif use_sim:
             with RawTerminal():
