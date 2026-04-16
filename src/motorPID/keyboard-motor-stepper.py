@@ -1241,6 +1241,25 @@ def clear_screen():
     sys.stdout.flush()
 
 
+def command_el_with_bounds(motor_2, command_speed: float, direction: int, el_min: float = 0.0, el_max: float = 90.0):
+    """
+    Keyboard EL command with explicit 0..90 boundary guard.
+    direction: +1 (up), -1 (down), 0 (stop)
+    """
+    if direction == 0:
+        motor_2.stop_smooth()
+        return
+    st2 = motor_2.get_status()
+    cur_el = float(st2["position_deg"])
+    if direction > 0 and cur_el >= el_max - 1e-3:
+        motor_2.stop_smooth()
+        return
+    if direction < 0 and cur_el <= el_min + 1e-3:
+        motor_2.stop_smooth()
+        return
+    motor_2.set_target_speed(float(direction) * abs(float(command_speed)))
+
+
 def draw_sim_ui(st1, st2, command_speed):
     clear_screen()
     az_disp = st1["position_deg"] % 360.0
@@ -1730,12 +1749,14 @@ class SimGuiApp:
         else:
             self.motor_1.stop_smooth()
 
+        el_min = 0.0 if self.cfg_m2.soft_limit_min_deg is None else float(self.cfg_m2.soft_limit_min_deg)
+        el_max = 90.0 if self.cfg_m2.soft_limit_max_deg is None else float(self.cfg_m2.soft_limit_max_deg)
         if self.el_pos_pressed and not self.el_neg_pressed:
-            self.motor_2.set_target_speed(spd)
+            command_el_with_bounds(self.motor_2, spd, +1, el_min=el_min, el_max=el_max)
         elif self.el_neg_pressed and not self.el_pos_pressed:
-            self.motor_2.set_target_speed(-spd)
+            command_el_with_bounds(self.motor_2, spd, -1, el_min=el_min, el_max=el_max)
         else:
-            self.motor_2.stop_smooth()
+            command_el_with_bounds(self.motor_2, spd, 0, el_min=el_min, el_max=el_max)
 
     def _smooth_stop(self):
         if self.imu_hold_enabled and self.imu_hold_ctrl is not None:
@@ -1981,12 +2002,13 @@ class SimGuiApp:
         imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
         if imu:
             az_disp = float(imu["azimuth_deg"]) % 360.0
-            el_disp = float(imu["elevation_deg"])
-            pose_src = "IMU"
+            pose_src = "IMU_AZ/MOTOR_EL"
         else:
             az_disp = st1["position_deg"] % 360.0
-            el_disp = st2["position_deg"]
             pose_src = "MOTOR"
+        # EL visual feedback untuk keyboard control harus mengikuti motor axis,
+        # bukan IMU pitch yang bisa offset/stagnan terhadap mekanik.
+        el_disp = float(st2["position_deg"])
         self._calc_selected_az_el()
         self._tracking_step()
         imu_hold_row = None
@@ -2128,12 +2150,11 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
         imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
         if imu:
             az_disp = float(imu["azimuth_deg"]) % 360.0
-            el_disp = float(imu["elevation_deg"])
-            pose_src = "IMU"
+            pose_src = "IMU_AZ/MOTOR_EL"
         else:
             az_disp = st1["position_deg"] % 360.0
-            el_disp = st2["position_deg"]
             pose_src = "MOTOR"
+        el_disp = st2["position_deg"]
         saz, sel = sat_az_el()
         sat_txt = f"{selected_sat_name} AZ={saz:.2f} EL={sel:.2f}" if saz is not None and sel is not None else selected_sat_name
         print(f"M1(AZ) pos={az_disp:.2f} spd={st1['current_speed_sps']:.1f} tgt={st1['target_speed_sps']:.1f}")
@@ -2182,9 +2203,9 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
                 elif key in ("\x1b[D", "a", "A"):
                     motor_1.set_target_speed(-abs(command_speed))
                 elif key in ("\x1b[A", "w", "W"):
-                    motor_2.set_target_speed(abs(command_speed))
+                    command_el_with_bounds(motor_2, command_speed, +1, el_min=0.0, el_max=90.0)
                 elif key in ("\x1b[B", "s", "S"):
-                    motor_2.set_target_speed(-abs(command_speed))
+                    command_el_with_bounds(motor_2, command_speed, -1, el_min=0.0, el_max=90.0)
                 elif key == " ":
                     motor_1.stop_smooth(); motor_2.stop_smooth()
                 elif key == "+":
@@ -2458,9 +2479,9 @@ def main():
                     elif key in ("\x1b[D", "a", "A"):
                         motor_1.set_target_speed(-abs(command_speed))
                     elif key in ("\x1b[A", "w", "W"):
-                        motor_2.set_target_speed(abs(command_speed))
+                        command_el_with_bounds(motor_2, command_speed, +1, el_min=0.0, el_max=90.0)
                     elif key in ("\x1b[B", "s", "S"):
-                        motor_2.set_target_speed(-abs(command_speed))
+                        command_el_with_bounds(motor_2, command_speed, -1, el_min=0.0, el_max=90.0)
                     elif key == " ":
                         motor_1.stop_smooth()
                         motor_2.stop_smooth()
@@ -2510,12 +2531,11 @@ def main():
                     imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
                     if imu:
                         az_pos = float(imu["azimuth_deg"]) % 360.0
-                        el_pos = float(imu["elevation_deg"])
-                        pose_tag = "IMU"
+                        pose_tag = "IMU_AZ/MOTOR_EL"
                     else:
                         az_pos = st1["position_deg"] % 360.0
-                        el_pos = st2["position_deg"]
                         pose_tag = "MOTOR"
+                    el_pos = st2["position_deg"]
                     fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
                     fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
                     imu_txt = ""
@@ -2536,9 +2556,9 @@ def main():
                 elif key in ("\x1b[D", "a", "A"):
                     motor_1.set_target_speed(-abs(command_speed))
                 elif key in ("\x1b[A", "w", "W"):
-                    motor_2.set_target_speed(abs(command_speed))
+                    command_el_with_bounds(motor_2, command_speed, +1, el_min=0.0, el_max=90.0)
                 elif key in ("\x1b[B", "s", "S"):
-                    motor_2.set_target_speed(-abs(command_speed))
+                    command_el_with_bounds(motor_2, command_speed, -1, el_min=0.0, el_max=90.0)
                 elif key == " ":
                     motor_1.stop_smooth()
                     motor_2.stop_smooth()
