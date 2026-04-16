@@ -141,6 +141,7 @@ class StepperConfig:
     az_wrap_enabled: bool = False  # False: tidak boleh lintas 0/360 (sesuai rotator non-continous)
     az_offset_deg: float = 0.0     # Kalibrasi azimuth terhadap Utara kompas
     el_offset_deg: float = 0.0     # Kalibrasi elevasi terhadap referensi mekanik
+    axis_gear_ratio: float = 1.0   # >1 jika ada reduksi gear (motor:output)
     az_ls_deg: float = 0.0         # 0=full range, non-zero=blok jika lintas titik AZ LS
     az_ls_block_crossing: bool = False  # Default: AZ LS sebagai referensi, bukan hard-stop
 
@@ -593,11 +594,13 @@ class WT901Reader:
 class ELImuFusionConfig:
     update_rate_hz: float = 100.0
     complementary_alpha: float = 0.98
+    imu_pitch_weight: float = 0.18
     stale_timeout_s: float = 0.2
     still_gyro_dps: float = 0.3
     still_acc_g_tol: float = 0.08
     el_min_deg: float = 0.0
     el_max_deg: float = 90.0
+    debug_log: bool = False
 
 
 class ELImuFusionTracker:
@@ -619,6 +622,8 @@ class ELImuFusionTracker:
         self._samples = 0
         self._last_rate_t = time.time()
         self._rate_hz = 0.0
+        self._initialized = False
+        self._debug_snapshot = {}
 
     def start(self):
         self._run = True
@@ -657,11 +662,18 @@ class ELImuFusionTracker:
 
                 acc_pitch = self._accel_to_pitch_deg(float(ax), float(ay), float(az))
                 with self._lock:
+                    if not self._initialized:
+                        # Bootstrap from IMU fused pitch to avoid startup lock at near-zero accel tilt.
+                        self._el_est_deg = imu_pitch
+                        self._initialized = True
                     gyro_term = self._el_est_deg + (float(gy) - self._gyro_bias_y) * dt
                     alpha = max(0.7, min(0.999, float(self.cfg.complementary_alpha)))
-                    # Blend gyro-integrated pitch with accel pitch and a small IMU fused-angle correction.
-                    fused = alpha * gyro_term + (1.0 - alpha) * acc_pitch
-                    fused = 0.97 * fused + 0.03 * imu_pitch
+                    acc_fused = alpha * gyro_term + (1.0 - alpha) * acc_pitch
+                    w_imu = max(0.02, min(0.6, float(self.cfg.imu_pitch_weight)))
+                    innovation = imu_pitch - acc_fused
+                    # Increase correction when estimator diverges far from IMU fused pitch.
+                    w_imu_dyn = min(0.65, w_imu + min(0.35, abs(innovation) / 180.0))
+                    fused = (1.0 - w_imu_dyn) * acc_fused + w_imu_dyn * imu_pitch
                     self._el_est_deg = fused
 
                     acc_norm = math.sqrt((float(ax) * float(ax)) + (float(ay) * float(ay)) + (float(az) * float(az)))
@@ -677,7 +689,26 @@ class ELImuFusionTracker:
                         self._rate_hz = self._samples / max(1e-6, (now - self._last_rate_t))
                         self._samples = 0
                         self._last_rate_t = now
+                    self._debug_snapshot = {
+                        "acc_pitch_deg": acc_pitch,
+                        "imu_pitch_deg": imu_pitch,
+                        "gyro_y_dps": float(gy),
+                        "gyro_term_deg": gyro_term,
+                        "innovation_deg": innovation,
+                        "imu_weight_dyn": w_imu_dyn,
+                        "acc_norm_g": acc_norm,
+                    }
                     self._last_error = ""
+                    if self.cfg.debug_log and (self._samples % 20 == 0):
+                        self._logger.info(
+                            "EL fusion dbg est=%.2f imu=%.2f acc=%.2f gy=%.3f bias=%.3f w=%.3f",
+                            self._el_est_deg,
+                            imu_pitch,
+                            acc_pitch,
+                            float(gy),
+                            self._gyro_bias_y,
+                            w_imu_dyn,
+                        )
             except Exception as exc:
                 with self._lock:
                     self._last_error = str(exc)
@@ -731,8 +762,10 @@ class ELImuFusionTracker:
                 "rate_hz": self._rate_hz,
                 "gyro_bias_y_dps": self._gyro_bias_y,
                 "zero_offset_deg": self._zero_offset_deg,
+                "initialized": self._initialized,
                 "last_imu_ts": self._last_imu_ts,
                 "last_error": self._last_error,
+                "debug": dict(self._debug_snapshot),
             }
 
     def close(self):
@@ -1071,20 +1104,24 @@ class TB6600Stepper:
 
     def get_position_deg(self) -> float:
         with self._lock:
-            return (self._position_full_steps / self.cfg.steps_per_rev) * 360.0
+            gear = max(1e-9, float(self.cfg.axis_gear_ratio))
+            return ((self._position_full_steps / self.cfg.steps_per_rev) * 360.0) / gear
 
     def set_position_deg(self, position_deg: float):
         """Software calibration point: set current axis angle without moving motor."""
         with self._lock:
-            self._position_full_steps = (float(position_deg) / 360.0) * float(self.cfg.steps_per_rev)
+            gear = max(1e-9, float(self.cfg.axis_gear_ratio))
+            self._position_full_steps = (float(position_deg) * gear / 360.0) * float(self.cfg.steps_per_rev)
 
     def get_status(self) -> dict:
         with self._lock:
+            gear = max(1e-9, float(self.cfg.axis_gear_ratio))
+            pos_deg = ((self._position_full_steps / self.cfg.steps_per_rev) * 360.0) / gear
             return {
                 "target_speed_sps": self._target_speed_sps,
                 "current_speed_sps": self._current_speed_sps,
                 "microstep": self.cfg.microstep,
-                "position_deg": (self._position_full_steps / self.cfg.steps_per_rev) * 360.0,
+                "position_deg": pos_deg,
                 "fault_latched": self._fault_latched,
                 "fault_msg": self._fault_msg,
             }
@@ -1195,8 +1232,9 @@ class TB6600Stepper:
 
             # Prediksi posisi berikut untuk soft-limit
             step_delta_full = (1.0 / float(microstep)) * (1.0 if cw else -1.0)
-            current_deg = (self.get_position_steps() / self.cfg.steps_per_rev) * 360.0
-            next_deg = ((self.get_position_steps() + step_delta_full) / self.cfg.steps_per_rev) * 360.0
+            gear = max(1e-9, float(self.cfg.axis_gear_ratio))
+            current_deg = ((self.get_position_steps() / self.cfg.steps_per_rev) * 360.0) / gear
+            next_deg = (((self.get_position_steps() + step_delta_full) / self.cfg.steps_per_rev) * 360.0) / gear
             if self._soft_limit_reached(next_deg):
                 with self._lock:
                     self._current_speed_sps = 0.0
@@ -1279,20 +1317,24 @@ class SimStepper:
 
     def get_position_deg(self) -> float:
         with self._lock:
-            return (self._position_full_steps / self.cfg.steps_per_rev) * 360.0
+            gear = max(1e-9, float(self.cfg.axis_gear_ratio))
+            return ((self._position_full_steps / self.cfg.steps_per_rev) * 360.0) / gear
 
     def set_position_deg(self, position_deg: float):
         """Software calibration point: set current axis angle without moving motor."""
         with self._lock:
-            self._position_full_steps = (float(position_deg) / 360.0) * float(self.cfg.steps_per_rev)
+            gear = max(1e-9, float(self.cfg.axis_gear_ratio))
+            self._position_full_steps = (float(position_deg) * gear / 360.0) * float(self.cfg.steps_per_rev)
 
     def get_status(self) -> dict:
         with self._lock:
+            gear = max(1e-9, float(self.cfg.axis_gear_ratio))
+            pos_deg = ((self._position_full_steps / self.cfg.steps_per_rev) * 360.0) / gear
             return {
                 "target_speed_sps": self._target_speed_sps,
                 "current_speed_sps": self._current_speed_sps,
                 "microstep": self.cfg.microstep,
-                "position_deg": (self._position_full_steps / self.cfg.steps_per_rev) * 360.0,
+                "position_deg": pos_deg,
                 "fault_latched": self._fault_latched,
                 "fault_msg": self._fault_msg,
             }
@@ -1351,8 +1393,9 @@ class SimStepper:
             # Integrasi posisi berbasis kecepatan pulse/s
             if abs(spd) > 1e-3:
                 step_delta_full = (spd * dt) / float(ms)
-                current_deg = (self.get_position_steps() / self.cfg.steps_per_rev) * 360.0
-                next_deg = ((self.get_position_steps() + step_delta_full) / self.cfg.steps_per_rev) * 360.0
+                gear = max(1e-9, float(self.cfg.axis_gear_ratio))
+                current_deg = ((self.get_position_steps() / self.cfg.steps_per_rev) * 360.0) / gear
+                next_deg = (((self.get_position_steps() + step_delta_full) / self.cfg.steps_per_rev) * 360.0) / gear
                 if not self._check_soft_limit(next_deg) and not self._check_az_ls(current_deg, next_deg):
                     with self._lock:
                         self._position_full_steps += step_delta_full
@@ -2228,11 +2271,14 @@ class SimGuiApp:
                 )
         if self.el_imu_tracker is not None:
             st_el = self.el_imu_tracker.get_status()
+            dbg = st_el.get("debug", {}) if isinstance(st_el, dict) else {}
             self.lbl_status.config(
                 text=self.lbl_status.cget("text")
                 + (
                     f"\nEL-IMU raw={self.el_imu_tracker.get_el_raw_deg():.2f}° est={el_disp:.2f}° "
-                    f"rate={st_el.get('rate_hz', 0.0):.1f}Hz"
+                    f"rate={st_el.get('rate_hz', 0.0):.1f}Hz "
+                    f"imuPitch={dbg.get('imu_pitch_deg', 0.0):.2f} "
+                    f"accPitch={dbg.get('acc_pitch_deg', 0.0):.2f}"
                 )
             )
         self._draw_rotator(az_disp, el_disp)
@@ -2353,6 +2399,11 @@ def run_cli_mode(
         print(f"M1(AZ) pos={az_disp:.2f} spd={st1['current_speed_sps']:.1f} tgt={st1['target_speed_sps']:.1f}")
         print(f"M2(EL) pos={el_disp:.2f} spd={st2['current_speed_sps']:.1f} tgt={st2['target_speed_sps']:.1f}")
         print(f"speed={command_speed:.1f} ms={st1['microstep']} pose={pose_src} track={'ON' if tracking_enabled else 'OFF'} sat={sat_txt}")
+        el_steps_per_deg = (cfg_m2.steps_per_rev * st2["microstep"] * max(1e-9, cfg_m2.axis_gear_ratio)) / 360.0
+        print(
+            f"EL conv steps/rev={cfg_m2.steps_per_rev} micro={st2['microstep']} "
+            f"gear={cfg_m2.axis_gear_ratio:.4f} => {el_steps_per_deg:.4f} microsteps/deg"
+        )
         print(
             f"limits AZ[{cfg_m1.soft_limit_min_deg},{cfg_m1.soft_limit_max_deg}] "
             f"EL[{cfg_m2.soft_limit_min_deg},{cfg_m2.soft_limit_max_deg}] "
@@ -2370,6 +2421,8 @@ def run_cli_mode(
                 )
             else:
                 print(f"imu status={imu_reader.get_status()}")
+        if el_imu_tracker is not None:
+            print(f"elimu dbg={el_imu_tracker.get_status()}")
 
     def run_arrow_control():
         nonlocal tracking_enabled, command_speed
@@ -2611,6 +2664,9 @@ def main():
     parser.add_argument("--el-imu-only", action="store_true", help="Gunakan estimasi EL IMU secara eksklusif untuk tracking/control")
     parser.add_argument("--el-imu-rate-hz", type=float, default=100.0, help="Update rate EL IMU fusion (>=100Hz)")
     parser.add_argument("--el-imu-alpha", type=float, default=0.98, help="Complementary filter alpha EL fusion")
+    parser.add_argument("--el-imu-weight", type=float, default=0.18, help="Weight koreksi sudut pitch IMU pada EL fusion")
+    parser.add_argument("--el-imu-debug", action="store_true", help="Aktifkan debug log EL fusion")
+    parser.add_argument("--el-gear-ratio", type=float, default=1.0, help="Rasio gear EL (motor:output), contoh 50 berarti 50:1")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2643,6 +2699,14 @@ def main():
         accel_sps2=3000.0,
         soft_limit_min_deg=0.0,
         soft_limit_max_deg=90.0,
+        axis_gear_ratio=max(1e-9, float(args.el_gear_ratio)),
+    )
+    logging.getLogger("motorPID.cfg").info(
+        "EL conversion: steps_per_rev=%d microstep=%d gear=%.4f => %.4f microsteps/deg",
+        cfg_m2.steps_per_rev,
+        cfg_m2.microstep,
+        cfg_m2.axis_gear_ratio,
+        (cfg_m2.steps_per_rev * cfg_m2.microstep * cfg_m2.axis_gear_ratio) / 360.0,
     )
 
     # --sim-gui tetap memaksa mode simulator (kompatibilitas).
@@ -2702,8 +2766,10 @@ def main():
         el_cfg = ELImuFusionConfig(
             update_rate_hz=max(100.0, float(args.el_imu_rate_hz)),
             complementary_alpha=max(0.7, min(0.999, float(args.el_imu_alpha))),
+            imu_pitch_weight=max(0.02, min(0.8, float(args.el_imu_weight))),
             el_min_deg=0.0,
             el_max_deg=90.0,
+            debug_log=bool(args.el_imu_debug),
         )
         el_imu_tracker = ELImuFusionTracker(el_cfg, imu_reader)
         el_imu_tracker.start()
