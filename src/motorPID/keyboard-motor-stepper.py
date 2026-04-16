@@ -172,6 +172,7 @@ class WT901Sample:
     roll_deg: float
     pitch_deg: float
     yaw_deg: float
+    accel_g: tuple[float, float, float]
     gyro_dps: tuple[float, float, float]
     mag: tuple[float, float, float]
     temperature_c: float | None
@@ -366,6 +367,9 @@ class WT901Reader:
         roll = self._safe_get("angleX")
         pitch = self._safe_get("angleY")
         yaw = self._safe_get("angleZ")
+        ax = self._safe_get("accX")
+        ay = self._safe_get("accY")
+        az_acc = self._safe_get("accZ")
         gx = self._safe_get("gyroX") - self._gyro_bias[0]
         gy = self._safe_get("gyroY") - self._gyro_bias[1]
         gz = self._safe_get("gyroZ") - self._gyro_bias[2]
@@ -390,6 +394,7 @@ class WT901Reader:
             roll_deg=roll,
             pitch_deg=pitch,
             yaw_deg=yaw,
+            accel_g=(ax, ay, az_acc),
             gyro_dps=(gx, gy, gz),
             mag=(mx, my, mz),
             temperature_c=temp_c,
@@ -491,6 +496,7 @@ class WT901Reader:
             "roll_deg": smp.roll_deg,
             "pitch_deg": smp.pitch_deg,
             "yaw_deg": smp.yaw_deg,
+            "accel_g": smp.accel_g,
             "gyro_dps": smp.gyro_dps,
             "mag": smp.mag,
             "temperature_c": smp.temperature_c,
@@ -581,6 +587,158 @@ class WT901Reader:
         except Exception:
             pass
         self._connected = False
+
+
+@dataclass
+class ELImuFusionConfig:
+    update_rate_hz: float = 100.0
+    complementary_alpha: float = 0.98
+    stale_timeout_s: float = 0.2
+    still_gyro_dps: float = 0.3
+    still_acc_g_tol: float = 0.08
+    el_min_deg: float = 0.0
+    el_max_deg: float = 90.0
+
+
+class ELImuFusionTracker:
+    """IMU-only EL estimator (gyro integration + accel correction + drift compensation)."""
+
+    def __init__(self, cfg: ELImuFusionConfig, imu_reader: WT901Reader):
+        self.cfg = cfg
+        self.imu_reader = imu_reader
+        self._lock = threading.Lock()
+        self._logger = logging.getLogger("motorPID.el_imu")
+        self._run = False
+        self._thread = None
+        self._last_imu_ts = None
+        self._last_proc_t = None
+        self._el_est_deg = 0.0
+        self._gyro_bias_y = 0.0
+        self._zero_offset_deg = 0.0
+        self._last_error = ""
+        self._samples = 0
+        self._last_rate_t = time.time()
+        self._rate_hz = 0.0
+
+    def start(self):
+        self._run = True
+        period = 1.0 / max(100.0, float(self.cfg.update_rate_hz))
+        self._thread = threading.Thread(target=self._loop, args=(period,), daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _accel_to_pitch_deg(ax: float, ay: float, az: float) -> float:
+        # Pitch estimate from gravity vector.
+        denom = math.sqrt((ay * ay) + (az * az))
+        if denom < 1e-9:
+            return 0.0
+        return math.degrees(math.atan2(ax, denom))
+
+    def _loop(self, period_s: float):
+        while self._run:
+            t0 = time.time()
+            try:
+                imu = self.imu_reader.get_latest_dict()
+                if not imu:
+                    time.sleep(period_s)
+                    continue
+                imu_ts = float(imu["timestamp"])
+                if self._last_imu_ts is not None and imu_ts <= self._last_imu_ts:
+                    time.sleep(period_s)
+                    continue
+                self._last_imu_ts = imu_ts
+
+                ax, ay, az = imu.get("accel_g", (0.0, 0.0, 1.0))
+                gx, gy, gz = imu.get("gyro_dps", (0.0, 0.0, 0.0))
+                imu_pitch = float(imu.get("elevation_deg", 0.0))
+                now = time.time()
+                dt = 0.01 if self._last_proc_t is None else max(0.001, now - self._last_proc_t)
+                self._last_proc_t = now
+
+                acc_pitch = self._accel_to_pitch_deg(float(ax), float(ay), float(az))
+                with self._lock:
+                    gyro_term = self._el_est_deg + (float(gy) - self._gyro_bias_y) * dt
+                    alpha = max(0.7, min(0.999, float(self.cfg.complementary_alpha)))
+                    # Blend gyro-integrated pitch with accel pitch and a small IMU fused-angle correction.
+                    fused = alpha * gyro_term + (1.0 - alpha) * acc_pitch
+                    fused = 0.97 * fused + 0.03 * imu_pitch
+                    self._el_est_deg = fused
+
+                    acc_norm = math.sqrt((float(ax) * float(ax)) + (float(ay) * float(ay)) + (float(az) * float(az)))
+                    still = (abs(float(gy)) < float(self.cfg.still_gyro_dps)) and (
+                        abs(acc_norm - 1.0) < float(self.cfg.still_acc_g_tol)
+                    )
+                    if still:
+                        # Slow bias learning while stationary.
+                        self._gyro_bias_y = (0.995 * self._gyro_bias_y) + (0.005 * float(gy))
+
+                    self._samples += 1
+                    if now - self._last_rate_t >= 1.0:
+                        self._rate_hz = self._samples / max(1e-6, (now - self._last_rate_t))
+                        self._samples = 0
+                        self._last_rate_t = now
+                    self._last_error = ""
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = str(exc)
+                self._logger.error("EL IMU fusion error: %s", exc)
+            dt_loop = time.time() - t0
+            time.sleep(max(0.0, period_s - dt_loop))
+
+    def calibrate_level_zero(self, duration_s: float = 2.0):
+        duration_s = max(0.2, float(duration_s))
+        t_end = time.time() + duration_s
+        vals = []
+        while time.time() < t_end:
+            vals.append(self.get_el_raw_deg())
+            time.sleep(0.01)
+        if vals:
+            avg = sum(vals) / float(len(vals))
+            with self._lock:
+                self._zero_offset_deg = -avg
+
+    def calibrate_gyro_bias(self, duration_s: float = 2.0):
+        duration_s = max(0.2, float(duration_s))
+        t_end = time.time() + duration_s
+        vals = []
+        while time.time() < t_end:
+            imu = self.imu_reader.get_latest_dict()
+            if imu:
+                vals.append(float(imu.get("gyro_dps", (0.0, 0.0, 0.0))[1]))
+            time.sleep(0.01)
+        if vals:
+            with self._lock:
+                self._gyro_bias_y = sum(vals) / float(len(vals))
+
+    def get_el_raw_deg(self) -> float:
+        with self._lock:
+            return float(self._el_est_deg)
+
+    def get_el_deg(self) -> float | None:
+        with self._lock:
+            last_imu_ts = self._last_imu_ts
+            el = self._el_est_deg + self._zero_offset_deg
+        if last_imu_ts is None:
+            return None
+        if (time.time() - float(last_imu_ts)) > float(self.cfg.stale_timeout_s):
+            return None
+        el = max(float(self.cfg.el_min_deg), min(float(self.cfg.el_max_deg), float(el)))
+        return el
+
+    def get_status(self) -> dict:
+        with self._lock:
+            return {
+                "rate_hz": self._rate_hz,
+                "gyro_bias_y_dps": self._gyro_bias_y,
+                "zero_offset_deg": self._zero_offset_deg,
+                "last_imu_ts": self._last_imu_ts,
+                "last_error": self._last_error,
+            }
+
+    def close(self):
+        self._run = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class ImuAzElPositionController:
@@ -1241,7 +1399,14 @@ def clear_screen():
     sys.stdout.flush()
 
 
-def command_el_with_bounds(motor_2, command_speed: float, direction: int, el_min: float = 0.0, el_max: float = 90.0):
+def command_el_with_bounds(
+    motor_2,
+    command_speed: float,
+    direction: int,
+    el_min: float = 0.0,
+    el_max: float = 90.0,
+    current_el_deg: float | None = None,
+):
     """
     Keyboard EL command with explicit 0..90 boundary guard.
     direction: +1 (up), -1 (down), 0 (stop)
@@ -1249,8 +1414,11 @@ def command_el_with_bounds(motor_2, command_speed: float, direction: int, el_min
     if direction == 0:
         motor_2.stop_smooth()
         return
-    st2 = motor_2.get_status()
-    cur_el = float(st2["position_deg"])
+    if current_el_deg is None:
+        st2 = motor_2.get_status()
+        cur_el = float(st2["position_deg"])
+    else:
+        cur_el = float(current_el_deg)
     if direction > 0 and cur_el >= el_max - 1e-3:
         motor_2.stop_smooth()
         return
@@ -1426,6 +1594,7 @@ class SimGuiApp:
         cfg_m1,
         cfg_m2,
         imu_reader: WT901Reader | None = None,
+        el_imu_tracker: ELImuFusionTracker | None = None,
         imu_hold_ctrl: ImuAzElPositionController | None = None,
     ):
         self.motor_1 = motor_1
@@ -1433,6 +1602,7 @@ class SimGuiApp:
         self.cfg_m1 = cfg_m1
         self.cfg_m2 = cfg_m2
         self.imu_reader = imu_reader
+        self.el_imu_tracker = el_imu_tracker
         self.imu_hold_ctrl = imu_hold_ctrl
         self.imu_hold_enabled = imu_hold_ctrl is not None
         self.command_speed = 600.0
@@ -1751,12 +1921,13 @@ class SimGuiApp:
 
         el_min = 0.0 if self.cfg_m2.soft_limit_min_deg is None else float(self.cfg_m2.soft_limit_min_deg)
         el_max = 90.0 if self.cfg_m2.soft_limit_max_deg is None else float(self.cfg_m2.soft_limit_max_deg)
+        el_cur = self.el_imu_tracker.get_el_deg() if self.el_imu_tracker is not None else None
         if self.el_pos_pressed and not self.el_neg_pressed:
-            command_el_with_bounds(self.motor_2, spd, +1, el_min=el_min, el_max=el_max)
+            command_el_with_bounds(self.motor_2, spd, +1, el_min=el_min, el_max=el_max, current_el_deg=el_cur)
         elif self.el_neg_pressed and not self.el_pos_pressed:
-            command_el_with_bounds(self.motor_2, spd, -1, el_min=el_min, el_max=el_max)
+            command_el_with_bounds(self.motor_2, spd, -1, el_min=el_min, el_max=el_max, current_el_deg=el_cur)
         else:
-            command_el_with_bounds(self.motor_2, spd, 0, el_min=el_min, el_max=el_max)
+            command_el_with_bounds(self.motor_2, spd, 0, el_min=el_min, el_max=el_max, current_el_deg=el_cur)
 
     def _smooth_stop(self):
         if self.imu_hold_enabled and self.imu_hold_ctrl is not None:
@@ -1881,11 +2052,14 @@ class SimGuiApp:
         self._set_imu_hold(not self.imu_hold_enabled)
 
     def _imu_zero(self):
-        if self.imu_hold_ctrl is None:
+        if self.imu_hold_ctrl is None and self.el_imu_tracker is None:
             return
         try:
-            self.imu_hold_ctrl.calibrate_zero_reference()
-            self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [IMU zeroed]")
+            if self.imu_hold_ctrl is not None:
+                self.imu_hold_ctrl.calibrate_zero_reference()
+            if self.el_imu_tracker is not None:
+                self.el_imu_tracker.calibrate_level_zero(1.2)
+            self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [IMU zeroed/releveled]")
         except Exception as exc:
             self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [IMU zero error: {exc}]")
 
@@ -1950,14 +2124,15 @@ class SimGuiApp:
         if self.sat_az is None or self.sat_el is None:
             return
         imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
+        el_imu = self.el_imu_tracker.get_el_deg() if self.el_imu_tracker is not None else None
         if imu:
             cur_az = float(imu["azimuth_deg"]) % 360.0
-            cur_el = float(imu["elevation_deg"])
+            cur_el = float(el_imu) if el_imu is not None else float(imu["elevation_deg"])
         else:
             st1 = self.motor_1.get_status()
             st2 = self.motor_2.get_status()
             cur_az = st1["position_deg"] % 360.0
-            cur_el = st2["position_deg"]
+            cur_el = float(el_imu) if el_imu is not None else st2["position_deg"]
         # Konversi azimuth satelit (kompas) ke frame mekanik rotator dengan offset kalibrasi.
         target_az = (self.sat_az + self.cfg_m1.az_offset_deg) % 360.0
         target_el = self.sat_el + self.cfg_m2.el_offset_deg
@@ -2000,15 +2175,15 @@ class SimGuiApp:
         st1 = self.motor_1.get_status()
         st2 = self.motor_2.get_status()
         imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
+        el_imu = self.el_imu_tracker.get_el_deg() if self.el_imu_tracker is not None else None
         if imu:
             az_disp = float(imu["azimuth_deg"]) % 360.0
-            pose_src = "IMU_AZ/MOTOR_EL"
+            pose_src = "IMU_AZ/IMU_EL" if el_imu is not None else "IMU_AZ/MOTOR_EL"
         else:
             az_disp = st1["position_deg"] % 360.0
-            pose_src = "MOTOR"
-        # EL visual feedback untuk keyboard control harus mengikuti motor axis,
-        # bukan IMU pitch yang bisa offset/stagnan terhadap mekanik.
-        el_disp = float(st2["position_deg"])
+            pose_src = "IMU_EL_ONLY" if el_imu is not None else "MOTOR"
+        # EL visual feedback mengikuti estimator IMU-only jika aktif.
+        el_disp = float(el_imu) if el_imu is not None else float(st2["position_deg"])
         self._calc_selected_az_el()
         self._tracking_step()
         imu_hold_row = None
@@ -2051,6 +2226,15 @@ class SimGuiApp:
                         f" | IMU-HOLD={hold_txt} TGTrel AZ={taz:.2f} EL={tel:.2f}{extra}"
                     )
                 )
+        if self.el_imu_tracker is not None:
+            st_el = self.el_imu_tracker.get_status()
+            self.lbl_status.config(
+                text=self.lbl_status.cget("text")
+                + (
+                    f"\nEL-IMU raw={self.el_imu_tracker.get_el_raw_deg():.2f}° est={el_disp:.2f}° "
+                    f"rate={st_el.get('rate_hz', 0.0):.1f}Hz"
+                )
+            )
         self._draw_rotator(az_disp, el_disp)
         self.root.after(50, self._update_ui)
 
@@ -2058,7 +2242,14 @@ class SimGuiApp:
         self.root.mainloop()
 
 
-def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | None = None):
+def run_cli_mode(
+    motor_1,
+    motor_2,
+    cfg_m1,
+    cfg_m2,
+    imu_reader: WT901Reader | None = None,
+    el_imu_tracker: ELImuFusionTracker | None = None,
+):
     print("\n=== TB6600 ROTATOR CLI MODE ===")
     print("Type 'help' for commands.")
 
@@ -2127,14 +2318,15 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
         if saz is None or sel is None:
             return
         imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
+        el_imu = el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None
         if imu:
             cur_az = float(imu["azimuth_deg"]) % 360.0
-            cur_el = float(imu["elevation_deg"])
+            cur_el = float(el_imu) if el_imu is not None else float(imu["elevation_deg"])
         else:
             st1 = motor_1.get_status()
             st2 = motor_2.get_status()
             cur_az = st1["position_deg"] % 360.0
-            cur_el = st2["position_deg"]
+            cur_el = float(el_imu) if el_imu is not None else st2["position_deg"]
         target_az = (saz + cfg_m1.az_offset_deg) % 360.0
         target_el = sel + cfg_m2.el_offset_deg
         if cfg_m1.soft_limit_min_deg is not None:
@@ -2148,13 +2340,14 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
         st1 = motor_1.get_status()
         st2 = motor_2.get_status()
         imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
+        el_imu = el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None
         if imu:
             az_disp = float(imu["azimuth_deg"]) % 360.0
-            pose_src = "IMU_AZ/MOTOR_EL"
+            pose_src = "IMU_AZ/IMU_EL" if el_imu is not None else "IMU_AZ/MOTOR_EL"
         else:
             az_disp = st1["position_deg"] % 360.0
-            pose_src = "MOTOR"
-        el_disp = st2["position_deg"]
+            pose_src = "IMU_EL_ONLY" if el_imu is not None else "MOTOR"
+        el_disp = float(el_imu) if el_imu is not None else st2["position_deg"]
         saz, sel = sat_az_el()
         sat_txt = f"{selected_sat_name} AZ={saz:.2f} EL={sel:.2f}" if saz is not None and sel is not None else selected_sat_name
         print(f"M1(AZ) pos={az_disp:.2f} spd={st1['current_speed_sps']:.1f} tgt={st1['target_speed_sps']:.1f}")
@@ -2203,9 +2396,23 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
                 elif key in ("\x1b[D", "a", "A"):
                     motor_1.set_target_speed(-abs(command_speed))
                 elif key in ("\x1b[A", "w", "W"):
-                    command_el_with_bounds(motor_2, command_speed, +1, el_min=0.0, el_max=90.0)
+                    command_el_with_bounds(
+                        motor_2,
+                        command_speed,
+                        +1,
+                        el_min=0.0,
+                        el_max=90.0,
+                        current_el_deg=(el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None),
+                    )
                 elif key in ("\x1b[B", "s", "S"):
-                    command_el_with_bounds(motor_2, command_speed, -1, el_min=0.0, el_max=90.0)
+                    command_el_with_bounds(
+                        motor_2,
+                        command_speed,
+                        -1,
+                        el_min=0.0,
+                        el_max=90.0,
+                        current_el_deg=(el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None),
+                    )
                 elif key == " ":
                     motor_1.stop_smooth(); motor_2.stop_smooth()
                 elif key == "+":
@@ -2241,6 +2448,7 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
                 print("limit az <min> <max> | limit el <min> <max>")
                 print("obs <lat> <lon> <alt_m> | tle search <text> | tle select <idx> | track on|off")
                 print("imu status | imu decl <deg> | imu gyrocal <sec> | imu magcal start|end")
+                print("elimu status | elimu zero [sec] | elimu gyrocal [sec]")
             elif c == "status":
                 print_status()
             elif c == "imu" and len(p) >= 2 and p[1].lower() == "status":
@@ -2272,14 +2480,50 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
                     print("IMU magnetic calibration ended")
                 else:
                     raise ValueError("imu magcal expects start|end")
+            elif c == "elimu" and len(p) >= 2 and p[1].lower() == "status":
+                if el_imu_tracker is None:
+                    print("EL IMU tracker not enabled")
+                else:
+                    print(el_imu_tracker.get_status())
+                    print(f"el_deg={el_imu_tracker.get_el_deg()}")
+            elif c == "elimu" and len(p) >= 2 and p[1].lower() == "zero":
+                if el_imu_tracker is None:
+                    print("EL IMU tracker not enabled")
+                else:
+                    sec = 1.5 if len(p) < 3 else float(p[2])
+                    el_imu_tracker.calibrate_level_zero(sec)
+                    print("EL IMU zero calibration done")
+            elif c == "elimu" and len(p) >= 2 and p[1].lower() == "gyrocal":
+                if el_imu_tracker is None:
+                    print("EL IMU tracker not enabled")
+                else:
+                    sec = 1.5 if len(p) < 3 else float(p[2])
+                    el_imu_tracker.calibrate_gyro_bias(sec)
+                    print("EL IMU gyro bias calibration done")
             elif c == "az+":
                 tracking_enabled = False; motor_1.set_target_speed(abs(command_speed))
             elif c == "az-":
                 tracking_enabled = False; motor_1.set_target_speed(-abs(command_speed))
             elif c == "el+":
-                tracking_enabled = False; motor_2.set_target_speed(abs(command_speed))
+                tracking_enabled = False
+                command_el_with_bounds(
+                    motor_2,
+                    command_speed,
+                    +1,
+                    el_min=0.0,
+                    el_max=90.0,
+                    current_el_deg=(el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None),
+                )
             elif c == "el-":
-                tracking_enabled = False; motor_2.set_target_speed(-abs(command_speed))
+                tracking_enabled = False
+                command_el_with_bounds(
+                    motor_2,
+                    command_speed,
+                    -1,
+                    el_min=0.0,
+                    el_max=90.0,
+                    current_el_deg=(el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None),
+                )
             elif c == "stop":
                 tracking_enabled = False; motor_1.stop_smooth(); motor_2.stop_smooth()
             elif c == "estop":
@@ -2364,6 +2608,9 @@ def main():
     parser.add_argument("--imu-dropout-timeout", type=float, default=0.25, help="Timeout dropout IMU (detik)")
     parser.add_argument("--imu-nudge-deg", type=float, default=0.5, help="Besar nudge keyboard per langkah (deg)")
     parser.add_argument("--imu-log-path", default="", help="Path CSV log cmd-vs-actual AZ/EL (10Hz)")
+    parser.add_argument("--el-imu-only", action="store_true", help="Gunakan estimasi EL IMU secara eksklusif untuk tracking/control")
+    parser.add_argument("--el-imu-rate-hz", type=float, default=100.0, help="Update rate EL IMU fusion (>=100Hz)")
+    parser.add_argument("--el-imu-alpha", type=float, default=0.98, help="Complementary filter alpha EL fusion")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2448,19 +2695,42 @@ def main():
                 imu_hold_ctrl.calibrate_zero_reference()
             else:
                 logging.getLogger("motorPID.imu_hold").warning("IMU sample belum ada, hold akan menunggu data.")
+    el_imu_tracker = None
+    # EL tracking/control source default: IMU-only saat IMU aktif.
+    enable_el_imu = args.imu and not use_sim
+    if enable_el_imu and imu_reader is not None:
+        el_cfg = ELImuFusionConfig(
+            update_rate_hz=max(100.0, float(args.el_imu_rate_hz)),
+            complementary_alpha=max(0.7, min(0.999, float(args.el_imu_alpha))),
+            el_min_deg=0.0,
+            el_max_deg=90.0,
+        )
+        el_imu_tracker = ELImuFusionTracker(el_cfg, imu_reader)
+        el_imu_tracker.start()
+        # EL position determination no longer relies on step count boundaries.
+        cfg_m2.soft_limit_min_deg = None
+        cfg_m2.soft_limit_max_deg = None
 
     command_speed = 600.0
     last_report = 0.0
 
     try:
         if args.cli:
-            run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader=imu_reader)
+            run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader=imu_reader, el_imu_tracker=el_imu_tracker)
         elif use_gui:
             if not TK_AVAILABLE:
                 raise RuntimeError("tkinter tidak tersedia. Install tkinter atau jalankan tanpa --gui/--sim-gui.")
             if not os.environ.get("DISPLAY"):
                 raise RuntimeError("DISPLAY tidak terdeteksi. Jalankan dari desktop Raspberry Pi atau pakai X11 forwarding.")
-            app = SimGuiApp(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader=imu_reader, imu_hold_ctrl=imu_hold_ctrl)
+            app = SimGuiApp(
+                motor_1,
+                motor_2,
+                cfg_m1,
+                cfg_m2,
+                imu_reader=imu_reader,
+                el_imu_tracker=el_imu_tracker,
+                imu_hold_ctrl=imu_hold_ctrl,
+            )
             app.run()
         elif use_sim:
             with RawTerminal():
@@ -2479,9 +2749,23 @@ def main():
                     elif key in ("\x1b[D", "a", "A"):
                         motor_1.set_target_speed(-abs(command_speed))
                     elif key in ("\x1b[A", "w", "W"):
-                        command_el_with_bounds(motor_2, command_speed, +1, el_min=0.0, el_max=90.0)
+                        command_el_with_bounds(
+                            motor_2,
+                            command_speed,
+                            +1,
+                            el_min=0.0,
+                            el_max=90.0,
+                            current_el_deg=(el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None),
+                        )
                     elif key in ("\x1b[B", "s", "S"):
-                        command_el_with_bounds(motor_2, command_speed, -1, el_min=0.0, el_max=90.0)
+                        command_el_with_bounds(
+                            motor_2,
+                            command_speed,
+                            -1,
+                            el_min=0.0,
+                            el_max=90.0,
+                            current_el_deg=(el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None),
+                        )
                     elif key == " ":
                         motor_1.stop_smooth()
                         motor_2.stop_smooth()
@@ -2529,13 +2813,14 @@ def main():
                     st1 = motor_1.get_status()
                     st2 = motor_2.get_status()
                     imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
+                    el_imu = el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None
                     if imu:
                         az_pos = float(imu["azimuth_deg"]) % 360.0
-                        pose_tag = "IMU_AZ/MOTOR_EL"
+                        pose_tag = "IMU_AZ/IMU_EL" if el_imu is not None else "IMU_AZ/MOTOR_EL"
                     else:
                         az_pos = st1["position_deg"] % 360.0
-                        pose_tag = "MOTOR"
-                    el_pos = st2["position_deg"]
+                        pose_tag = "IMU_EL_ONLY" if el_imu is not None else "MOTOR"
+                    el_pos = float(el_imu) if el_imu is not None else st2["position_deg"]
                     fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
                     fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
                     imu_txt = ""
@@ -2556,9 +2841,23 @@ def main():
                 elif key in ("\x1b[D", "a", "A"):
                     motor_1.set_target_speed(-abs(command_speed))
                 elif key in ("\x1b[A", "w", "W"):
-                    command_el_with_bounds(motor_2, command_speed, +1, el_min=0.0, el_max=90.0)
+                    command_el_with_bounds(
+                        motor_2,
+                        command_speed,
+                        +1,
+                        el_min=0.0,
+                        el_max=90.0,
+                        current_el_deg=(el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None),
+                    )
                 elif key in ("\x1b[B", "s", "S"):
-                    command_el_with_bounds(motor_2, command_speed, -1, el_min=0.0, el_max=90.0)
+                    command_el_with_bounds(
+                        motor_2,
+                        command_speed,
+                        -1,
+                        el_min=0.0,
+                        el_max=90.0,
+                        current_el_deg=(el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None),
+                    )
                 elif key == " ":
                     motor_1.stop_smooth()
                     motor_2.stop_smooth()
@@ -2592,6 +2891,8 @@ def main():
         print("\nShutdown controller...")
         if imu_hold_ctrl is not None:
             imu_hold_ctrl.close()
+        if el_imu_tracker is not None:
+            el_imu_tracker.close()
         if imu_reader is not None:
             imu_reader.close()
         motor_1.close()
