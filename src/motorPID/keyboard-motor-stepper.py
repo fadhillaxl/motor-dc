@@ -1898,11 +1898,15 @@ class SimGuiApp:
             return
         if self.sat_az is None or self.sat_el is None:
             return
-
-        st1 = self.motor_1.get_status()
-        st2 = self.motor_2.get_status()
-        cur_az = st1["position_deg"] % 360.0
-        cur_el = st2["position_deg"]
+        imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
+        if imu:
+            cur_az = float(imu["azimuth_deg"]) % 360.0
+            cur_el = float(imu["elevation_deg"])
+        else:
+            st1 = self.motor_1.get_status()
+            st2 = self.motor_2.get_status()
+            cur_az = st1["position_deg"] % 360.0
+            cur_el = st2["position_deg"]
         # Konversi azimuth satelit (kompas) ke frame mekanik rotator dengan offset kalibrasi.
         target_az = (self.sat_az + self.cfg_m1.az_offset_deg) % 360.0
         target_el = self.sat_el
@@ -1921,12 +1925,12 @@ class SimGuiApp:
         self.motor_1.set_target_speed(cmd_az)
         self.motor_2.set_target_speed(cmd_el)
 
-    def _draw_rotator(self, st1, st2):
+    def _draw_rotator(self, az_deg, el_deg):
         self.canvas.delete("all")
         cx, cy, r = 200, 130, 90
         self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#33ccff", width=2)
         self.canvas.create_text(cx, cy + 105, fill="white", text="AZ", font=("Arial", 10, "bold"))
-        az = st1["position_deg"] % 360.0
+        az = az_deg % 360.0
         import math
         rad = math.radians(az - 90.0)
         x2 = cx + r * 0.85 * math.cos(rad)
@@ -1936,7 +1940,7 @@ class SimGuiApp:
         x0, y0, w, h = 460, 60, 240, 160
         self.canvas.create_rectangle(x0, y0, x0 + w, y0 + h, outline="#33ccff", width=2)
         self.canvas.create_text(x0 + w / 2, y0 + h + 20, fill="white", text="EL", font=("Arial", 10, "bold"))
-        el = max(0.0, min(90.0, st2["position_deg"]))
+        el = max(0.0, min(90.0, el_deg))
         bar_h = (el / 90.0) * (h - 20)
         self.canvas.create_rectangle(x0 + 20, y0 + h - 10 - bar_h, x0 + w - 20, y0 + h - 10, fill="#06d6a0")
         self.canvas.create_text(x0 + w / 2, y0 + h - bar_h - 20, fill="white", text=f"{el:.1f}°")
@@ -1944,7 +1948,15 @@ class SimGuiApp:
     def _update_ui(self):
         st1 = self.motor_1.get_status()
         st2 = self.motor_2.get_status()
-        az_disp = st1["position_deg"] % 360.0
+        imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
+        if imu:
+            az_disp = float(imu["azimuth_deg"]) % 360.0
+            el_disp = float(imu["elevation_deg"])
+            pose_src = "IMU"
+        else:
+            az_disp = st1["position_deg"] % 360.0
+            el_disp = st2["position_deg"]
+            pose_src = "MOTOR"
         self._calc_selected_az_el()
         self._tracking_step()
         imu_hold_row = None
@@ -1964,12 +1976,11 @@ class SimGuiApp:
         self.lbl_status.config(
             text=(
                 f"AZ: pos={az_disp:.2f}°  spd={st1['current_speed_sps']:.1f} sps  tgt={st1['target_speed_sps']:.1f}\n"
-                f"EL: pos={st2['position_deg']:.2f}°  spd={st2['current_speed_sps']:.1f} sps  tgt={st2['target_speed_sps']:.1f}\n"
-                f"Command speed={self.command_speed:.1f} sps | Microstep={st1['microstep']} | Track={'ON' if self.tracking_enabled else 'OFF'}{fault}"
+                f"EL: pos={el_disp:.2f}°  spd={st2['current_speed_sps']:.1f} sps  tgt={st2['target_speed_sps']:.1f}\n"
+                f"Command speed={self.command_speed:.1f} sps | Microstep={st1['microstep']} | PoseSrc={pose_src} | Track={'ON' if self.tracking_enabled else 'OFF'}{fault}"
             )
         )
         if self.imu_reader is not None:
-            imu = self.imu_reader.get_latest_dict()
             if imu:
                 taz = tel = 0.0
                 if self.imu_hold_ctrl is not None:
@@ -1988,7 +1999,7 @@ class SimGuiApp:
                         f" | IMU-HOLD={hold_txt} TGTrel AZ={taz:.2f} EL={tel:.2f}{extra}"
                     )
                 )
-        self._draw_rotator(st1, st2)
+        self._draw_rotator(az_disp, el_disp)
         self.root.after(50, self._update_ui)
 
     def run(self):
@@ -2063,10 +2074,15 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
         saz, sel = sat_az_el()
         if saz is None or sel is None:
             return
-        st1 = motor_1.get_status()
-        st2 = motor_2.get_status()
-        cur_az = st1["position_deg"] % 360.0
-        cur_el = st2["position_deg"]
+        imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
+        if imu:
+            cur_az = float(imu["azimuth_deg"]) % 360.0
+            cur_el = float(imu["elevation_deg"])
+        else:
+            st1 = motor_1.get_status()
+            st2 = motor_2.get_status()
+            cur_az = st1["position_deg"] % 360.0
+            cur_el = st2["position_deg"]
         target_az = (saz + cfg_m1.az_offset_deg) % 360.0
         if cfg_m1.soft_limit_min_deg is not None:
             target_az = max(cfg_m1.soft_limit_min_deg, target_az)
@@ -2078,12 +2094,20 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
     def print_status():
         st1 = motor_1.get_status()
         st2 = motor_2.get_status()
-        az_disp = st1["position_deg"] % 360.0
+        imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
+        if imu:
+            az_disp = float(imu["azimuth_deg"]) % 360.0
+            el_disp = float(imu["elevation_deg"])
+            pose_src = "IMU"
+        else:
+            az_disp = st1["position_deg"] % 360.0
+            el_disp = st2["position_deg"]
+            pose_src = "MOTOR"
         saz, sel = sat_az_el()
         sat_txt = f"{selected_sat_name} AZ={saz:.2f} EL={sel:.2f}" if saz is not None and sel is not None else selected_sat_name
         print(f"M1(AZ) pos={az_disp:.2f} spd={st1['current_speed_sps']:.1f} tgt={st1['target_speed_sps']:.1f}")
-        print(f"M2(EL) pos={st2['position_deg']:.2f} spd={st2['current_speed_sps']:.1f} tgt={st2['target_speed_sps']:.1f}")
-        print(f"speed={command_speed:.1f} ms={st1['microstep']} track={'ON' if tracking_enabled else 'OFF'} sat={sat_txt}")
+        print(f"M2(EL) pos={el_disp:.2f} spd={st2['current_speed_sps']:.1f} tgt={st2['target_speed_sps']:.1f}")
+        print(f"speed={command_speed:.1f} ms={st1['microstep']} pose={pose_src} track={'ON' if tracking_enabled else 'OFF'} sat={sat_txt}")
         print(f"limits AZ[{cfg_m1.soft_limit_min_deg},{cfg_m1.soft_limit_max_deg}] EL[{cfg_m2.soft_limit_min_deg},{cfg_m2.soft_limit_max_deg}] offset={cfg_m1.az_offset_deg}")
         if imu_reader is not None:
             imu = imu_reader.get_latest_dict()
@@ -2435,20 +2459,24 @@ def main():
                 if now - last_report > 0.25:
                     st1 = motor_1.get_status()
                     st2 = motor_2.get_status()
+                    imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
+                    if imu:
+                        az_pos = float(imu["azimuth_deg"]) % 360.0
+                        el_pos = float(imu["elevation_deg"])
+                        pose_tag = "IMU"
+                    else:
+                        az_pos = st1["position_deg"] % 360.0
+                        el_pos = st2["position_deg"]
+                        pose_tag = "MOTOR"
                     fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
                     fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
                     imu_txt = ""
-                    if imu_reader is not None:
-                        imu = imu_reader.get_latest_dict()
-                        if imu:
-                            imu_txt = (
-                                f" | IMU AZ={imu['azimuth_deg']:6.2f} EL={imu['elevation_deg']:6.2f} "
-                                f"HDG={imu['compass_deg']:6.2f}"
-                            )
+                    if imu:
+                        imu_txt = f" | HDG={imu['compass_deg']:6.2f}"
                     sys.stdout.write(
-                        f"\rM1 POS={(st1['position_deg'] % 360.0):7.2f} SPD={st1['current_speed_sps']:7.1f} "
-                        f"| M2 POS={st2['position_deg']:7.2f} SPD={st2['current_speed_sps']:7.1f} "
-                        f"| MS={st1['microstep']:2d}{fault1}{fault2}{imu_txt}       "
+                        f"\rM1 POS={az_pos:7.2f} SPD={st1['current_speed_sps']:7.1f} "
+                        f"| M2 POS={el_pos:7.2f} SPD={st2['current_speed_sps']:7.1f} "
+                        f"| SRC={pose_tag} MS={st1['microstep']:2d}{fault1}{fault2}{imu_txt}       "
                     )
                     sys.stdout.flush()
                     last_report = now
