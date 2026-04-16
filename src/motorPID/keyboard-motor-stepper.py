@@ -565,6 +565,7 @@ def clear_screen():
 
 def draw_sim_ui(st1, st2, command_speed):
     clear_screen()
+    az_disp = st1["position_deg"] % 360.0
     print("=== ROTATOR STEPPER SIMULATION UI ===")
     print("Konfigurasi: NEMA23 | TB6600 | Microstep 2 (400 pulse/rev) | Current 2.0A")
     print("")
@@ -574,7 +575,7 @@ def draw_sim_ui(st1, st2, command_speed):
     print("- Space=Stop halus, E=E-Stop, R=Reset fault, +/- speed, 1..5 microstep, Q=Quit")
     print("")
     print(
-        f"AZ  pos={st1['position_deg']:8.2f} deg  spd={st1['current_speed_sps']:8.1f} sps  "
+        f"AZ  pos={az_disp:8.2f} deg  spd={st1['current_speed_sps']:8.1f} sps  "
         f"tgt={st1['target_speed_sps']:8.1f}  ms={st1['microstep']}"
     )
     print(
@@ -970,8 +971,12 @@ class SimGuiApp:
             self.cfg_m1.az_offset_deg = az_offset
             self.az_ls_deg = az_ls
             self.cfg_m1.az_ls_deg = az_ls
-            self.cfg_m1.soft_limit_min_deg = 0.0
-            self.cfg_m1.soft_limit_max_deg = 360.0
+            # Aktifkan blok crossing AZ LS saat user mengisi nilai non-zero/non-360.
+            self.cfg_m1.az_ls_block_crossing = not (abs(az_ls) < 1e-9 or abs(az_ls - 360.0) < 1e-9)
+            # Untuk mode AZ LS, nonaktifkan soft-limit AZ 0/360 agar 0 derajat
+            # bukan batas lagi; batas AZ ditentukan oleh crossing AZ LS saja.
+            self.cfg_m1.soft_limit_min_deg = None
+            self.cfg_m1.soft_limit_max_deg = None
             self.cfg_m2.soft_limit_min_deg = el_min
             self.cfg_m2.soft_limit_max_deg = el_max
             self.lbl_sat.config(
@@ -980,7 +985,11 @@ class SimGuiApp:
                     if self.sat_az is not None and self.sat_el is not None
                     else f"SAT: {self.selected_sat_name} | AZ: - | EL: -"
                 )
-                + f"  [AZ LS ref={self.az_ls_deg:.2f} deg applied]"
+                + (
+                    f"  [AZ LS ref={self.az_ls_deg:.2f} deg | crossing block ON]"
+                    if self.cfg_m1.az_ls_block_crossing
+                    else f"  [AZ LS ref={self.az_ls_deg:.2f} deg | crossing block OFF]"
+                )
             )
         except Exception as exc:
             self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [ERROR: {exc}]")
@@ -1103,6 +1112,7 @@ class SimGuiApp:
     def _update_ui(self):
         st1 = self.motor_1.get_status()
         st2 = self.motor_2.get_status()
+        az_disp = st1["position_deg"] % 360.0
         self._calc_selected_az_el()
         self._tracking_step()
         fault = ""
@@ -1118,7 +1128,7 @@ class SimGuiApp:
 
         self.lbl_status.config(
             text=(
-                f"AZ: pos={st1['position_deg']:.2f}°  spd={st1['current_speed_sps']:.1f} sps  tgt={st1['target_speed_sps']:.1f}\n"
+                f"AZ: pos={az_disp:.2f}°  spd={st1['current_speed_sps']:.1f} sps  tgt={st1['target_speed_sps']:.1f}\n"
                 f"EL: pos={st2['position_deg']:.2f}°  spd={st2['current_speed_sps']:.1f} sps  tgt={st2['target_speed_sps']:.1f}\n"
                 f"Command speed={self.command_speed:.1f} sps | Microstep={st1['microstep']} | Track={'ON' if self.tracking_enabled else 'OFF'}{fault}"
             )
@@ -1213,9 +1223,10 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2):
     def print_status():
         st1 = motor_1.get_status()
         st2 = motor_2.get_status()
+        az_disp = st1["position_deg"] % 360.0
         saz, sel = sat_az_el()
         sat_txt = f"{selected_sat_name} AZ={saz:.2f} EL={sel:.2f}" if saz is not None and sel is not None else selected_sat_name
-        print(f"M1(AZ) pos={st1['position_deg']:.2f} spd={st1['current_speed_sps']:.1f} tgt={st1['target_speed_sps']:.1f}")
+        print(f"M1(AZ) pos={az_disp:.2f} spd={st1['current_speed_sps']:.1f} tgt={st1['target_speed_sps']:.1f}")
         print(f"M2(EL) pos={st2['position_deg']:.2f} spd={st2['current_speed_sps']:.1f} tgt={st2['target_speed_sps']:.1f}")
         print(f"speed={command_speed:.1f} ms={st1['microstep']} track={'ON' if tracking_enabled else 'OFF'} sat={sat_txt}")
         print(f"limits AZ[{cfg_m1.soft_limit_min_deg},{cfg_m1.soft_limit_max_deg}] EL[{cfg_m2.soft_limit_min_deg},{cfg_m2.soft_limit_max_deg}] offset={cfg_m1.az_offset_deg}")
@@ -1467,7 +1478,7 @@ def main():
                     fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
                     fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
                     sys.stdout.write(
-                        f"\rM1 POS={st1['position_deg']:7.2f} SPD={st1['current_speed_sps']:7.1f} "
+                        f"\rM1 POS={(st1['position_deg'] % 360.0):7.2f} SPD={st1['current_speed_sps']:7.1f} "
                         f"| M2 POS={st2['position_deg']:7.2f} SPD={st2['current_speed_sps']:7.1f} "
                         f"| MS={st1['microstep']:2d}{fault1}{fault2}       "
                     )
