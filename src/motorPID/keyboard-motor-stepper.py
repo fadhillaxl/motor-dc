@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 # coding: utf-8
 """
 TB6600 Stepper Keyboard Controller
@@ -43,8 +44,12 @@ import threading
 import argparse
 import json
 import os
+import platform
+import logging
+import math
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass
 from az_ls_utils import az_ls_allows_motion, validate_az_ls
 try:
@@ -70,6 +75,27 @@ except Exception:
     Topos = None
     load = None
     SKYFIELD_AVAILABLE = False
+
+# =====================================================
+# PYTHON PATH -> folder chs lokal project (samakan pola read_wt901.py)
+# =====================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "Python-SDK-WT901C485", "chs"))
+if SDK_CHS not in sys.path:
+    sys.path.insert(0, SDK_CHS)
+
+try:
+    import lib.device_model as wt901_deviceModel
+    from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
+    from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
+    WT901_SDK_AVAILABLE = True
+    WT901_SDK_IMPORT_ERROR = ""
+except Exception as exc:
+    wt901_deviceModel = None
+    JY901SDataProcessor = None
+    Protocol485Resolver = None
+    WT901_SDK_AVAILABLE = False
+    WT901_SDK_IMPORT_ERROR = str(exc)
 
 
 @dataclass
@@ -114,6 +140,403 @@ class StepperConfig:
     az_offset_deg: float = 0.0     # Kalibrasi azimuth terhadap Utara kompas
     az_ls_deg: float = 0.0         # 0=full range, non-zero=blok jika lintas titik AZ LS
     az_ls_block_crossing: bool = False  # Default: AZ LS sebagai referensi, bukan hard-stop
+
+
+@dataclass
+class WT901Config:
+    enabled: bool = False
+    interface: str = "uart"  # uart|i2c
+    port_name: str = ""
+    baud: int = 9600
+    address: int = 0x50
+    sample_rate_hz: float = 50.0
+    timeout_s: float = 0.08
+    retry_limit: int = 5
+    reconnect_delay_s: float = 0.5
+    buffer_size: int = 512
+    moving_avg_window: int = 5
+    outlier_deg_threshold: float = 35.0
+    declination_deg: float = 0.0
+    log_level: str = "INFO"
+
+
+@dataclass
+class WT901Sample:
+    timestamp: float
+    az_deg: float
+    el_deg: float
+    compass_deg: float
+    roll_deg: float
+    pitch_deg: float
+    yaw_deg: float
+    gyro_dps: tuple[float, float, float]
+    mag: tuple[float, float, float]
+    temperature_c: float | None
+    source: str = "sdk"
+
+
+class WT901Reader:
+    """WT901 IMU service for hardware mode with retry, filtering, and buffering."""
+
+    def __init__(self, cfg: WT901Config):
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._run = False
+        self._thread = None
+        self._device = None
+        self._connected = False
+        self._last_error = ""
+        self._retry_count = 0
+        self._last_ok_t = None
+        self._latest: WT901Sample | None = None
+        self._buffer = deque(maxlen=max(64, int(cfg.buffer_size)))
+        self._yaw_hist = deque(maxlen=max(3, int(cfg.moving_avg_window)))
+        self._pitch_hist = deque(maxlen=max(3, int(cfg.moving_avg_window)))
+        self._compass_hist = deque(maxlen=max(3, int(cfg.moving_avg_window)))
+        self._gyro_bias = [0.0, 0.0, 0.0]
+        self._hard_iron = [0.0, 0.0, 0.0]
+        self._soft_iron = [1.0, 1.0, 1.0]
+        self._logger = logging.getLogger("motorPID.wt901")
+        self._logger.setLevel(getattr(logging, str(cfg.log_level).upper(), logging.INFO))
+
+    @staticmethod
+    def _default_port() -> str:
+        return "/dev/ttyUSB0" if platform.system().lower() == "linux" else "/dev/tty.usbserial-1330"
+
+    @staticmethod
+    def _wrap_360(v: float) -> float:
+        x = float(v) % 360.0
+        return x if x >= 0.0 else x + 360.0
+
+    @staticmethod
+    def _to_deg_rad(v_deg: float) -> tuple[float, float]:
+        return float(v_deg), math.radians(float(v_deg))
+
+    @staticmethod
+    def _moving_average(hist: deque) -> float:
+        if not hist:
+            return 0.0
+        return float(sum(hist)) / float(len(hist))
+
+    @staticmethod
+    def _decode_int16_le(lo: int, hi: int) -> int:
+        raw = ((int(hi) & 0xFF) << 8) | (int(lo) & 0xFF)
+        return raw - 65536 if raw >= 32768 else raw
+
+    @classmethod
+    def parse_uart_frame(cls, frame: bytes) -> dict | None:
+        """
+        Parse 11-byte WT901 UART frame (0x55 + type + 8 data bytes + checksum).
+        Includes checksum and little-endian int16 conversion.
+        """
+        if len(frame) != 11 or frame[0] != 0x55:
+            return None
+        checksum = sum(frame[:10]) & 0xFF
+        if checksum != frame[10]:
+            return None
+        frame_type = frame[1]
+        vals = [
+            cls._decode_int16_le(frame[2], frame[3]),
+            cls._decode_int16_le(frame[4], frame[5]),
+            cls._decode_int16_le(frame[6], frame[7]),
+            cls._decode_int16_le(frame[8], frame[9]),
+        ]
+        return {"type": frame_type, "values_i16": vals, "checksum_ok": True}
+
+    def _new_device(self):
+        if not WT901_SDK_AVAILABLE:
+            raise RuntimeError(f"WT901 SDK tidak tersedia: {WT901_SDK_IMPORT_ERROR}")
+        dev = wt901_deviceModel.DeviceModel(
+            "WT901",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
+            "51_0",
+        )
+        dev.ADDR = int(self.cfg.address) & 0xFF
+        port_name = self.cfg.port_name.strip() if self.cfg.port_name else self._default_port()
+        if self.cfg.interface.lower() == "uart":
+            dev.serialConfig.portName = port_name
+            dev.serialConfig.baud = int(self.cfg.baud)
+            if hasattr(dev.serialConfig, "timeout"):
+                dev.serialConfig.timeout = float(self.cfg.timeout_s)
+        elif self.cfg.interface.lower() == "i2c":
+            # SDK ini berbasis Protocol485Resolver; i2c disediakan sebagai mode degrade.
+            # Jika object i2cConfig tersedia, set param dasar; jika tidak, fallback error.
+            if hasattr(dev, "i2cConfig"):
+                if hasattr(dev.i2cConfig, "address"):
+                    dev.i2cConfig.address = int(self.cfg.address) & 0x7F
+                if hasattr(dev.i2cConfig, "bus"):
+                    dev.i2cConfig.bus = 1
+            else:
+                raise RuntimeError("I2C mode belum didukung oleh SDK WT901C485 pada project ini.")
+        else:
+            raise ValueError(f"WT901 interface unsupported: {self.cfg.interface}")
+        return dev
+
+    def initialize(self):
+        if not self.cfg.enabled:
+            self._logger.info("WT901 disabled by config.")
+            return
+        self._connect_with_retry()
+        self._run = True
+        period = 1.0 / max(50.0, float(self.cfg.sample_rate_hz))
+        self._thread = threading.Thread(target=self._acquire_loop, args=(period,), daemon=True)
+        self._thread.start()
+
+    def _connect_with_retry(self):
+        for attempt in range(1, max(1, int(self.cfg.retry_limit)) + 1):
+            try:
+                dev = self._new_device()
+                dev.openDevice()
+                vals = dev.readReg(0x02, 3)
+                if len(vals) <= 0:
+                    raise RuntimeError("No response on readReg(0x02,3)")
+                self._device = dev
+                self._connected = True
+                self._retry_count = 0
+                self._last_error = ""
+                self._logger.info("WT901 connected on attempt %d", attempt)
+                return
+            except Exception as exc:
+                self._last_error = f"connect fail attempt {attempt}: {exc}"
+                self._retry_count += 1
+                self._connected = False
+                self._logger.error("WT901 connect error: %s", self._last_error)
+                time.sleep(float(self.cfg.reconnect_delay_s))
+        raise RuntimeError(f"WT901 gagal konek setelah {self.cfg.retry_limit} percobaan.")
+
+    def _safe_get(self, key: str, default: float = 0.0) -> float:
+        try:
+            return float(self._device.getDeviceData(key))
+        except Exception:
+            return float(default)
+
+    def _read_sample_from_sdk(self) -> WT901Sample:
+        if self._device is None:
+            raise RuntimeError("WT901 device belum diinisialisasi")
+        regs = self._device.readReg(0x30, 41)
+        if len(regs) <= 0:
+            raise TimeoutError("WT901 timeout / empty register response")
+
+        roll = self._safe_get("angleX")
+        pitch = self._safe_get("angleY")
+        yaw = self._safe_get("angleZ")
+        gx = self._safe_get("gyroX") - self._gyro_bias[0]
+        gy = self._safe_get("gyroY") - self._gyro_bias[1]
+        gz = self._safe_get("gyroZ") - self._gyro_bias[2]
+        mx = (self._safe_get("magX") - self._hard_iron[0]) * self._soft_iron[0]
+        my = (self._safe_get("magY") - self._hard_iron[1]) * self._soft_iron[1]
+        mz = (self._safe_get("magZ") - self._hard_iron[2]) * self._soft_iron[2]
+        temp_c = self._safe_get("temperature")
+
+        # Compass dari magnetometer jika valid, fallback ke yaw.
+        if abs(mx) > 1e-9 or abs(my) > 1e-9:
+            compass = self._wrap_360(math.degrees(math.atan2(my, mx)) + self.cfg.declination_deg)
+        else:
+            compass = self._wrap_360(yaw + self.cfg.declination_deg)
+
+        az = self._wrap_360(yaw + self.cfg.declination_deg)
+        el = max(-90.0, min(90.0, pitch))
+        sample = WT901Sample(
+            timestamp=time.time(),
+            az_deg=az,
+            el_deg=el,
+            compass_deg=compass,
+            roll_deg=roll,
+            pitch_deg=pitch,
+            yaw_deg=yaw,
+            gyro_dps=(gx, gy, gz),
+            mag=(mx, my, mz),
+            temperature_c=temp_c,
+        )
+        self._validate_ranges(sample)
+        return self._filter_sample(sample)
+
+    def _validate_ranges(self, smp: WT901Sample):
+        if not (-180.0 <= smp.roll_deg <= 180.0):
+            raise ValueError(f"roll out of range: {smp.roll_deg}")
+        if not (-180.0 <= smp.pitch_deg <= 180.0):
+            raise ValueError(f"pitch out of range: {smp.pitch_deg}")
+        if not (-360.0 <= smp.yaw_deg <= 360.0):
+            raise ValueError(f"yaw out of range: {smp.yaw_deg}")
+        for g in smp.gyro_dps:
+            if not (-5000.0 <= g <= 5000.0):
+                raise ValueError(f"gyro out of range: {g}")
+
+    def _filter_sample(self, smp: WT901Sample) -> WT901Sample:
+        self._yaw_hist.append(self._wrap_360(smp.az_deg))
+        self._pitch_hist.append(float(smp.el_deg))
+        self._compass_hist.append(self._wrap_360(smp.compass_deg))
+
+        az_avg = self._moving_average(self._yaw_hist)
+        el_avg = self._moving_average(self._pitch_hist)
+        comp_avg = self._moving_average(self._compass_hist)
+
+        if self._latest is not None:
+            delta = abs(az_avg - self._latest.az_deg)
+            if delta > 180.0:
+                delta = 360.0 - delta
+            if delta > float(self.cfg.outlier_deg_threshold):
+                az_avg = self._latest.az_deg
+                comp_avg = self._latest.compass_deg
+
+        smp.az_deg = self._wrap_360(az_avg)
+        smp.el_deg = max(-90.0, min(90.0, el_avg))
+        smp.compass_deg = self._wrap_360(comp_avg)
+        return smp
+
+    def _acquire_loop(self, period_s: float):
+        while self._run:
+            t0 = time.time()
+            try:
+                smp = self._read_sample_from_sdk()
+                with self._lock:
+                    self._latest = smp
+                    self._buffer.append(smp)
+                with self._status_lock:
+                    self._last_ok_t = smp.timestamp
+                    self._connected = True
+                    self._retry_count = 0
+                    self._last_error = ""
+            except Exception as exc:
+                with self._status_lock:
+                    self._last_error = str(exc)
+                    self._retry_count += 1
+                self._logger.error("WT901 read error: %s", exc)
+                if self._retry_count >= max(1, int(self.cfg.retry_limit)):
+                    self._reset_connection()
+            dt = time.time() - t0
+            time.sleep(max(0.0, period_s - dt))
+
+    def _reset_connection(self):
+        self._logger.warning("WT901 reset connection (retry=%d)", self._retry_count)
+        try:
+            if self._device is not None:
+                self._device.closeDevice()
+        except Exception:
+            pass
+        self._device = None
+        self._connected = False
+        time.sleep(float(self.cfg.reconnect_delay_s))
+        try:
+            self._connect_with_retry()
+        except Exception as exc:
+            self._last_error = f"reconnect failed: {exc}"
+            self._logger.error("WT901 reconnect failed: %s", exc)
+
+    def get_latest(self) -> WT901Sample | None:
+        with self._lock:
+            return self._latest
+
+    def get_latest_dict(self) -> dict:
+        smp = self.get_latest()
+        if smp is None:
+            return {}
+        az_deg, az_rad = self._to_deg_rad(smp.az_deg)
+        el_deg, el_rad = self._to_deg_rad(smp.el_deg)
+        cp_deg, cp_rad = self._to_deg_rad(smp.compass_deg)
+        return {
+            "timestamp": smp.timestamp,
+            "azimuth_deg": az_deg,
+            "azimuth_rad": az_rad,
+            "elevation_deg": el_deg,
+            "elevation_rad": el_rad,
+            "compass_deg": cp_deg,
+            "compass_rad": cp_rad,
+            "roll_deg": smp.roll_deg,
+            "pitch_deg": smp.pitch_deg,
+            "yaw_deg": smp.yaw_deg,
+            "gyro_dps": smp.gyro_dps,
+            "mag": smp.mag,
+            "temperature_c": smp.temperature_c,
+            "source": smp.source,
+        }
+
+    def get_buffer_snapshot(self) -> list[dict]:
+        with self._lock:
+            data = list(self._buffer)
+        out = []
+        for smp in data:
+            out.append(
+                {
+                    "timestamp": smp.timestamp,
+                    "azimuth_deg": smp.az_deg,
+                    "elevation_deg": smp.el_deg,
+                    "compass_deg": smp.compass_deg,
+                }
+            )
+        return out
+
+    def get_status(self) -> dict:
+        with self._status_lock:
+            return {
+                "enabled": self.cfg.enabled,
+                "connected": self._connected,
+                "interface": self.cfg.interface,
+                "port": self.cfg.port_name or self._default_port(),
+                "baud": self.cfg.baud,
+                "sample_rate_hz": max(50.0, float(self.cfg.sample_rate_hz)),
+                "last_ok_timestamp": self._last_ok_t,
+                "retry_count": self._retry_count,
+                "last_error": self._last_error,
+                "buffer_len": len(self._buffer),
+            }
+
+    def set_declination(self, decl_deg: float):
+        self.cfg.declination_deg = float(decl_deg)
+
+    def set_hard_iron_offset(self, mx: float, my: float, mz: float):
+        self._hard_iron = [float(mx), float(my), float(mz)]
+
+    def set_soft_iron_scale(self, sx: float, sy: float, sz: float):
+        self._soft_iron = [max(1e-6, float(sx)), max(1e-6, float(sy)), max(1e-6, float(sz))]
+
+    def calibrate_gyro_bias(self, duration_s: float = 2.0):
+        duration_s = max(0.2, float(duration_s))
+        t_end = time.time() + duration_s
+        acc = [0.0, 0.0, 0.0]
+        n = 0
+        while time.time() < t_end:
+            smp = self.get_latest()
+            if smp is not None:
+                acc[0] += smp.gyro_dps[0]
+                acc[1] += smp.gyro_dps[1]
+                acc[2] += smp.gyro_dps[2]
+                n += 1
+            time.sleep(0.01)
+        if n > 0:
+            self._gyro_bias = [acc[0] / n, acc[1] / n, acc[2] / n]
+            self._logger.info("WT901 gyro bias calibrated: %s", self._gyro_bias)
+
+    def begin_field_calibration(self):
+        if self._device is None:
+            raise RuntimeError("WT901 belum connected")
+        if hasattr(self._device, "BeginFiledCalibration"):
+            self._device.BeginFiledCalibration()
+            self._logger.info("WT901 field calibration started")
+        else:
+            raise RuntimeError("BeginFiledCalibration not available on current SDK")
+
+    def end_field_calibration(self):
+        if self._device is None:
+            raise RuntimeError("WT901 belum connected")
+        if hasattr(self._device, "EndFiledCalibration"):
+            self._device.EndFiledCalibration()
+            self._logger.info("WT901 field calibration ended")
+        else:
+            raise RuntimeError("EndFiledCalibration not available on current SDK")
+
+    def close(self):
+        self._run = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+        try:
+            if self._device is not None:
+                self._device.closeDevice()
+        except Exception:
+            pass
+        self._connected = False
 
 
 class TB6600Stepper:
@@ -631,11 +1054,12 @@ def tle_extract_lines(item: dict):
 
 
 class SimGuiApp:
-    def __init__(self, motor_1, motor_2, cfg_m1, cfg_m2):
+    def __init__(self, motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | None = None):
         self.motor_1 = motor_1
         self.motor_2 = motor_2
         self.cfg_m1 = cfg_m1
         self.cfg_m2 = cfg_m2
+        self.imu_reader = imu_reader
         self.command_speed = 600.0
         self.az_pos_pressed = False
         self.az_neg_pressed = False
@@ -1133,6 +1557,16 @@ class SimGuiApp:
                 f"Command speed={self.command_speed:.1f} sps | Microstep={st1['microstep']} | Track={'ON' if self.tracking_enabled else 'OFF'}{fault}"
             )
         )
+        if self.imu_reader is not None:
+            imu = self.imu_reader.get_latest_dict()
+            if imu:
+                self.lbl_status.config(
+                    text=self.lbl_status.cget("text")
+                    + (
+                        f"\nIMU AZ={imu['azimuth_deg']:.2f}° EL={imu['elevation_deg']:.2f}° "
+                        f"HDG={imu['compass_deg']:.2f}° T={imu['temperature_c']:.1f}C"
+                    )
+                )
         self._draw_rotator(st1, st2)
         self.root.after(50, self._update_ui)
 
@@ -1140,7 +1574,7 @@ class SimGuiApp:
         self.root.mainloop()
 
 
-def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2):
+def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | None = None):
     print("\n=== TB6600 ROTATOR CLI MODE ===")
     print("Type 'help' for commands.")
 
@@ -1230,6 +1664,18 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2):
         print(f"M2(EL) pos={st2['position_deg']:.2f} spd={st2['current_speed_sps']:.1f} tgt={st2['target_speed_sps']:.1f}")
         print(f"speed={command_speed:.1f} ms={st1['microstep']} track={'ON' if tracking_enabled else 'OFF'} sat={sat_txt}")
         print(f"limits AZ[{cfg_m1.soft_limit_min_deg},{cfg_m1.soft_limit_max_deg}] EL[{cfg_m2.soft_limit_min_deg},{cfg_m2.soft_limit_max_deg}] offset={cfg_m1.az_offset_deg}")
+        if imu_reader is not None:
+            imu = imu_reader.get_latest_dict()
+            if imu:
+                print(
+                    "imu "
+                    f"AZ={imu['azimuth_deg']:.2f}({imu['azimuth_rad']:.4f} rad) "
+                    f"EL={imu['elevation_deg']:.2f}({imu['elevation_rad']:.4f} rad) "
+                    f"HDG={imu['compass_deg']:.2f} "
+                    f"GYRO={imu['gyro_dps']} MAG={imu['mag']}"
+                )
+            else:
+                print(f"imu status={imu_reader.get_status()}")
 
     def run_arrow_control():
         nonlocal tracking_enabled, command_speed
@@ -1292,8 +1738,38 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2):
                 print("speed <sps> | micro <1|2|4|8|16> | offset <deg>")
                 print("limit az <min> <max> | limit el <min> <max>")
                 print("obs <lat> <lon> <alt_m> | tle search <text> | tle select <idx> | track on|off")
+                print("imu status | imu decl <deg> | imu gyrocal <sec> | imu magcal start|end")
             elif c == "status":
                 print_status()
+            elif c == "imu" and len(p) >= 2 and p[1].lower() == "status":
+                if imu_reader is None:
+                    print("IMU not enabled")
+                else:
+                    print(imu_reader.get_status())
+                    print(imu_reader.get_latest_dict())
+            elif c == "imu" and len(p) == 3 and p[1].lower() == "decl":
+                if imu_reader is None:
+                    print("IMU not enabled")
+                else:
+                    imu_reader.set_declination(float(p[2]))
+                    print(f"IMU declination -> {float(p[2]):.3f} deg")
+            elif c == "imu" and len(p) == 3 and p[1].lower() == "gyrocal":
+                if imu_reader is None:
+                    print("IMU not enabled")
+                else:
+                    imu_reader.calibrate_gyro_bias(float(p[2]))
+                    print("IMU gyro bias calibration done")
+            elif c == "imu" and len(p) == 3 and p[1].lower() == "magcal":
+                if imu_reader is None:
+                    print("IMU not enabled")
+                elif p[2].lower() == "start":
+                    imu_reader.begin_field_calibration()
+                    print("IMU magnetic calibration started")
+                elif p[2].lower() == "end":
+                    imu_reader.end_field_calibration()
+                    print("IMU magnetic calibration ended")
+                else:
+                    raise ValueError("imu magcal expects start|end")
             elif c == "az+":
                 tracking_enabled = False; motor_1.set_target_speed(abs(command_speed))
             elif c == "az-":
@@ -1364,7 +1840,20 @@ def main():
     parser.add_argument("--gui", action="store_true", help="Jalankan GUI (bisa hardware atau simulasi)")
     parser.add_argument("--sim-gui", action="store_true", help="Jalankan simulasi GUI (window)")
     parser.add_argument("--cli", action="store_true", help="Run interactive CLI mode")
+    parser.add_argument("--imu", action="store_true", help="Aktifkan akuisisi WT901 IMU (hardware mode)")
+    parser.add_argument("--imu-interface", default="uart", choices=["uart", "i2c"], help="Interface WT901")
+    parser.add_argument("--imu-port", default="", help="Serial port WT901, default auto")
+    parser.add_argument("--imu-baud", type=int, default=9600, help="Baudrate WT901 UART")
+    parser.add_argument("--imu-addr", type=lambda x: int(x, 0), default=0x50, help="WT901 device address (e.g. 0x50)")
+    parser.add_argument("--imu-rate-hz", type=float, default=50.0, help="Sampling rate WT901 (>=50Hz)")
+    parser.add_argument("--imu-declination", type=float, default=0.0, help="Magnetic declination compensation (deg)")
+    parser.add_argument("--imu-log-level", default="INFO", help="WT901 log level (DEBUG/INFO/WARN/ERROR)")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, str(args.imu_log_level).upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     # Motor 1 (sesuai mapping user)
     cfg_m1 = StepperConfig(
@@ -1401,19 +1890,37 @@ def main():
     else:
         motor_1 = TB6600Stepper(cfg_m1)
         motor_2 = TB6600Stepper(cfg_m2)
+    imu_reader = None
+    if args.imu and not use_sim:
+        imu_cfg = WT901Config(
+            enabled=True,
+            interface=args.imu_interface,
+            port_name=args.imu_port,
+            baud=int(args.imu_baud),
+            address=int(args.imu_addr),
+            sample_rate_hz=max(50.0, float(args.imu_rate_hz)),
+            declination_deg=float(args.imu_declination),
+            log_level=str(args.imu_log_level).upper(),
+        )
+        try:
+            imu_reader = WT901Reader(imu_cfg)
+            imu_reader.initialize()
+        except Exception as exc:
+            logging.getLogger("motorPID.wt901").error("IMU disabled due to init failure: %s", exc)
+            imu_reader = None
 
     command_speed = 600.0
     last_report = 0.0
 
     try:
         if args.cli:
-            run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2)
+            run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader=imu_reader)
         elif use_gui:
             if not TK_AVAILABLE:
                 raise RuntimeError("tkinter tidak tersedia. Install tkinter atau jalankan tanpa --gui/--sim-gui.")
             if not os.environ.get("DISPLAY"):
                 raise RuntimeError("DISPLAY tidak terdeteksi. Jalankan dari desktop Raspberry Pi atau pakai X11 forwarding.")
-            app = SimGuiApp(motor_1, motor_2, cfg_m1, cfg_m2)
+            app = SimGuiApp(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader=imu_reader)
             app.run()
         elif use_sim:
             with RawTerminal():
@@ -1479,10 +1986,18 @@ def main():
                     st2 = motor_2.get_status()
                     fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
                     fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
+                    imu_txt = ""
+                    if imu_reader is not None:
+                        imu = imu_reader.get_latest_dict()
+                        if imu:
+                            imu_txt = (
+                                f" | IMU AZ={imu['azimuth_deg']:6.2f} EL={imu['elevation_deg']:6.2f} "
+                                f"HDG={imu['compass_deg']:6.2f}"
+                            )
                     sys.stdout.write(
                         f"\rM1 POS={(st1['position_deg'] % 360.0):7.2f} SPD={st1['current_speed_sps']:7.1f} "
                         f"| M2 POS={st2['position_deg']:7.2f} SPD={st2['current_speed_sps']:7.1f} "
-                        f"| MS={st1['microstep']:2d}{fault1}{fault2}       "
+                        f"| MS={st1['microstep']:2d}{fault1}{fault2}{imu_txt}       "
                     )
                     sys.stdout.flush()
                     last_report = now
@@ -1528,6 +2043,8 @@ def main():
         print(f"\nERROR runtime: {exc}")
     finally:
         print("\nShutdown controller...")
+        if imu_reader is not None:
+            imu_reader.close()
         motor_1.close()
         motor_2.close()
         if GPIO_AVAILABLE and not use_sim:
