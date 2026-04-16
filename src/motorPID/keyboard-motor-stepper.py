@@ -140,6 +140,7 @@ class StepperConfig:
     soft_limit_max_deg: float | None = 360.0
     az_wrap_enabled: bool = False  # False: tidak boleh lintas 0/360 (sesuai rotator non-continous)
     az_offset_deg: float = 0.0     # Kalibrasi azimuth terhadap Utara kompas
+    el_offset_deg: float = 0.0     # Kalibrasi elevasi terhadap referensi mekanik
     az_ls_deg: float = 0.0         # 0=full range, non-zero=blok jika lintas titik AZ LS
     az_ls_block_crossing: bool = False  # Default: AZ LS sebagai referensi, bukan hard-stop
 
@@ -914,6 +915,11 @@ class TB6600Stepper:
         with self._lock:
             return (self._position_full_steps / self.cfg.steps_per_rev) * 360.0
 
+    def set_position_deg(self, position_deg: float):
+        """Software calibration point: set current axis angle without moving motor."""
+        with self._lock:
+            self._position_full_steps = (float(position_deg) / 360.0) * float(self.cfg.steps_per_rev)
+
     def get_status(self) -> dict:
         with self._lock:
             return {
@@ -1116,6 +1122,11 @@ class SimStepper:
     def get_position_deg(self) -> float:
         with self._lock:
             return (self._position_full_steps / self.cfg.steps_per_rev) * 360.0
+
+    def set_position_deg(self, position_deg: float):
+        """Software calibration point: set current axis angle without moving motor."""
+        with self._lock:
+            self._position_full_steps = (float(position_deg) / 360.0) * float(self.cfg.steps_per_rev)
 
     def get_status(self) -> dict:
         with self._lock:
@@ -1483,6 +1494,10 @@ class SimGuiApp:
         self.ent_az_offset = tk.Entry(cal, width=8)
         self.ent_az_offset.insert(0, f"{self.cfg_m1.az_offset_deg:.2f}")
         self.ent_az_offset.pack(side=tk.LEFT, padx=2)
+        tk.Label(cal, text="EL offset (deg)").pack(side=tk.LEFT, padx=(10, 2))
+        self.ent_el_offset = tk.Entry(cal, width=8)
+        self.ent_el_offset.insert(0, f"{self.cfg_m2.el_offset_deg:.2f}")
+        self.ent_el_offset.pack(side=tk.LEFT, padx=2)
 
         limit_row = tk.Frame(self.content)
         limit_row.pack(pady=2, fill="x")
@@ -1532,8 +1547,10 @@ class SimGuiApp:
         tk.Button(ctrl, text="STOP", width=10, command=self._smooth_stop).grid(row=1, column=0, padx=4, pady=4)
         tk.Button(ctrl, text="E-STOP", width=10, command=self._estop).grid(row=1, column=1, padx=4, pady=4)
         tk.Button(ctrl, text="RESET", width=10, command=self._reset).grid(row=1, column=2, padx=4, pady=4)
-        tk.Button(ctrl, text="+ SPEED", width=10, command=self._speed_up).grid(row=1, column=3, padx=4, pady=4)
-        tk.Button(ctrl, text="- SPEED", width=10, command=self._speed_down).grid(row=1, column=4, padx=4, pady=4)
+        tk.Button(ctrl, text="CAL AZ=0", width=10, command=lambda: self._calibrate_axis("az", 0.0)).grid(row=1, column=3, padx=4, pady=4)
+        tk.Button(ctrl, text="CAL EL=0", width=10, command=lambda: self._calibrate_axis("el", 0.0)).grid(row=1, column=4, padx=4, pady=4)
+        tk.Button(ctrl, text="+ SPEED", width=10, command=self._speed_up).grid(row=1, column=5, padx=4, pady=4)
+        tk.Button(ctrl, text="- SPEED", width=10, command=self._speed_down).grid(row=1, column=6, padx=4, pady=4)
         self.btn_imu_hold = tk.Button(ctrl, text="IMU HOLD: OFF", width=14, command=self._toggle_imu_hold, bg="#5a5a5a", fg="white")
         self.btn_imu_hold.grid(row=2, column=0, padx=4, pady=4)
         tk.Button(ctrl, text="IMU ZERO", width=10, command=self._imu_zero).grid(row=2, column=1, padx=4, pady=4)
@@ -1749,9 +1766,21 @@ class SimGuiApp:
         self.motor_1.set_microstep(v)
         self.motor_2.set_microstep(v)
 
+    def _calibrate_axis(self, axis: str, deg: float):
+        try:
+            if axis == "az":
+                self.motor_1.set_position_deg(float(deg))
+            elif axis == "el":
+                self.motor_2.set_position_deg(float(deg))
+            else:
+                raise ValueError("axis must be az|el")
+        except Exception as exc:
+            self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [CAL ERR: {exc}]")
+
     def _apply_limit_offset(self):
         try:
             az_offset = float(self.ent_az_offset.get().strip())
+            el_offset = float(self.ent_el_offset.get().strip())
             az_ls = validate_az_ls(float(self.ent_az_ls.get().strip()))
             el_min = float(self.ent_el_min.get().strip())
             el_max = float(self.ent_el_max.get().strip())
@@ -1759,6 +1788,7 @@ class SimGuiApp:
                 raise ValueError("EL min must be < EL max")
 
             self.cfg_m1.az_offset_deg = az_offset
+            self.cfg_m2.el_offset_deg = el_offset
             self.az_ls_deg = az_ls
             self.cfg_m1.az_ls_deg = az_ls
             # Aktifkan blok crossing AZ LS saat user mengisi nilai non-zero/non-360.
@@ -1909,7 +1939,7 @@ class SimGuiApp:
             cur_el = st2["position_deg"]
         # Konversi azimuth satelit (kompas) ke frame mekanik rotator dengan offset kalibrasi.
         target_az = (self.sat_az + self.cfg_m1.az_offset_deg) % 360.0
-        target_el = self.sat_el
+        target_el = self.sat_el + self.cfg_m2.el_offset_deg
 
         # Clamp target ke rentang mekanik agar tidak forcing ke luar limit.
         if self.cfg_m1.soft_limit_min_deg is not None:
@@ -2084,12 +2114,13 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
             cur_az = st1["position_deg"] % 360.0
             cur_el = st2["position_deg"]
         target_az = (saz + cfg_m1.az_offset_deg) % 360.0
+        target_el = sel + cfg_m2.el_offset_deg
         if cfg_m1.soft_limit_min_deg is not None:
             target_az = max(cfg_m1.soft_limit_min_deg, target_az)
         if cfg_m1.soft_limit_max_deg is not None:
             target_az = min(cfg_m1.soft_limit_max_deg, target_az)
         motor_1.set_target_speed(pid("az", az_error(target_az, cur_az), cfg_m1.max_speed_sps))
-        motor_2.set_target_speed(pid("el", sel - cur_el, cfg_m2.max_speed_sps))
+        motor_2.set_target_speed(pid("el", target_el - cur_el, cfg_m2.max_speed_sps))
 
     def print_status():
         st1 = motor_1.get_status()
@@ -2108,7 +2139,11 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
         print(f"M1(AZ) pos={az_disp:.2f} spd={st1['current_speed_sps']:.1f} tgt={st1['target_speed_sps']:.1f}")
         print(f"M2(EL) pos={el_disp:.2f} spd={st2['current_speed_sps']:.1f} tgt={st2['target_speed_sps']:.1f}")
         print(f"speed={command_speed:.1f} ms={st1['microstep']} pose={pose_src} track={'ON' if tracking_enabled else 'OFF'} sat={sat_txt}")
-        print(f"limits AZ[{cfg_m1.soft_limit_min_deg},{cfg_m1.soft_limit_max_deg}] EL[{cfg_m2.soft_limit_min_deg},{cfg_m2.soft_limit_max_deg}] offset={cfg_m1.az_offset_deg}")
+        print(
+            f"limits AZ[{cfg_m1.soft_limit_min_deg},{cfg_m1.soft_limit_max_deg}] "
+            f"EL[{cfg_m2.soft_limit_min_deg},{cfg_m2.soft_limit_max_deg}] "
+            f"offset_az={cfg_m1.az_offset_deg} offset_el={cfg_m2.el_offset_deg}"
+        )
         if imu_reader is not None:
             imu = imu_reader.get_latest_dict()
             if imu:
@@ -2180,7 +2215,8 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
             elif c == "help":
                 print("status | az+ az- el+ el- stop estop reset")
                 print("arrow  (direct keyboard arrows/WASD control)")
-                print("speed <sps> | micro <1|2|4|8|16> | offset <deg>")
+                print("speed <sps> | micro <1|2|4|8|16>")
+                print("offset az <deg> | offset el <deg> | cal az <deg> | cal el <deg>")
                 print("limit az <min> <max> | limit el <min> <max>")
                 print("obs <lat> <lon> <alt_m> | tle search <text> | tle select <idx> | track on|off")
                 print("imu status | imu decl <deg> | imu gyrocal <sec> | imu magcal start|end")
@@ -2234,7 +2270,16 @@ def run_cli_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader: WT901Reader | Non
             elif c == "micro" and len(p) == 2:
                 v = int(p[1]); motor_1.set_microstep(v); motor_2.set_microstep(v)
             elif c == "offset" and len(p) == 2:
+                # Backward compatibility: offset <deg> = AZ offset.
                 cfg_m1.az_offset_deg = float(p[1])
+            elif c == "offset" and len(p) == 3 and p[1].lower() == "az":
+                cfg_m1.az_offset_deg = float(p[2])
+            elif c == "offset" and len(p) == 3 and p[1].lower() == "el":
+                cfg_m2.el_offset_deg = float(p[2])
+            elif c == "cal" and len(p) == 3 and p[1].lower() == "az":
+                motor_1.set_position_deg(float(p[2]))
+            elif c == "cal" and len(p) == 3 and p[1].lower() == "el":
+                motor_2.set_position_deg(float(p[2]))
             elif c == "limit" and len(p) == 4 and p[1].lower() == "az":
                 mn, mx = float(p[2]), float(p[3]); 
                 if mn >= mx: raise ValueError("AZ min must be < max")
