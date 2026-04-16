@@ -44,6 +44,8 @@ import threading
 import argparse
 import json
 import os
+import csv
+import datetime
 import platform
 import logging
 import math
@@ -173,6 +175,21 @@ class WT901Sample:
     mag: tuple[float, float, float]
     temperature_c: float | None
     source: str = "sdk"
+
+
+@dataclass
+class ImuAzElHoldConfig:
+    control_rate_hz: float = 50.0
+    log_rate_hz: float = 10.0
+    dropout_timeout_s: float = 0.25
+    az_kp: float = 65.0
+    az_ki: float = 0.18
+    az_kd: float = 12.0
+    el_kp: float = 55.0
+    el_ki: float = 0.16
+    el_kd: float = 10.0
+    nudge_step_deg: float = 0.5
+    log_path: str = ""
 
 
 class WT901Reader:
@@ -312,12 +329,38 @@ class WT901Reader:
         except Exception:
             return float(default)
 
+    def _validate_register_payload(self, regs):
+        if not isinstance(regs, (list, tuple, bytes, bytearray)):
+            raise ValueError("WT901 register payload type invalid")
+        if len(regs) <= 0:
+            raise TimeoutError("WT901 register payload kosong")
+        ints = list(regs)
+        for v in ints:
+            if not isinstance(v, int):
+                raise ValueError("WT901 register payload non-int value")
+            if v < -32768 or v > 65535:
+                raise ValueError(f"WT901 register payload out of range: {v}")
+
+        # Jika payload terlihat seperti stream frame UART 11-byte, validasi checksum per frame.
+        if len(ints) % 11 == 0:
+            frame_like = True
+            for i in range(0, len(ints), 11):
+                b0 = ints[i] & 0xFF
+                if b0 != 0x55:
+                    frame_like = False
+                    break
+            if frame_like:
+                for i in range(0, len(ints), 11):
+                    frame = bytes((ints[i + j] & 0xFF) for j in range(11))
+                    parsed = self.parse_uart_frame(frame)
+                    if parsed is None:
+                        raise ValueError("WT901 UART checksum/frame invalid")
+
     def _read_sample_from_sdk(self) -> WT901Sample:
         if self._device is None:
             raise RuntimeError("WT901 device belum diinisialisasi")
         regs = self._device.readReg(0x30, 41)
-        if len(regs) <= 0:
-            raise TimeoutError("WT901 timeout / empty register response")
+        self._validate_register_payload(regs)
 
         roll = self._safe_get("angleX")
         pitch = self._safe_get("angleY")
@@ -537,6 +580,207 @@ class WT901Reader:
         except Exception:
             pass
         self._connected = False
+
+
+class ImuAzElPositionController:
+    """Closed-loop AZ/EL hold controller using WT901 orientation feedback."""
+
+    def __init__(self, cfg: ImuAzElHoldConfig, imu_reader: WT901Reader, motor_1, motor_2, cfg_m1: StepperConfig, cfg_m2: StepperConfig):
+        self.cfg = cfg
+        self.imu_reader = imu_reader
+        self.motor_1 = motor_1
+        self.motor_2 = motor_2
+        self.cfg_m1 = cfg_m1
+        self.cfg_m2 = cfg_m2
+        self._lock = threading.Lock()
+        self._logger = logging.getLogger("motorPID.imu_hold")
+        self._zero_az_abs = 0.0
+        self._zero_el_abs = 0.0
+        self._target_az_rel = 0.0
+        self._target_el_rel = 0.0
+        self._i_az = 0.0
+        self._i_el = 0.0
+        self._last_e_az = 0.0
+        self._last_e_el = 0.0
+        self._last_t = None
+        self._last_control = {}
+        self._dropout = False
+        self._next_log_t = 0.0
+        self._log_file = None
+        self._log_writer = None
+        self._open_log_file()
+
+    @staticmethod
+    def _az_error_deg(target_abs: float, actual_abs: float, az_wrap_enabled: bool) -> float:
+        e = float(target_abs) - float(actual_abs)
+        if not az_wrap_enabled:
+            return e
+        if e > 180.0:
+            e -= 360.0
+        elif e < -180.0:
+            e += 360.0
+        return e
+
+    def _clamp_abs_targets(self, az_abs: float, el_abs: float) -> tuple[float, float]:
+        if self.cfg_m1.soft_limit_min_deg is not None:
+            az_abs = max(float(self.cfg_m1.soft_limit_min_deg), az_abs)
+        if self.cfg_m1.soft_limit_max_deg is not None:
+            az_abs = min(float(self.cfg_m1.soft_limit_max_deg), az_abs)
+        if self.cfg_m2.soft_limit_min_deg is not None:
+            el_abs = max(float(self.cfg_m2.soft_limit_min_deg), el_abs)
+        if self.cfg_m2.soft_limit_max_deg is not None:
+            el_abs = min(float(self.cfg_m2.soft_limit_max_deg), el_abs)
+        return az_abs, el_abs
+
+    def _open_log_file(self):
+        path = self.cfg.log_path.strip() or datetime.datetime.now().strftime("imu_azel_hold_%Y%m%d_%H%M%S.csv")
+        self._log_file = open(path, "w", newline="")
+        self._log_writer = csv.writer(self._log_file)
+        self._log_writer.writerow(
+            [
+                "timestamp", "cmd_az_rel_deg", "cmd_el_rel_deg", "cmd_az_abs_deg", "cmd_el_abs_deg",
+                "act_az_rel_deg", "act_el_rel_deg", "act_az_abs_deg", "act_el_abs_deg",
+                "err_az_deg", "err_el_deg", "cmd_az_speed_sps", "cmd_el_speed_sps", "imu_stale_s", "dropout",
+            ]
+        )
+        self._logger.info("IMU hold log file: %s", path)
+
+    def _append_log(self, row: dict):
+        if self._log_writer is None:
+            return
+        self._log_writer.writerow(
+            [
+                f"{row['timestamp']:.6f}", f"{row['cmd_az_rel']:.4f}", f"{row['cmd_el_rel']:.4f}",
+                f"{row['cmd_az_abs']:.4f}", f"{row['cmd_el_abs']:.4f}",
+                f"{row['act_az_rel']:.4f}", f"{row['act_el_rel']:.4f}",
+                f"{row['act_az_abs']:.4f}", f"{row['act_el_abs']:.4f}",
+                f"{row['err_az']:.4f}", f"{row['err_el']:.4f}",
+                f"{row['cmd_az_speed']:.4f}", f"{row['cmd_el_speed']:.4f}",
+                f"{row['imu_stale_s']:.4f}", int(bool(row["dropout"])),
+            ]
+        )
+        self._log_file.flush()
+
+    def calibrate_zero_reference(self):
+        imu = self.imu_reader.get_latest_dict()
+        if not imu:
+            raise RuntimeError("IMU sample belum tersedia untuk zeroing.")
+        with self._lock:
+            self._zero_az_abs = float(imu["azimuth_deg"])
+            self._zero_el_abs = float(imu["elevation_deg"])
+            self._target_az_rel = 0.0
+            self._target_el_rel = 0.0
+            self._i_az = 0.0
+            self._i_el = 0.0
+            self._last_e_az = 0.0
+            self._last_e_el = 0.0
+            self._last_t = None
+        self._logger.info("IMU zero reference set: az=%.3f el=%.3f", self._zero_az_abs, self._zero_el_abs)
+
+    def nudge_target(self, axis: str, delta_deg: float):
+        with self._lock:
+            if axis == "az":
+                self._target_az_rel += float(delta_deg)
+            elif axis == "el":
+                self._target_el_rel += float(delta_deg)
+            else:
+                raise ValueError("axis must be az or el")
+            az_abs = self._target_az_rel + self._zero_az_abs
+            el_abs = self._target_el_rel + self._zero_el_abs
+            az_abs, el_abs = self._clamp_abs_targets(az_abs, el_abs)
+            self._target_az_rel = az_abs - self._zero_az_abs
+            self._target_el_rel = el_abs - self._zero_el_abs
+
+    def hold_current(self):
+        imu = self.imu_reader.get_latest_dict()
+        if not imu:
+            return
+        with self._lock:
+            self._target_az_rel = float(imu["azimuth_deg"]) - self._zero_az_abs
+            self._target_el_rel = float(imu["elevation_deg"]) - self._zero_el_abs
+            self._i_az = 0.0
+            self._i_el = 0.0
+
+    def get_targets_rel(self) -> tuple[float, float]:
+        with self._lock:
+            return float(self._target_az_rel), float(self._target_el_rel)
+
+    def get_zero_offsets(self) -> tuple[float, float]:
+        with self._lock:
+            return float(self._zero_az_abs), float(self._zero_el_abs)
+
+    def update(self, now: float | None = None) -> dict:
+        if now is None:
+            now = time.time()
+        imu = self.imu_reader.get_latest_dict()
+        if not imu:
+            self.motor_1.stop_smooth()
+            self.motor_2.stop_smooth()
+            self._dropout = True
+            return {"dropout": True, "reason": "no imu sample"}
+        imu_ts = float(imu["timestamp"])
+        stale_s = max(0.0, now - imu_ts)
+        if stale_s > float(self.cfg.dropout_timeout_s):
+            self.motor_1.stop_smooth()
+            self.motor_2.stop_smooth()
+            self._dropout = True
+            return {"dropout": True, "reason": "imu stale", "imu_stale_s": stale_s}
+        self._dropout = False
+
+        act_az_abs = float(imu["azimuth_deg"])
+        act_el_abs = float(imu["elevation_deg"])
+        with self._lock:
+            cmd_az_abs = self._target_az_rel + self._zero_az_abs
+            cmd_el_abs = self._target_el_rel + self._zero_el_abs
+            cmd_az_abs, cmd_el_abs = self._clamp_abs_targets(cmd_az_abs, cmd_el_abs)
+            self._target_az_rel = cmd_az_abs - self._zero_az_abs
+            self._target_el_rel = cmd_el_abs - self._zero_el_abs
+            dt = 0.02 if self._last_t is None else max(0.001, now - self._last_t)
+            self._last_t = now
+            e_az = self._az_error_deg(cmd_az_abs, act_az_abs, self.cfg_m1.az_wrap_enabled)
+            e_el = cmd_el_abs - act_el_abs
+            self._i_az = max(-300.0, min(300.0, self._i_az + e_az * dt))
+            self._i_el = max(-300.0, min(300.0, self._i_el + e_el * dt))
+            d_az = (e_az - self._last_e_az) / dt
+            d_el = (e_el - self._last_e_el) / dt
+            self._last_e_az = e_az
+            self._last_e_el = e_el
+            cmd_az_speed = self.cfg.az_kp * e_az + self.cfg.az_ki * self._i_az + self.cfg.az_kd * d_az
+            cmd_el_speed = self.cfg.el_kp * e_el + self.cfg.el_ki * self._i_el + self.cfg.el_kd * d_el
+            if abs(e_az) < 0.06:
+                cmd_az_speed = 0.0
+            if abs(e_el) < 0.06:
+                cmd_el_speed = 0.0
+            cmd_az_speed = max(-self.cfg_m1.max_speed_sps, min(self.cfg_m1.max_speed_sps, cmd_az_speed))
+            cmd_el_speed = max(-self.cfg_m2.max_speed_sps, min(self.cfg_m2.max_speed_sps, cmd_el_speed))
+
+        self.motor_1.set_target_speed(cmd_az_speed)
+        self.motor_2.set_target_speed(cmd_el_speed)
+        row = {
+            "timestamp": now, "cmd_az_rel": self._target_az_rel, "cmd_el_rel": self._target_el_rel,
+            "cmd_az_abs": cmd_az_abs, "cmd_el_abs": cmd_el_abs,
+            "act_az_rel": act_az_abs - self._zero_az_abs, "act_el_rel": act_el_abs - self._zero_el_abs,
+            "act_az_abs": act_az_abs, "act_el_abs": act_el_abs, "err_az": e_az, "err_el": e_el,
+            "cmd_az_speed": cmd_az_speed, "cmd_el_speed": cmd_el_speed, "imu_stale_s": stale_s, "dropout": False,
+        }
+        if now >= self._next_log_t:
+            self._append_log(row)
+            self._next_log_t = now + (1.0 / max(1.0, float(self.cfg.log_rate_hz)))
+        self._last_control = row
+        return row
+
+    def get_last_control(self) -> dict:
+        return dict(self._last_control)
+
+    def close(self):
+        try:
+            self.motor_1.stop_smooth()
+            self.motor_2.stop_smooth()
+        except Exception:
+            pass
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
 
 
 class TB6600Stepper:
@@ -1008,6 +1252,97 @@ def draw_sim_ui(st1, st2, command_speed):
     if st1["fault_latched"] or st2["fault_latched"]:
         print(f"FAULT: {st1['fault_msg']} {st2['fault_msg']}")
     print(f"\nCommand speed: {command_speed:.1f} sps")
+
+
+def run_imu_azel_keyboard_mode(
+    motor_1,
+    motor_2,
+    cfg_m1: StepperConfig,
+    cfg_m2: StepperConfig,
+    imu_reader: WT901Reader,
+    imu_ctrl: ImuAzElPositionController,
+):
+    print(
+        "\n=== IMU AZ/EL POSITION HOLD MODE ===\n"
+        "Target dikunci ke IMU feedback. Keyboard override (nudge):\n"
+        "  A/Left  : AZ target -\n"
+        "  D/Right : AZ target +\n"
+        "  W/Up    : EL target +\n"
+        "  S/Down  : EL target -\n"
+        "  Z       : Zero IMU reference frame\n"
+        "  Space   : Hold current orientation\n"
+        "  E       : Emergency stop, R reset fault\n"
+        "  +/-     : Ubah nudge step\n"
+        "  Q       : Quit\n"
+    )
+    nudge = max(0.05, float(imu_ctrl.cfg.nudge_step_deg))
+    report_period_s = 0.1
+    last_report = 0.0
+    ctrl_period_s = 1.0 / max(10.0, float(imu_ctrl.cfg.control_rate_hz))
+
+    with RawTerminal():
+        while True:
+            now = time.time()
+            key = get_key_nonblocking(0.01)
+            if key in ("q", "Q"):
+                motor_1.stop_smooth()
+                motor_2.stop_smooth()
+                print("\nExit IMU hold mode.")
+                break
+            elif key in ("\x1b[C", "d", "D"):
+                imu_ctrl.nudge_target("az", +nudge)
+            elif key in ("\x1b[D", "a", "A"):
+                imu_ctrl.nudge_target("az", -nudge)
+            elif key in ("\x1b[A", "w", "W"):
+                imu_ctrl.nudge_target("el", +nudge)
+            elif key in ("\x1b[B", "s", "S"):
+                imu_ctrl.nudge_target("el", -nudge)
+            elif key in ("z", "Z"):
+                imu_ctrl.calibrate_zero_reference()
+            elif key == " ":
+                imu_ctrl.hold_current()
+            elif key in ("e", "E"):
+                motor_1.emergency_stop("Emergency stop keyboard")
+                motor_2.emergency_stop("Emergency stop keyboard")
+            elif key in ("r", "R"):
+                motor_1.reset_fault()
+                motor_2.reset_fault()
+            elif key == "+":
+                nudge = min(15.0, nudge + 0.1)
+            elif key == "-":
+                nudge = max(0.05, nudge - 0.1)
+
+            ctrl = imu_ctrl.update(now)
+
+            if now - last_report >= report_period_s:
+                st1 = motor_1.get_status()
+                st2 = motor_2.get_status()
+                imu = imu_reader.get_latest_dict()
+                taz, tel = imu_ctrl.get_targets_rel()
+                z_az, z_el = imu_ctrl.get_zero_offsets()
+                if imu:
+                    az_rel = imu["azimuth_deg"] - z_az
+                    el_rel = imu["elevation_deg"] - z_el
+                    msg_imu = (
+                        f"IMU rel AZ={az_rel:7.2f} EL={el_rel:7.2f} "
+                        f"abs AZ={imu['azimuth_deg']:7.2f} EL={imu['elevation_deg']:7.2f}"
+                    )
+                else:
+                    msg_imu = "IMU unavailable"
+                msg_ctrl = (
+                    f"TGT rel AZ={taz:7.2f} EL={tel:7.2f} "
+                    f"SPDcmd AZ={st1['target_speed_sps']:7.1f} EL={st2['target_speed_sps']:7.1f}"
+                )
+                msg_dropout = ""
+                if ctrl.get("dropout"):
+                    msg_dropout = f" DROPOUT={ctrl.get('reason', '-')}"
+                sys.stdout.write(f"\r{msg_imu} | {msg_ctrl} | nudge={nudge:.2f}{msg_dropout}      ")
+                sys.stdout.flush()
+                last_report = now
+
+            dt = time.time() - now
+            if dt < ctrl_period_s:
+                time.sleep(ctrl_period_s - dt)
 
 
 class RawTerminal:
@@ -1848,6 +2183,11 @@ def main():
     parser.add_argument("--imu-rate-hz", type=float, default=50.0, help="Sampling rate WT901 (>=50Hz)")
     parser.add_argument("--imu-declination", type=float, default=0.0, help="Magnetic declination compensation (deg)")
     parser.add_argument("--imu-log-level", default="INFO", help="WT901 log level (DEBUG/INFO/WARN/ERROR)")
+    parser.add_argument("--imu-azel-hold", action="store_true", help="Aktifkan closed-loop hold AZ/EL berbasis IMU")
+    parser.add_argument("--imu-control-rate-hz", type=float, default=50.0, help="Control-loop rate untuk IMU hold")
+    parser.add_argument("--imu-dropout-timeout", type=float, default=0.25, help="Timeout dropout IMU (detik)")
+    parser.add_argument("--imu-nudge-deg", type=float, default=0.5, help="Besar nudge keyboard per langkah (deg)")
+    parser.add_argument("--imu-log-path", default="", help="Path CSV log cmd-vs-actual AZ/EL (10Hz)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1908,6 +2248,28 @@ def main():
         except Exception as exc:
             logging.getLogger("motorPID.wt901").error("IMU disabled due to init failure: %s", exc)
             imu_reader = None
+    imu_hold_ctrl = None
+    if args.imu_azel_hold and not use_sim:
+        if imu_reader is None:
+            logging.getLogger("motorPID.imu_hold").error("IMU AZ/EL hold but IMU is not available.")
+        else:
+            ctrl_cfg = ImuAzElHoldConfig(
+                control_rate_hz=max(10.0, float(args.imu_control_rate_hz)),
+                log_rate_hz=10.0,
+                dropout_timeout_s=max(0.05, float(args.imu_dropout_timeout)),
+                nudge_step_deg=max(0.05, float(args.imu_nudge_deg)),
+                log_path=str(args.imu_log_path).strip(),
+            )
+            imu_hold_ctrl = ImuAzElPositionController(ctrl_cfg, imu_reader, motor_1, motor_2, cfg_m1, cfg_m2)
+            # Tunggu sample awal agar zeroing valid.
+            for _ in range(40):
+                if imu_reader.get_latest_dict():
+                    break
+                time.sleep(0.05)
+            if imu_reader.get_latest_dict():
+                imu_hold_ctrl.calibrate_zero_reference()
+            else:
+                logging.getLogger("motorPID.imu_hold").warning("IMU sample belum ada, hold akan menunggu data.")
 
     command_speed = 600.0
     last_report = 0.0
@@ -1968,6 +2330,9 @@ def main():
                     elif key in ("q", "Q"):
                         break
         else:
+            if imu_hold_ctrl is not None:
+                run_imu_azel_keyboard_mode(motor_1, motor_2, cfg_m1, cfg_m2, imu_reader, imu_hold_ctrl)
+                return
             print(
                 "\n=== DUAL TB6600 KEYBOARD STEPPER CONTROL ===\n"
                 "Motor 1 (GPIO17/27/22): Arrow Left/Right atau A/D\n"
@@ -2043,6 +2408,8 @@ def main():
         print(f"\nERROR runtime: {exc}")
     finally:
         print("\nShutdown controller...")
+        if imu_hold_ctrl is not None:
+            imu_hold_ctrl.close()
         if imu_reader is not None:
             imu_reader.close()
         motor_1.close()
