@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import platform
+import math
 
 # PYTHON PATH -> folder chs lokal project
 # =====================================================
@@ -97,13 +98,13 @@ def reset_zero_point(device):
 
 def baca_sudut(device):
     """
-    Membaca sudut Roll, Pitch (EL), dan Yaw dari sensor.
-    Mengembalikan tuple (roll, pitch, yaw) dalam derajat.
+    Membaca sudut Roll, Pitch (EL), Yaw, dan menghitung Azimuth Kompas.
+    Mengembalikan tuple (roll, pitch, yaw, azimuth) dalam derajat.
     Menggunakan data register yang diparse oleh JY901SDataProcessor.
     """
     try:
         # Untuk SDK 485, pembacaan register ini akan mengisi deviceData
-        # termasuk angleX/angleY/angleZ.
+        # termasuk angleX/angleY/angleZ dan magX/magY/magZ.
         if hasattr(device, "readReg"):
             device.readReg(0x30, 41)
 
@@ -111,27 +112,57 @@ def baca_sudut(device):
             roll = device.get("AngleX")
             pitch = device.get("AngleY")
             yaw = device.get("AngleZ")
+            magX = device.get("magX")
+            magY = device.get("magY")
+            magZ = device.get("magZ")
         else:
             roll = device.getDeviceData("angleX")
             pitch = device.getDeviceData("angleY")
             yaw = device.getDeviceData("angleZ")
+            magX = device.getDeviceData("magX")
+            magY = device.getDeviceData("magY")
+            magZ = device.getDeviceData("magZ")
 
         if roll is None or pitch is None or yaw is None:
-            return None, None, None
+            return None, None, None, None
 
-        return float(roll), float(pitch), float(yaw)
+        # Menghitung Azimuth (Arah Hadap) berdasarkan Medan Magnet (Compass)
+        azimuth = None
+        if magX is not None and magY is not None and magZ is not None:
+            try:
+                # Konversi sudut ke radian untuk kompensasi kemiringan (tilt compensation)
+                roll_rad = math.radians(float(roll))
+                pitch_rad = math.radians(float(pitch))
+
+                # Kompensasi kemiringan (menggunakan sumbu standar NED/NWD)
+                # Bergantung pada sistem koordinat WT901, asumsi standar:
+                X_h = magX * math.cos(pitch_rad) + magZ * math.sin(pitch_rad)
+                Y_h = magX * math.sin(roll_rad) * math.sin(pitch_rad) + magY * math.cos(roll_rad) - magZ * math.sin(roll_rad) * math.cos(pitch_rad)
+
+                # Hitung sudut arah (heading/azimuth)
+                azimuth_rad = math.atan2(-Y_h, X_h)
+                azimuth = math.degrees(azimuth_rad)
+                
+                # Normalisasi ke 0-360 derajat
+                if azimuth < 0:
+                    azimuth += 360
+            except Exception:
+                pass
+
+        return float(roll), float(pitch), float(yaw), (float(azimuth) if azimuth is not None else None)
     except Exception:
-        return None, None, None
+        return None, None, None, None
 
 
 def tampilkan_header():
-    print("=" * 60)
-    print("  WT901C485 - Elevasi Absolut Terhadap Gravitasi")
-    print("=" * 60)
+    print("=" * 75)
+    print("  WT901C485 - Elevasi Absolut & Azimuth Kompas")
+    print("=" * 75)
     print("Penjelasan sudut:")
     print("  ROLL  (X) : Kemiringan kiri-kanan")
     print("  PITCH (Y) : Kemiringan depan-belakang [ELEVASI/EL]")
-    print("  YAW   (Z) : Rotasi horizontal (kompas)")
+    print("  YAW   (Z) : Rotasi Z (Giroskop/Fusi)")
+    print("  AZIMUTH   : Arah hadap kompas (Medan Magnet dengan Tilt Compensation)")
     print()
     print("Referensi: GRAVITASI BUMI (sudut absolut)")
     print("  0°   = Sensor sejajar dengan tanah (datar)")
@@ -139,9 +170,9 @@ def tampilkan_header():
     print("  -90° = Sensor terbalik tegak")
     print()
     print("Tekan Ctrl+C untuk berhenti.")
-    print("-" * 60)
-    print(f"{'Waktu':<12} {'ROLL (°)':>10} {'PITCH/EL (°)':>14} {'YAW (°)':>10}")
-    print("-" * 60)
+    print("-" * 75)
+    print(f"{'Waktu':<12} {'ROLL (°)':>10} {'PITCH/EL (°)':>14} {'YAW (°)':>10} {'AZIMUTH (°)':>14}")
+    print("-" * 75)
 
 
 def main():
@@ -172,7 +203,7 @@ def main():
     # Loop pembacaan data
     try:
         while True:
-            roll, pitch, yaw = baca_sudut(device)
+            roll, pitch, yaw, azimuth = baca_sudut(device)
 
             if pitch is None:
                 print(f"[WARN] Gagal membaca data, mencoba lagi...")
@@ -187,12 +218,13 @@ def main():
                 else:
                     status = f"MIRING BELAKANG {abs(pitch):.1f}°"
 
-                print(f"{waktu:<12} {roll:>10.2f} {pitch:>14.2f} {yaw:>10.2f}   [{status}]")
+                az_str = f"{azimuth:>14.2f}" if azimuth is not None else "           N/A"
+                print(f"{waktu:<12} {roll:>10.2f} {pitch:>14.2f} {yaw:>10.2f} {az_str}   [{status}]")
 
             time.sleep(INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n" + "-" * 60)
+        print("\n" + "-" * 75)
         print("[INFO] Program dihentikan oleh pengguna.")
 
     finally:
