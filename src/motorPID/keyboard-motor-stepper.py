@@ -78,6 +78,21 @@ except Exception:
     load = None
     SKYFIELD_AVAILABLE = False
 
+FALLBACK_TLE = [
+    {
+        "name": "ISS (ZARYA)",
+        "line1": "1 25544U 98067A   25067.51892361  .00015867  00000+0  28631-3 0  9991",
+        "line2": "2 25544  51.6393  20.9756 0004985  44.5630  78.1897 15.50033015442444",
+        "id": 25544,
+    },
+    {
+        "name": "NOAA 15",
+        "line1": "1 25338U 98030A   25067.47435356  .00000099  00000+0  74015-4 0  9995",
+        "line2": "2 25338  98.7545  92.6464 0010719 338.6616  21.3905 14.26090814391464",
+        "id": 25338,
+    },
+]
+
 # =====================================================
 # PYTHON PATH -> folder chs lokal project (samakan pola read_wt901.py)
 # =====================================================
@@ -600,6 +615,7 @@ class ELImuFusionConfig:
     still_acc_g_tol: float = 0.08
     el_min_deg: float = 0.0
     el_max_deg: float = 90.0
+    absolute_gravity_mode: bool = True
     debug_log: bool = False
 
 
@@ -717,6 +733,10 @@ class ELImuFusionTracker:
             time.sleep(max(0.0, period_s - dt_loop))
 
     def calibrate_level_zero(self, duration_s: float = 2.0):
+        # Mode absolut gravitasi: jangan ubah nol referensi EL.
+        if self.cfg.absolute_gravity_mode:
+            self._logger.info("EL absolute gravity mode aktif: zero calibration diabaikan.")
+            return
         duration_s = max(0.2, float(duration_s))
         t_end = time.time() + duration_s
         vals = []
@@ -748,7 +768,10 @@ class ELImuFusionTracker:
     def get_el_deg(self) -> float | None:
         with self._lock:
             last_imu_ts = self._last_imu_ts
-            el = self._el_est_deg + self._zero_offset_deg
+            if self.cfg.absolute_gravity_mode:
+                el = self._el_est_deg
+            else:
+                el = self._el_est_deg + self._zero_offset_deg
         if last_imu_ts is None:
             return None
         if (time.time() - float(last_imu_ts)) > float(self.cfg.stale_timeout_s):
@@ -762,6 +785,7 @@ class ELImuFusionTracker:
                 "rate_hz": self._rate_hz,
                 "gyro_bias_y_dps": self._gyro_bias_y,
                 "zero_offset_deg": self._zero_offset_deg,
+                "absolute_gravity_mode": self.cfg.absolute_gravity_mode,
                 "initialized": self._initialized,
                 "last_imu_ts": self._last_imu_ts,
                 "last_error": self._last_error,
@@ -1471,6 +1495,54 @@ def command_el_with_bounds(
     motor_2.set_target_speed(float(direction) * abs(float(command_speed)))
 
 
+def _adaptive_gains_common(axis: str, err_abs_deg: float):
+    if axis == "az":
+        if err_abs_deg > 20:
+            return 120.0, 0.20, 25.0
+        if err_abs_deg > 5:
+            return 85.0, 0.12, 18.0
+        if err_abs_deg > 1:
+            return 45.0, 0.06, 10.0
+        return 20.0, 0.0, 6.0
+    if err_abs_deg > 15:
+        return 110.0, 0.18, 20.0
+    if err_abs_deg > 4:
+        return 80.0, 0.10, 15.0
+    if err_abs_deg > 1:
+        return 40.0, 0.05, 8.0
+    return 18.0, 0.0, 5.0
+
+
+def _pid_speed_common(axis: str, err_deg: float, state: dict, max_speed: float) -> float:
+    now = time.time()
+    dt = 0.02 if state.get("last_t") is None else max(0.001, now - float(state["last_t"]))
+    state["last_t"] = now
+    kp, ki, kd = _adaptive_gains_common(axis, abs(err_deg))
+    state["i"] = float(state.get("i", 0.0)) + (err_deg * dt)
+    state["i"] = max(-300.0, min(300.0, state["i"]))
+    d = (err_deg - float(state.get("last_e", 0.0))) / dt
+    state["last_e"] = err_deg
+    out = (kp * err_deg) + (ki * state["i"]) + (kd * d)
+    if abs(err_deg) < 0.08:
+        out = 0.0
+    return max(-max_speed, min(max_speed, out))
+
+
+def set_azimuth(target_az_deg: float, current_az_deg: float, pid_state: dict, max_speed: float, wrap_enabled: bool = True) -> float:
+    err = float(target_az_deg) - float(current_az_deg)
+    if wrap_enabled:
+        if err > 180.0:
+            err -= 360.0
+        elif err < -180.0:
+            err += 360.0
+    return _pid_speed_common("az", err, pid_state, max_speed)
+
+
+def set_elevation(target_el_deg: float, current_el_deg: float, pid_state: dict, max_speed: float) -> float:
+    err = float(target_el_deg) - float(current_el_deg)
+    return _pid_speed_common("el", err, pid_state, max_speed)
+
+
 def draw_sim_ui(st1, st2, command_speed):
     clear_screen()
     az_disp = st1["position_deg"] % 360.0
@@ -1660,6 +1732,11 @@ class SimGuiApp:
         self.az_ls_deg = 0.0
         self.ts = load.timescale() if SKYFIELD_AVAILABLE else None
         self.tracking_enabled = False
+        self.tracking_diag = "init"
+        self._last_valid_sat_az = None
+        self._last_valid_sat_el = None
+        self._tracking_dbg_counter = 0
+        self._tracking_logger = logging.getLogger("motorPID.sim_gui_tracking")
         self._pid_state = {
             "az": {"i": 0.0, "last_e": 0.0, "last_t": None},
             "el": {"i": 0.0, "last_e": 0.0, "last_t": None},
@@ -1869,8 +1946,10 @@ class SimGuiApp:
                     parsed.append(r)
             self._tle_cache = parsed
             if not parsed:
-                self.lst_tle.insert(tk.END, "No data")
-                return
+                # Fallback agar tracking simulasi tetap berjalan saat API gagal/no data.
+                self._tle_cache = list(FALLBACK_TLE)
+                self.lst_tle.insert(tk.END, "No API data, fallback TLE loaded")
+                parsed = self._tle_cache
             for i, it in enumerate(parsed):
                 sat_id = it.get("id")
                 text = f"{i+1:02d}. {it['name']}" + (f" [{sat_id}]" if sat_id else "")
@@ -1879,7 +1958,15 @@ class SimGuiApp:
             self.lst_tle.selection_set(0)
             self._on_select_tle()
         except Exception as exc:
-            self.lst_tle.insert(tk.END, f"Load error: {exc}")
+            self._tle_cache = list(FALLBACK_TLE)
+            self.lst_tle.insert(tk.END, f"Load error: {exc} -> fallback TLE")
+            for i, it in enumerate(self._tle_cache):
+                sat_id = it.get("id")
+                text = f"{i+1:02d}. {it['name']}" + (f" [{sat_id}]" if sat_id else "")
+                self.lst_tle.insert(tk.END, text)
+            self.lst_tle.selection_clear(0, tk.END)
+            self.lst_tle.selection_set(1 if len(self._tle_cache) > 1 else 0)
+            self._on_select_tle()
 
     def _on_select_tle(self, _evt=None):
         sel = self.lst_tle.curselection()
@@ -1895,6 +1982,7 @@ class SimGuiApp:
         if not self.selected_tle or not SKYFIELD_AVAILABLE:
             self.sat_az = None
             self.sat_el = None
+            self.tracking_diag = "no_tle_or_skyfield"
             return
         try:
             lat = float(self.ent_lat.get().strip())
@@ -1903,6 +1991,7 @@ class SimGuiApp:
         except ValueError:
             self.sat_az = None
             self.sat_el = None
+            self.tracking_diag = "invalid_observer_latlonalt"
             return
         try:
             sat = EarthSatellite(self.selected_tle["line1"], self.selected_tle["line2"], self.selected_tle["name"], self.ts)
@@ -1913,9 +2002,37 @@ class SimGuiApp:
             alt, az, _distance = topocentric.altaz()
             self.sat_az = az.degrees
             self.sat_el = alt.degrees
-        except Exception:
-            self.sat_az = None
-            self.sat_el = None
+            self._last_valid_sat_az = self.sat_az
+            self._last_valid_sat_el = self.sat_el
+            self.tracking_diag = "sat_ok"
+        except Exception as exc:
+            # Jangan langsung drop target ke None agar tracking tidak terlihat "mati" saat hiccup sesaat.
+            if self._last_valid_sat_az is not None and self._last_valid_sat_el is not None:
+                self.sat_az = self._last_valid_sat_az
+                self.sat_el = self._last_valid_sat_el
+                self.tracking_diag = f"sat_calc_error_using_last_valid: {exc}"
+            else:
+                self.sat_az = None
+                self.sat_el = None
+                self.tracking_diag = f"sat_calc_error_no_valid: {exc}"
+
+    def set_azimuth(self, target_az_deg: float):
+        st1 = self.motor_1.get_status()
+        cur_az = float(st1["position_deg"]) % 360.0
+        target_az = float(target_az_deg) % 360.0
+        err_az = self._az_shortest_error(target_az, cur_az)
+        cmd_az = self._pid_speed_cmd("az", err_az, self.cfg_m1.max_speed_sps)
+        self.motor_1.set_target_speed(cmd_az)
+        return {"cur_az": cur_az, "target_az": target_az, "err_az": err_az, "cmd_az": cmd_az}
+
+    def set_elevation(self, target_el_deg: float):
+        st2 = self.motor_2.get_status()
+        cur_el = float(st2["position_deg"])
+        target_el = max(0.0, min(90.0, float(target_el_deg)))
+        err_el = target_el - cur_el
+        cmd_el = self._pid_speed_cmd("el", err_el, self.cfg_m2.max_speed_sps)
+        self.motor_2.set_target_speed(cmd_el)
+        return {"cur_el": cur_el, "target_el": target_el, "err_el": err_el, "cmd_el": cmd_el}
 
     def _press_axis(self, axis: str):
         if self.imu_hold_enabled and self.imu_hold_ctrl is not None:
@@ -2100,9 +2217,8 @@ class SimGuiApp:
         try:
             if self.imu_hold_ctrl is not None:
                 self.imu_hold_ctrl.calibrate_zero_reference()
-            if self.el_imu_tracker is not None:
-                self.el_imu_tracker.calibrate_level_zero(1.2)
-            self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [IMU zeroed/releveled]")
+            # EL sengaja tidak di-zero agar tetap absolut terhadap gravitasi.
+            self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [IMU zeroed | EL absolute]")
         except Exception as exc:
             self.lbl_sat.config(text=f"SAT: {self.selected_sat_name} | AZ: - | EL: -  [IMU zero error: {exc}]")
 
@@ -2163,8 +2279,10 @@ class SimGuiApp:
 
     def _tracking_step(self):
         if not self.tracking_enabled:
+            self.tracking_diag = "tracking_off"
             return
         if self.sat_az is None or self.sat_el is None:
+            self.tracking_diag = "sat_none_no_target"
             return
         imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
         el_imu = self.el_imu_tracker.get_el_deg() if self.el_imu_tracker is not None else None
@@ -2193,6 +2311,13 @@ class SimGuiApp:
         cmd_el = self._pid_speed_cmd("el", err_el, self.cfg_m2.max_speed_sps)
         self.motor_1.set_target_speed(cmd_az)
         self.motor_2.set_target_speed(cmd_el)
+        self._tracking_dbg_counter += 1
+        self.tracking_diag = (
+            f"ok tAZ={target_az:.2f} tEL={target_el:.2f} "
+            f"eAZ={err_az:.2f} eEL={err_el:.2f} cmdAZ={cmd_az:.1f} cmdEL={cmd_el:.1f}"
+        )
+        if self._tracking_dbg_counter % 20 == 0:
+            self._tracking_logger.info("SIM-GUI tracking: %s", self.tracking_diag)
 
     def _draw_rotator(self, az_deg, el_deg):
         self.canvas.delete("all")
@@ -2247,7 +2372,8 @@ class SimGuiApp:
             text=(
                 f"AZ: pos={az_disp:.2f}°  spd={st1['current_speed_sps']:.1f} sps  tgt={st1['target_speed_sps']:.1f}\n"
                 f"EL: pos={el_disp:.2f}°  spd={st2['current_speed_sps']:.1f} sps  tgt={st2['target_speed_sps']:.1f}\n"
-                f"Command speed={self.command_speed:.1f} sps | Microstep={st1['microstep']} | PoseSrc={pose_src} | Track={'ON' if self.tracking_enabled else 'OFF'}{fault}"
+                f"Command speed={self.command_speed:.1f} sps | Microstep={st1['microstep']} | PoseSrc={pose_src} | "
+                f"Track={'ON' if self.tracking_enabled else 'OFF'} | Diag={self.tracking_diag}{fault}"
             )
         )
         if self.imu_reader is not None:
@@ -2545,7 +2671,11 @@ def run_cli_mode(
                 else:
                     sec = 1.5 if len(p) < 3 else float(p[2])
                     el_imu_tracker.calibrate_level_zero(sec)
-                    print("EL IMU zero calibration done")
+                    st = el_imu_tracker.get_status()
+                    if st.get("absolute_gravity_mode", False):
+                        print("EL absolute gravity mode aktif: zero calibration diabaikan")
+                    else:
+                        print("EL IMU zero calibration done")
             elif c == "elimu" and len(p) >= 2 and p[1].lower() == "gyrocal":
                 if el_imu_tracker is None:
                     print("EL IMU tracker not enabled")
@@ -2642,6 +2772,63 @@ def run_cli_mode(
             print(f"ERR: {exc}")
 
 
+def run_tracking_regression_tests() -> bool:
+    """
+    Regression sederhana non-GUI untuk memastikan command tracking menggerakkan AZ/EL.
+    """
+    cfg_az = StepperConfig(steps_per_rev=200, microstep=2, max_speed_sps=2200.0, accel_sps2=3000.0, soft_limit_min_deg=None, soft_limit_max_deg=None)
+    cfg_el = StepperConfig(steps_per_rev=200, microstep=2, max_speed_sps=2200.0, accel_sps2=3000.0, soft_limit_min_deg=0.0, soft_limit_max_deg=90.0)
+    m1 = SimStepper(cfg_az, "AZ_TEST")
+    m2 = SimStepper(cfg_el, "EL_TEST")
+
+    def az_err(target_deg, current_deg):
+        e = target_deg - current_deg
+        if e > 180.0:
+            e -= 360.0
+        elif e < -180.0:
+            e += 360.0
+        return e
+
+    scenarios = [
+        (10.0, 5.0),
+        (120.0, 30.0),
+        (220.0, 60.0),
+        (315.0, 10.0),
+        (45.0, 80.0),
+    ]
+    passed = True
+    try:
+        for i, (taz, tel) in enumerate(scenarios, start=1):
+            st1_init = m1.get_status()
+            st2_init = m2.get_status()
+            az_err_init = abs(az_err(taz, st1_init["position_deg"] % 360.0))
+            el_err_init = abs(tel - st2_init["position_deg"])
+            t0 = time.time()
+            while time.time() - t0 < 2.4:
+                st1 = m1.get_status()
+                st2 = m2.get_status()
+                eaz = az_err(taz, st1["position_deg"] % 360.0)
+                eel = tel - st2["position_deg"]
+                m1.set_target_speed(max(-cfg_az.max_speed_sps, min(cfg_az.max_speed_sps, 70.0 * eaz)))
+                m2.set_target_speed(max(-cfg_el.max_speed_sps, min(cfg_el.max_speed_sps, 70.0 * eel)))
+                time.sleep(0.01)
+            st1 = m1.get_status()
+            st2 = m2.get_status()
+            az_err_final = abs(az_err(taz, st1["position_deg"] % 360.0))
+            el_err_final = abs(tel - st2["position_deg"])
+            az_ok = (az_err_final <= az_err_init) and ((az_err_init - az_err_final) >= 5.0 or az_err_final < 15.0)
+            el_ok = (el_err_final <= el_err_init) and ((el_err_init - el_err_final) >= 5.0 or el_err_final < 8.0)
+            print(
+                f"[selftest] scenario#{i} target=({taz:.1f},{tel:.1f}) pos=({st1['position_deg']%360.0:.1f},{st2['position_deg']:.1f}) "
+                f"errAZ={az_err_init:.1f}->{az_err_final:.1f} errEL={el_err_init:.1f}->{el_err_final:.1f} az_ok={az_ok} el_ok={el_ok}"
+            )
+            passed = passed and az_ok and el_ok
+        return passed
+    finally:
+        m1.close()
+        m2.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sim", action="store_true", help="Jalankan mode simulasi UI (tanpa GPIO)")
@@ -2667,7 +2854,13 @@ def main():
     parser.add_argument("--el-imu-weight", type=float, default=0.18, help="Weight koreksi sudut pitch IMU pada EL fusion")
     parser.add_argument("--el-imu-debug", action="store_true", help="Aktifkan debug log EL fusion")
     parser.add_argument("--el-gear-ratio", type=float, default=1.0, help="Rasio gear EL (motor:output), contoh 50 berarti 50:1")
+    parser.add_argument("--selftest-tracking", action="store_true", help="Jalankan 5 skenario regression tracking non-GUI")
     args = parser.parse_args()
+
+    if args.selftest_tracking:
+        ok = run_tracking_regression_tests()
+        print(f"[selftest] result={'PASS' if ok else 'FAIL'}")
+        return
 
     logging.basicConfig(
         level=getattr(logging, str(args.imu_log_level).upper(), logging.INFO),
