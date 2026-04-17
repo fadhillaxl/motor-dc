@@ -2953,8 +2953,9 @@ def main():
             else:
                 logging.getLogger("motorPID.imu_hold").warning("IMU sample belum ada, hold akan menunggu data.")
     el_imu_tracker = None
-    # EL tracking/control source default: IMU-only saat IMU aktif.
-    enable_el_imu = args.imu and not use_sim
+    # EL tracking/control source hanya aktif saat diminta eksplisit.
+    # Ini mencegah EL keyboard terasa "stuck" jika EL IMU startup belum valid.
+    enable_el_imu = args.el_imu_only and args.imu and not use_sim
     if enable_el_imu and imu_reader is not None:
         el_cfg = ELImuFusionConfig(
             update_rate_hz=max(100.0, float(args.el_imu_rate_hz)),
