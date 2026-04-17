@@ -1466,6 +1466,20 @@ def clear_screen():
     sys.stdout.flush()
 
 
+def parse_float_safe(value, default=None):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            s = value.strip().replace(",", ".")
+            if s == "":
+                return default
+            return float(s)
+        return float(value)
+    except Exception:
+        return default
+
+
 def command_el_with_bounds(
     motor_2,
     command_speed: float,
@@ -1483,9 +1497,9 @@ def command_el_with_bounds(
         return
     if current_el_deg is None:
         st2 = motor_2.get_status()
-        cur_el = float(st2["position_deg"])
+        cur_el = parse_float_safe(st2.get("position_deg"), 0.0)
     else:
-        cur_el = float(current_el_deg)
+        cur_el = parse_float_safe(current_el_deg, 0.0)
     if direction > 0 and cur_el >= el_max - 1e-3:
         motor_2.stop_smooth()
         return
@@ -2028,7 +2042,9 @@ class SimGuiApp:
     def set_elevation(self, target_el_deg: float):
         st2 = self.motor_2.get_status()
         imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
-        cur_el = float(imu["elevation_deg"]) if imu else float(st2["position_deg"])
+        cur_el = parse_float_safe(imu.get("elevation_deg"), None) if imu else None
+        if cur_el is None:
+            cur_el = parse_float_safe(st2.get("position_deg"), 0.0)
         target_el = max(0.0, min(90.0, float(target_el_deg)))
         err_el = target_el - cur_el
         cmd_el = self._pid_speed_cmd("el", err_el, self.cfg_m2.max_speed_sps)
@@ -2084,7 +2100,7 @@ class SimGuiApp:
         el_max = 90.0 if self.cfg_m2.soft_limit_max_deg is None else float(self.cfg_m2.soft_limit_max_deg)
         imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
         if imu:
-            el_cur = float(imu["elevation_deg"])
+            el_cur = parse_float_safe(imu.get("elevation_deg"), None)
         else:
             el_cur = self.el_imu_tracker.get_el_deg() if self.el_imu_tracker is not None else None
         if self.el_pos_pressed and not self.el_neg_pressed:
@@ -2292,8 +2308,11 @@ class SimGuiApp:
         imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
         el_imu = self.el_imu_tracker.get_el_deg() if self.el_imu_tracker is not None else None
         if imu:
-            cur_az = float(imu["azimuth_deg"]) % 360.0
-            cur_el = float(imu["elevation_deg"])
+            cur_az_raw = parse_float_safe(imu.get("azimuth_deg"), None)
+            cur_az = (cur_az_raw % 360.0) if cur_az_raw is not None else (self.motor_1.get_status()["position_deg"] % 360.0)
+            cur_el = parse_float_safe(imu.get("elevation_deg"), None)
+            if cur_el is None:
+                cur_el = float(el_imu) if el_imu is not None else 0.0
         else:
             st1 = self.motor_1.get_status()
             st2 = self.motor_2.get_status()
@@ -2350,14 +2369,20 @@ class SimGuiApp:
         imu = self.imu_reader.get_latest_dict() if self.imu_reader is not None else {}
         el_imu = self.el_imu_tracker.get_el_deg() if self.el_imu_tracker is not None else None
         if imu:
-            az_disp = float(imu["azimuth_deg"]) % 360.0
+            az_disp = parse_float_safe(imu.get("azimuth_deg"), None)
+            if az_disp is None:
+                az_disp = st1["position_deg"] % 360.0
+            else:
+                az_disp = az_disp % 360.0
             pose_src = "IMU_AZ/IMU_EL"
         else:
             az_disp = st1["position_deg"] % 360.0
             pose_src = "IMU_EL_ONLY" if el_imu is not None else "MOTOR"
         # EL prioritas dari IMU (sesuai permintaan: mirror AZ source), fallback ke estimator/stepper.
         if imu:
-            el_disp = float(imu["elevation_deg"])
+            el_disp = parse_float_safe(imu.get("elevation_deg"), None)
+            if el_disp is None:
+                el_disp = float(el_imu) if el_imu is not None else float(st2["position_deg"])
         else:
             el_disp = float(el_imu) if el_imu is not None else float(st2["position_deg"])
         self._calc_selected_az_el()
@@ -2398,8 +2423,10 @@ class SimGuiApp:
                 self.lbl_status.config(
                     text=self.lbl_status.cget("text")
                     + (
-                        f"\nIMU AZ={imu['azimuth_deg']:.2f}° EL={imu['elevation_deg']:.2f}° "
-                        f"HDG={imu['compass_deg']:.2f}° T={imu['temperature_c']:.1f}C"
+                        f"\nIMU AZ={parse_float_safe(imu.get('azimuth_deg'), 0.0):.2f}° "
+                        f"EL={parse_float_safe(imu.get('elevation_deg'), 0.0):.2f}° "
+                        f"HDG={parse_float_safe(imu.get('compass_deg'), 0.0):.2f}° "
+                        f"T={parse_float_safe(imu.get('temperature_c'), 0.0):.1f}C"
                         f" | IMU-HOLD={hold_txt} TGTrel AZ={taz:.2f} EL={tel:.2f}{extra}"
                     )
                 )
@@ -2500,8 +2527,11 @@ def run_cli_mode(
         imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
         el_imu = el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None
         if imu:
-            cur_az = float(imu["azimuth_deg"]) % 360.0
-            cur_el = float(imu["elevation_deg"])
+            cur_az_raw = parse_float_safe(imu.get("azimuth_deg"), None)
+            cur_az = (cur_az_raw % 360.0) if cur_az_raw is not None else (motor_1.get_status()["position_deg"] % 360.0)
+            cur_el = parse_float_safe(imu.get("elevation_deg"), None)
+            if cur_el is None:
+                cur_el = float(el_imu) if el_imu is not None else motor_2.get_status()["position_deg"]
         else:
             st1 = motor_1.get_status()
             st2 = motor_2.get_status()
@@ -2522,12 +2552,15 @@ def run_cli_mode(
         imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
         el_imu = el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None
         if imu:
-            az_disp = float(imu["azimuth_deg"]) % 360.0
+            az_raw = parse_float_safe(imu.get("azimuth_deg"), None)
+            az_disp = (az_raw % 360.0) if az_raw is not None else (st1["position_deg"] % 360.0)
             pose_src = "IMU_AZ/IMU_EL"
         else:
             az_disp = st1["position_deg"] % 360.0
             pose_src = "IMU_EL_ONLY" if el_imu is not None else "MOTOR"
-        el_disp = float(imu["elevation_deg"]) if imu else (float(el_imu) if el_imu is not None else st2["position_deg"])
+        el_disp = parse_float_safe(imu.get("elevation_deg"), None) if imu else None
+        if el_disp is None:
+            el_disp = float(el_imu) if el_imu is not None else st2["position_deg"]
         saz, sel = sat_az_el()
         sat_txt = f"{selected_sat_name} AZ={saz:.2f} EL={sel:.2f}" if saz is not None and sel is not None else selected_sat_name
         print(f"M1(AZ) pos={az_disp:.2f} spd={st1['current_speed_sps']:.1f} tgt={st1['target_speed_sps']:.1f}")
@@ -2548,9 +2581,9 @@ def run_cli_mode(
             if imu:
                 print(
                     "imu "
-                    f"AZ={imu['azimuth_deg']:.2f}({imu['azimuth_rad']:.4f} rad) "
-                    f"EL={imu['elevation_deg']:.2f}({imu['elevation_rad']:.4f} rad) "
-                    f"HDG={imu['compass_deg']:.2f} "
+                    f"AZ={parse_float_safe(imu.get('azimuth_deg'), 0.0):.2f}({parse_float_safe(imu.get('azimuth_rad'), 0.0):.4f} rad) "
+                    f"EL={parse_float_safe(imu.get('elevation_deg'), 0.0):.2f}({parse_float_safe(imu.get('elevation_rad'), 0.0):.4f} rad) "
+                    f"HDG={parse_float_safe(imu.get('compass_deg'), 0.0):.2f} "
                     f"GYRO={imu['gyro_dps']} MAG={imu['mag']}"
                 )
             else:
@@ -3089,17 +3122,20 @@ def main():
                     imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
                     el_imu = el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None
                     if imu:
-                        az_pos = float(imu["azimuth_deg"]) % 360.0
+                        az_raw = parse_float_safe(imu.get("azimuth_deg"), None)
+                        az_pos = (az_raw % 360.0) if az_raw is not None else (st1["position_deg"] % 360.0)
                         pose_tag = "IMU_AZ/IMU_EL"
                     else:
                         az_pos = st1["position_deg"] % 360.0
                         pose_tag = "IMU_EL_ONLY" if el_imu is not None else "MOTOR"
-                    el_pos = float(imu["elevation_deg"]) if imu else (float(el_imu) if el_imu is not None else st2["position_deg"])
+                    el_pos = parse_float_safe(imu.get("elevation_deg"), None) if imu else None
+                    if el_pos is None:
+                        el_pos = float(el_imu) if el_imu is not None else st2["position_deg"]
                     fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
                     fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
                     imu_txt = ""
                     if imu:
-                        imu_txt = f" | HDG={imu['compass_deg']:6.2f}"
+                        imu_txt = f" | HDG={parse_float_safe(imu.get('compass_deg'), 0.0):6.2f}"
                     sys.stdout.write(
                         f"\rM1 POS={az_pos:7.2f} SPD={st1['current_speed_sps']:7.1f} "
                         f"| M2 POS={el_pos:7.2f} SPD={st2['current_speed_sps']:7.1f} "
