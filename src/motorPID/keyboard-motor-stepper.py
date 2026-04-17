@@ -969,6 +969,12 @@ class ImuAzElPositionController:
                 cmd_el_speed = 0.0
             cmd_az_speed = max(-self.cfg_m1.max_speed_sps, min(self.cfg_m1.max_speed_sps, cmd_az_speed))
             cmd_el_speed = max(-self.cfg_m2.max_speed_sps, min(self.cfg_m2.max_speed_sps, cmd_el_speed))
+            cmd_el_speed = gate_el_speed_by_position(
+                cmd_el_speed,
+                act_el_abs,
+                el_min=(0.0 if self.cfg_m2.soft_limit_min_deg is None else float(self.cfg_m2.soft_limit_min_deg)),
+                el_max=(90.0 if self.cfg_m2.soft_limit_max_deg is None else float(self.cfg_m2.soft_limit_max_deg)),
+            )
 
         self.motor_1.set_target_speed(cmd_az_speed)
         self.motor_2.set_target_speed(cmd_el_speed)
@@ -1507,6 +1513,28 @@ def command_el_with_bounds(
         motor_2.stop_smooth()
         return
     motor_2.set_target_speed(float(direction) * abs(float(command_speed)))
+
+
+def gate_el_speed_by_position(
+    cmd_el_speed: float,
+    current_el_deg: float | None,
+    el_min: float = 0.0,
+    el_max: float = 90.0,
+) -> float:
+    """
+    EL guard:
+    - jika posisi <= el_min, blok command negatif (turun)
+    - jika posisi >= el_max, blok command positif (naik)
+    """
+    cur = parse_float_safe(current_el_deg, None)
+    cmd = parse_float_safe(cmd_el_speed, 0.0)
+    if cur is None:
+        return float(cmd)
+    if cur <= float(el_min) + 1e-3 and cmd < 0.0:
+        return 0.0
+    if cur >= float(el_max) - 1e-3 and cmd > 0.0:
+        return 0.0
+    return float(cmd)
 
 
 def _adaptive_gains_common(axis: str, err_abs_deg: float):
@@ -2048,6 +2076,12 @@ class SimGuiApp:
         target_el = max(0.0, min(90.0, float(target_el_deg)))
         err_el = target_el - cur_el
         cmd_el = self._pid_speed_cmd("el", err_el, self.cfg_m2.max_speed_sps)
+        cmd_el = gate_el_speed_by_position(
+            cmd_el,
+            cur_el,
+            el_min=(0.0 if self.cfg_m2.soft_limit_min_deg is None else float(self.cfg_m2.soft_limit_min_deg)),
+            el_max=(90.0 if self.cfg_m2.soft_limit_max_deg is None else float(self.cfg_m2.soft_limit_max_deg)),
+        )
         self.motor_2.set_target_speed(cmd_el)
         return {"cur_el": cur_el, "target_el": target_el, "err_el": err_el, "cmd_el": cmd_el}
 
@@ -2333,6 +2367,12 @@ class SimGuiApp:
 
         cmd_az = self._pid_speed_cmd("az", err_az, self.cfg_m1.max_speed_sps)
         cmd_el = self._pid_speed_cmd("el", err_el, self.cfg_m2.max_speed_sps)
+        cmd_el = gate_el_speed_by_position(
+            cmd_el,
+            cur_el,
+            el_min=(0.0 if self.cfg_m2.soft_limit_min_deg is None else float(self.cfg_m2.soft_limit_min_deg)),
+            el_max=(90.0 if self.cfg_m2.soft_limit_max_deg is None else float(self.cfg_m2.soft_limit_max_deg)),
+        )
         self.motor_1.set_target_speed(cmd_az)
         self.motor_2.set_target_speed(cmd_el)
         self._tracking_dbg_counter += 1
@@ -2544,7 +2584,14 @@ def run_cli_mode(
         if cfg_m1.soft_limit_max_deg is not None:
             target_az = min(cfg_m1.soft_limit_max_deg, target_az)
         motor_1.set_target_speed(pid("az", az_error(target_az, cur_az), cfg_m1.max_speed_sps))
-        motor_2.set_target_speed(pid("el", target_el - cur_el, cfg_m2.max_speed_sps))
+        cmd_el = pid("el", target_el - cur_el, cfg_m2.max_speed_sps)
+        cmd_el = gate_el_speed_by_position(
+            cmd_el,
+            cur_el,
+            el_min=(0.0 if cfg_m2.soft_limit_min_deg is None else float(cfg_m2.soft_limit_min_deg)),
+            el_max=(90.0 if cfg_m2.soft_limit_max_deg is None else float(cfg_m2.soft_limit_max_deg)),
+        )
+        motor_2.set_target_speed(cmd_el)
 
     def print_status():
         st1 = motor_1.get_status()
