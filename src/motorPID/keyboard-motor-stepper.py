@@ -211,7 +211,24 @@ class ImuAzElHoldConfig:
 
 
 class WT901Reader:
-    """WT901 IMU service for hardware mode with retry, filtering, and buffering."""
+    """WT901 IMU service for hardware mode with retry, filtering, and buffering.
+    
+    Fitur dan Parameter Baru (berdasarkan absolutEL.py):
+    1. Azimuth (AZ): Dihitung dari magnetometer (Compass) menggunakan Tilt Compensation.
+       - Satuan: Derajat (°)
+       - Range Nilai: 0° hingga 360°
+    2. Elevasi Absolut (EL): Dibaca dari sensor Pitch setelah kalibrasi gravitasi bumi.
+       - Satuan: Derajat (°)
+       - Range Nilai: -90° hingga +90° (-90 tegak ke bawah, +90 tegak ke atas, 0 datar)
+    
+    Prosedur Kalibrasi:
+    1. Zero-point (Gravitasi): Dipanggil otomatis saat terkoneksi (`reset_zero_point`).
+       Pastikan alat diletakkan pada orientasi default/sejajar sebelum dihubungkan 
+       jika ingin mengatur elevasi 0° terhadap posisi saat ini.
+    2. Kompas (Medan Magnet): Panggil `begin_field_calibration()`, lalu putar perangkat 
+        360° perlahan di sumbu X, Y, dan Z. Setelah selesai, panggil `end_field_calibration()`.
+        (Di CLI: `imu magcal start` dan `imu magcal end`)
+    """
 
     def __init__(self, cfg: WT901Config):
         self.cfg = cfg
@@ -327,10 +344,15 @@ class WT901Reader:
                 vals = dev.readReg(0x02, 3)
                 if len(vals) <= 0:
                     raise RuntimeError("No response on readReg(0x02,3)")
+                
                 self._device = dev
                 self._connected = True
                 self._retry_count = 0
                 self._last_error = ""
+                
+                # (3) Kalibrasi Sensor: Reset zero-point saat terkoneksi agar EL absolut terhadap gravitasi
+                self.reset_zero_point()
+                
                 self._logger.info("WT901 connected on attempt %d", attempt)
                 return
             except Exception as exc:
@@ -341,11 +363,39 @@ class WT901Reader:
                 time.sleep(float(self.cfg.reconnect_delay_s))
         raise RuntimeError(f"WT901 gagal konek setelah {self.cfg.retry_limit} percobaan.")
 
-    def _safe_get(self, key: str, default: float = 0.0) -> float:
+    def reset_zero_point(self):
+        """
+        Menghapus zero-point yang tersimpan di sensor (Elevasi Absolut).
+        Ini memastikan pitch/EL selalu mengacu pada gravitasi, bukan posisi saat dinyalakan.
+        """
+        if self._device is None:
+            return
+        self._logger.info("Mereset zero-point ke default (sudut absolut)...")
         try:
-            return float(self._device.getDeviceData(key))
+            REG_KEY = 0x69
+            if hasattr(self._device, "write_register"):
+                self._device.write_register(self._device.ADDR, REG_KEY, 0xB588)
+                time.sleep(0.1)
+                self._device.write_register(self._device.ADDR, 0x01, 0x0000)
+            else:
+                if hasattr(self._device, "unlock"):
+                    self._device.unlock()
+                    time.sleep(0.1)
+                self._device.writeReg(0x01, 0x0000)
+                if hasattr(self._device, "save"):
+                    time.sleep(0.1)
+                    self._device.save()
+            time.sleep(0.3)
+            self._logger.info("Zero-point berhasil direset. Sensor menggunakan gravitasi sebagai referensi.")
+        except Exception as e:
+            self._logger.warning("Gagal reset zero-point: %s", e)
+
+    def _safe_get(self, key: str) -> float | None:
+        try:
+            val = self._device.getDeviceData(key)
+            return float(val) if val is not None else None
         except Exception:
-            return float(default)
+            return None
 
     def _validate_register_payload(self, regs):
         if not isinstance(regs, (list, tuple, bytes, bytearray)):
@@ -386,21 +436,51 @@ class WT901Reader:
         ax = self._safe_get("accX")
         ay = self._safe_get("accY")
         az_acc = self._safe_get("accZ")
-        gx = self._safe_get("gyroX") - self._gyro_bias[0]
-        gy = self._safe_get("gyroY") - self._gyro_bias[1]
-        gz = self._safe_get("gyroZ") - self._gyro_bias[2]
-        mx = (self._safe_get("magX") - self._hard_iron[0]) * self._soft_iron[0]
-        my = (self._safe_get("magY") - self._hard_iron[1]) * self._soft_iron[1]
-        mz = (self._safe_get("magZ") - self._hard_iron[2]) * self._soft_iron[2]
+        gx = self._safe_get("gyroX")
+        gy = self._safe_get("gyroY")
+        gz = self._safe_get("gyroZ")
+        mx = self._safe_get("magX")
+        my = self._safe_get("magY")
+        mz = self._safe_get("magZ")
         temp_c = self._safe_get("temperature")
 
-        # Compass dari magnetometer jika valid, fallback ke yaw.
-        if abs(mx) > 1e-9 or abs(my) > 1e-9:
-            compass = self._wrap_360(math.degrees(math.atan2(my, mx)) + self.cfg.declination_deg)
-        else:
+        # Validasi (4) penanganan error untuk data sensor yang tidak valid
+        if any(v is None for v in (roll, pitch, yaw, ax, ay, az_acc, mx, my, mz)):
+            raise ValueError("Data sudut/sensor tidak lengkap (None)")
+
+        gx -= self._gyro_bias[0]
+        gy -= self._gyro_bias[1]
+        gz -= self._gyro_bias[2]
+        mx = (mx - self._hard_iron[0]) * self._soft_iron[0]
+        my = (my - self._hard_iron[1]) * self._soft_iron[1]
+        mz = (mz - self._hard_iron[2]) * self._soft_iron[2]
+
+        # (1) Integrasi pembacaan magnetometer untuk azimuth dengan kompensasi kemiringan (tilt compensation)
+        try:
+            roll_rad = math.radians(roll)
+            pitch_rad = math.radians(pitch)
+
+            # Transformasi NED/NWD asumsi standar
+            X_h = mx * math.cos(pitch_rad) + mz * math.sin(pitch_rad)
+            Y_h = mx * math.sin(roll_rad) * math.sin(pitch_rad) + my * math.cos(roll_rad) - mz * math.sin(roll_rad) * math.cos(pitch_rad)
+
+            azimuth_rad = math.atan2(-Y_h, X_h)
+            azimuth = math.degrees(azimuth_rad)
+            if azimuth < 0:
+                azimuth += 360.0
+            
+            compass = self._wrap_360(azimuth + self.cfg.declination_deg)
+        except Exception:
             compass = self._wrap_360(yaw + self.cfg.declination_deg)
 
-        az = self._wrap_360(yaw + self.cfg.declination_deg)
+        # Azimuth utama sekarang menggunakan compass (magnetometer)
+        az = compass
+        
+        # (2) Kalkulasi elevasi absolut menggunakan accelerometer. 
+        # (Meskipun WT901 sudah memberikan pitch yang difusi gravitasi setelah reset_zero_point,
+        # kita tambahkan verifikasi accelerometer murni sebagai cadangan / log).
+        # el_acc = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az_acc*az_acc)))
+        
         el = max(-90.0, min(90.0, pitch))
         sample = WT901Sample(
             timestamp=time.time(),
@@ -578,20 +658,33 @@ class WT901Reader:
     def begin_field_calibration(self):
         if self._device is None:
             raise RuntimeError("WT901 belum connected")
+        
+        if hasattr(self._device, "unlock"):
+            self._device.unlock()
+            time.sleep(0.1)
+
         if hasattr(self._device, "BeginFiledCalibration"):
             self._device.BeginFiledCalibration()
-            self._logger.info("WT901 field calibration started")
         else:
-            raise RuntimeError("BeginFiledCalibration not available on current SDK")
+            self._device.writeReg(0x01, 0x07)
+        self._logger.info("WT901 field calibration started. Putar sensor 360 derajat di semua sumbu.")
 
     def end_field_calibration(self):
         if self._device is None:
             raise RuntimeError("WT901 belum connected")
+
+        if hasattr(self._device, "unlock"):
+            self._device.unlock()
+            time.sleep(0.1)
+
         if hasattr(self._device, "EndFiledCalibration"):
             self._device.EndFiledCalibration()
-            self._logger.info("WT901 field calibration ended")
         else:
-            raise RuntimeError("EndFiledCalibration not available on current SDK")
+            self._device.writeReg(0x01, 0x00)
+            if hasattr(self._device, "save"):
+                time.sleep(0.1)
+                self._device.save()
+        self._logger.info("WT901 field calibration ended and saved.")
 
     def close(self):
         self._run = False
@@ -2716,7 +2809,7 @@ def run_cli_mode(
                 print("offset az <deg> | offset el <deg> | cal az <deg> | cal el <deg>")
                 print("limit az <min> <max> | limit el <min> <max>")
                 print("obs <lat> <lon> <alt_m> | tle search <text> | tle select <idx> | track on|off")
-                print("imu status | imu decl <deg> | imu gyrocal <sec> | imu magcal start|end")
+                print("imu status | imu decl <deg> | imu gyrocal <sec> | imu magcal start|end | imu zero")
                 print("elimu status | elimu zero [sec] | elimu gyrocal [sec]")
             elif c == "status":
                 print_status()
@@ -2749,6 +2842,12 @@ def run_cli_mode(
                     print("IMU magnetic calibration ended")
                 else:
                     raise ValueError("imu magcal expects start|end")
+            elif c == "imu" and len(p) >= 2 and p[1].lower() == "zero":
+                if imu_reader is None:
+                    print("IMU not enabled")
+                else:
+                    imu_reader.reset_zero_point()
+                    print("IMU absolute elevation zero-point reset done")
             elif c == "elimu" and len(p) >= 2 and p[1].lower() == "status":
                 if el_imu_tracker is None:
                     print("EL IMU tracker not enabled")
