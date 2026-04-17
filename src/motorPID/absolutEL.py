@@ -44,6 +44,28 @@ INTERVAL  = 0.5          # Interval baca dalam detik
 # ─── Konstanta Reset Zero-Point ───────────────────────────────────────────
 REG_KEY   = 0x69          # Register kunci untuk operasi tulis
 
+def buat_device_model():
+    """
+    Membuat objek DeviceModel yang kompatibel dengan beberapa versi SDK.
+    Sebagian versi membutuhkan argumen dataUpdateListener tambahan.
+    """
+    try:
+        # Versi SDK lama: 3 argumen
+        return deviceModel.DeviceModel(
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
+        )
+    except TypeError:
+        # Versi SDK baru: 4 argumen (dataUpdateListener)
+        return deviceModel.DeviceModel(
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
+            "EL_0",
+        )
+
+
 def reset_zero_point(device):
     """
     Menghapus zero-point yang tersimpan di sensor.
@@ -52,10 +74,19 @@ def reset_zero_point(device):
     """
     print("[INFO] Mereset zero-point ke default (sudut absolut)...")
     try:
-        # Unlock register untuk penulisan
-        device.write_register(device.ADDR, REG_KEY, 0xB588)
-        time.sleep(0.1)
-        device.write_register(device.ADDR, 0x01, 0x0000)
+        # Mendukung dua varian API SDK: write_register(...) dan writeReg(...)
+        if hasattr(device, "write_register"):
+            device.write_register(device.ADDR, REG_KEY, 0xB588)
+            time.sleep(0.1)
+            device.write_register(device.ADDR, 0x01, 0x0000)
+        else:
+            if hasattr(device, "unlock"):
+                device.unlock()
+                time.sleep(0.1)
+            device.writeReg(0x01, 0x0000)
+            if hasattr(device, "save"):
+                time.sleep(0.1)
+                device.save()
         time.sleep(0.3)
 
         print("[OK] Zero-point berhasil direset. Sensor sekarang menggunakan gravitasi sebagai referensi.\n")
@@ -68,12 +99,22 @@ def baca_sudut(device):
     """
     Membaca sudut Roll, Pitch (EL), dan Yaw dari sensor.
     Mengembalikan tuple (roll, pitch, yaw) dalam derajat.
-    Menggunakan get() dari deviceModel yang sudah di-parse oleh JY901SDataProcessor.
+    Menggunakan data register yang diparse oleh JY901SDataProcessor.
     """
     try:
-        roll  = device.get("AngleX")   # Roll  (kemiringan kiri-kanan)
-        pitch = device.get("AngleY")   # Pitch (elevasi depan-belakang)
-        yaw   = device.get("AngleZ")   # Yaw   (rotasi horizontal)
+        # Untuk SDK 485, pembacaan register ini akan mengisi deviceData
+        # termasuk angleX/angleY/angleZ.
+        if hasattr(device, "readReg"):
+            device.readReg(0x30, 41)
+
+        if hasattr(device, "get"):
+            roll = device.get("AngleX")
+            pitch = device.get("AngleY")
+            yaw = device.get("AngleZ")
+        else:
+            roll = device.getDeviceData("angleX")
+            pitch = device.getDeviceData("angleY")
+            yaw = device.getDeviceData("angleZ")
 
         if roll is None or pitch is None or yaw is None:
             return None, None, None
@@ -108,11 +149,7 @@ def main():
 
     # Inisialisasi koneksi ke sensor
     try:
-        device = deviceModel.DeviceModel(
-            "WT901C485",
-            Protocol485Resolver(),
-            JY901SDataProcessor()
-        )
+        device = buat_device_model()
         device.ADDR = 0x50
         if platform.system().lower() == "linux":
             device.serialConfig.portName = "/dev/ttyUSB0"
@@ -160,7 +197,10 @@ def main():
 
     finally:
         try:
-            device.close()
+            if hasattr(device, "closeDevice"):
+                device.closeDevice()
+            else:
+                device.close()
             print("[INFO] Koneksi serial ditutup.")
         except Exception:
             pass
