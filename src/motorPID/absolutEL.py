@@ -1,7 +1,7 @@
 """
 Baca Elevasi Absolut Terhadap Gravitasi - WT901C485
 =====================================================
-Script ini membaca sudut EL (Elevation/Pitch) dari sensor WT901C485
+Script ini membaca sudut EL (Elevation/Roll) dari sensor WT901C485
 menggunakan referensi gravitasi bumi (sudut absolut).
 
 Cara penggunaan:
@@ -70,7 +70,7 @@ def buat_device_model():
 def reset_zero_point(device):
     """
     Menghapus zero-point yang tersimpan di sensor.
-    Ini memastikan EL selalu mengacu pada gravitasi (sudut absolut),
+    Ini memastikan EL (Roll) selalu mengacu pada gravitasi (sudut absolut),
     bukan posisi saat dinyalakan.
     """
     print("[INFO] Mereset zero-point ke default (sudut absolut)...")
@@ -98,7 +98,7 @@ def reset_zero_point(device):
 
 def baca_sudut(device):
     """
-    Membaca sudut Roll, Pitch (EL), Yaw, dan menghitung Azimuth Kompas.
+    Membaca sudut Roll (EL), Pitch, Yaw, dan menghitung Azimuth Kompas.
     Mengembalikan tuple (roll, pitch, yaw, azimuth) dalam derajat.
     Menggunakan data register yang diparse oleh JY901SDataProcessor.
     """
@@ -159,8 +159,8 @@ def tampilkan_header():
     print("  WT901C485 - Elevasi Absolut & Azimuth Kompas")
     print("=" * 75)
     print("Penjelasan sudut:")
-    print("  ROLL  (X) : Kemiringan kiri-kanan")
-    print("  PITCH (Y) : Kemiringan depan-belakang [ELEVASI/EL]")
+    print("  ROLL  (X) : Kemiringan kiri-kanan [ELEVASI/EL]")
+    print("  PITCH (Y) : Kemiringan depan-belakang")
     print("  YAW   (Z) : Rotasi Z (Giroskop/Fusi)")
     print("  AZIMUTH   : Arah hadap kompas (Medan Magnet dengan Tilt Compensation)")
     print()
@@ -171,7 +171,7 @@ def tampilkan_header():
     print()
     print("Tekan Ctrl+C untuk berhenti.")
     print("-" * 75)
-    print(f"{'Waktu':<12} {'ROLL (°)':>10} {'PITCH/EL (°)':>14} {'YAW (°)':>10} {'AZIMUTH (°)':>14}")
+    print(f"{'Waktu':<12} {'ROLL/EL (°)':>14} {'PITCH (°)':>10} {'YAW (°)':>10} {'AZIMUTH (°)':>14}")
     print("-" * 75)
 
 
@@ -205,21 +205,21 @@ def main():
         while True:
             roll, pitch, yaw, azimuth = baca_sudut(device)
 
-            if pitch is None:
+            if roll is None:
                 print(f"[WARN] Gagal membaca data, mencoba lagi...")
             else:
                 waktu = time.strftime("%H:%M:%S")
 
                 # Interpretasi elevasi
-                if abs(pitch) < 5:
+                if abs(roll) < 5:
                     status = "DATAR"
-                elif pitch > 0:
-                    status = f"MIRING DEPAN {pitch:.1f}°"
+                elif roll > 0:
+                    status = f"MIRING DEPAN {roll:.1f}°"
                 else:
-                    status = f"MIRING BELAKANG {abs(pitch):.1f}°"
+                    status = f"MIRING BELAKANG {abs(roll):.1f}°"
 
                 az_str = f"{azimuth:>14.2f}" if azimuth is not None else "           N/A"
-                print(f"{waktu:<12} {roll:>10.2f} {pitch:>14.2f} {yaw:>10.2f} {az_str}   [{status}]")
+                print(f"{waktu:<12} {roll:>14.2f} {pitch:>10.2f} {yaw:>10.2f} {az_str}   [{status}]")
 
             time.sleep(INTERVAL)
 

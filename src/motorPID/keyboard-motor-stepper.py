@@ -217,7 +217,7 @@ class WT901Reader:
     1. Azimuth (AZ): Dihitung dari magnetometer (Compass) menggunakan Tilt Compensation.
        - Satuan: Derajat (°)
        - Range Nilai: 0° hingga 360°
-    2. Elevasi Absolut (EL): Dibaca dari sensor Pitch setelah kalibrasi gravitasi bumi.
+    2. Elevasi Absolut (EL): Dibaca dari sensor Roll setelah kalibrasi gravitasi bumi.
        - Satuan: Derajat (°)
        - Range Nilai: -90° hingga +90° (-90 tegak ke bawah, +90 tegak ke atas, 0 datar)
     
@@ -366,7 +366,7 @@ class WT901Reader:
     def reset_zero_point(self):
         """
         Menghapus zero-point yang tersimpan di sensor (Elevasi Absolut).
-        Ini memastikan pitch/EL selalu mengacu pada gravitasi, bukan posisi saat dinyalakan.
+        Ini memastikan roll/EL selalu mengacu pada gravitasi, bukan posisi saat dinyalakan.
         """
         if self._device is None:
             return
@@ -481,7 +481,7 @@ class WT901Reader:
         # kita tambahkan verifikasi accelerometer murni sebagai cadangan / log).
         # el_acc = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az_acc*az_acc)))
         
-        el = max(-90.0, min(90.0, pitch))
+        el = max(-90.0, min(90.0, roll))
         sample = WT901Sample(
             timestamp=time.time(),
             az_deg=az,
