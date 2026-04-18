@@ -514,7 +514,7 @@ class WT901Reader:
         # kita tambahkan verifikasi accelerometer murni sebagai cadangan / log).
         # el_acc = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az_acc*az_acc)))
         
-        el = max(-90.0, min(90.0, roll))
+        el = max(-180.0, min(180.0, roll))
         sample = WT901Sample(
             timestamp=time.time(),
             az_deg=az,
@@ -560,7 +560,7 @@ class WT901Reader:
                 comp_avg = self._latest.compass_deg
 
         smp.az_deg = self._wrap_360(az_avg)
-        smp.el_deg = max(-90.0, min(90.0, el_avg))
+        smp.el_deg = max(-180.0, min(180.0, el_avg))
         smp.compass_deg = self._wrap_360(comp_avg)
         return smp
 
@@ -740,7 +740,7 @@ class ELImuFusionConfig:
     still_gyro_dps: float = 0.3
     still_acc_g_tol: float = 0.08
     el_min_deg: float = 0.0
-    el_max_deg: float = 90.0
+    el_max_deg: float = 180.0
     absolute_gravity_mode: bool = True
     debug_log: bool = False
 
@@ -1617,7 +1617,7 @@ def command_el_with_bounds(
     command_speed: float,
     direction: int,
     el_min: float = 0.0,
-    el_max: float = 90.0,
+    el_max: float = 180.0,
     current_el_deg: float | None = None,
 ):
     """
@@ -1644,7 +1644,7 @@ def gate_el_speed_by_position(
     cmd_el_speed: float,
     current_el_deg: float | None,
     el_min: float = 0.0,
-    el_max: float = 90.0,
+    el_max: float = 180.0,
 ) -> float:
     """
     Dihapus guard posisi EL agar full manual control bisa dilakukan,
@@ -2189,7 +2189,7 @@ class SimGuiApp:
         cur_el = parse_float_safe(imu.get("elevation_deg"), None) if imu else None
         if cur_el is None:
             cur_el = parse_float_safe(st2.get("position_deg"), 0.0)
-        target_el = max(0.0, min(90.0, float(target_el_deg)))
+        target_el = max(-180.0, min(180.0, float(target_el_deg)))
         err_el = target_el - cur_el
         cmd_el = self._pid_speed_cmd("el", err_el, self.cfg_m2.max_speed_sps)
         cmd_el = gate_el_speed_by_position(
@@ -2514,7 +2514,7 @@ class SimGuiApp:
         x0, y0, w, h = 460, 60, 240, 160
         self.canvas.create_rectangle(x0, y0, x0 + w, y0 + h, outline="#33ccff", width=2)
         self.canvas.create_text(x0 + w / 2, y0 + h + 20, fill="white", text="EL", font=("Arial", 10, "bold"))
-        el = max(0.0, min(90.0, el_deg))
+        el = max(-180.0, min(180.0, el_deg))
         bar_h = (el / 90.0) * (h - 20)
         self.canvas.create_rectangle(x0 + 20, y0 + h - 10 - bar_h, x0 + w - 20, y0 + h - 10, fill="#06d6a0")
         self.canvas.create_text(x0 + w / 2, y0 + h - bar_h - 20, fill="white", text=f"{el:.1f}°")
@@ -2785,7 +2785,7 @@ def run_cli_mode(
                         command_speed,
                         +1,
                         el_min=0.0,
-                        el_max=90.0,
+                        el_max=180.0,
                         current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
                     )
                 elif key in ("\x1b[B", "s", "S"):
@@ -2795,7 +2795,7 @@ def run_cli_mode(
                         command_speed,
                         -1,
                         el_min=0.0,
-                        el_max=90.0,
+                        el_max=180.0,
                         current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
                     )
                 elif key == " ":
@@ -2907,7 +2907,7 @@ def run_cli_mode(
                     command_speed,
                     +1,
                     el_min=0.0,
-                    el_max=90.0,
+                    el_max=180.0,
                     current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
                 )
             elif c == "el-":
@@ -2918,7 +2918,7 @@ def run_cli_mode(
                     command_speed,
                     -1,
                     el_min=0.0,
-                    el_max=90.0,
+                    el_max=180.0,
                     current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
                 )
             elif c == "stop":
@@ -2991,7 +2991,7 @@ def run_tracking_regression_tests() -> bool:
     Regression sederhana non-GUI untuk memastikan command tracking menggerakkan AZ/EL.
     """
     cfg_az = StepperConfig(steps_per_rev=200, microstep=2, max_speed_sps=2200.0, accel_sps2=3000.0, soft_limit_min_deg=None, soft_limit_max_deg=None)
-    cfg_el = StepperConfig(steps_per_rev=200, microstep=2, max_speed_sps=2200.0, accel_sps2=3000.0, soft_limit_min_deg=0.0, soft_limit_max_deg=90.0)
+    cfg_el = StepperConfig(steps_per_rev=200, microstep=2, max_speed_sps=2200.0, accel_sps2=3000.0, soft_limit_min_deg=0.0, soft_limit_max_deg=180.0)
     m1 = SimStepper(cfg_az, "AZ_TEST")
     m2 = SimStepper(cfg_el, "EL_TEST")
 
@@ -3105,7 +3105,7 @@ def main():
         max_speed_sps=2200.0,
         accel_sps2=3000.0,
         soft_limit_min_deg=0.0,
-        soft_limit_max_deg=90.0,
+        soft_limit_max_deg=180.0,
         axis_gear_ratio=max(1e-9, float(args.el_gear_ratio)),
     )
     logging.getLogger("motorPID.cfg").info(
@@ -3176,7 +3176,7 @@ def main():
             complementary_alpha=max(0.7, min(0.999, float(args.el_imu_alpha))),
             imu_pitch_weight=max(0.02, min(0.8, float(args.el_imu_weight))),
             el_min_deg=0.0,
-            el_max_deg=90.0,
+            el_max_deg=180.0,
             debug_log=bool(args.el_imu_debug),
         )
         el_imu_tracker = ELImuFusionTracker(el_cfg, imu_reader)
@@ -3229,7 +3229,7 @@ def main():
                             command_speed,
                             +1,
                             el_min=0.0,
-                            el_max=90.0,
+                            el_max=180.0,
                             current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
                         )
                     elif key in ("\x1b[B", "s", "S"):
@@ -3239,7 +3239,7 @@ def main():
                             command_speed,
                             -1,
                             el_min=0.0,
-                            el_max=90.0,
+                            el_max=180.0,
                             current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
                         )
                     elif key == " ":
@@ -3326,7 +3326,7 @@ def main():
                         command_speed,
                         +1,
                         el_min=0.0,
-                        el_max=90.0,
+                        el_max=180.0,
                         current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
                     )
                 elif key in ("\x1b[B", "s", "S"):
@@ -3336,7 +3336,7 @@ def main():
                         command_speed,
                         -1,
                         el_min=0.0,
-                        el_max=90.0,
+                        el_max=180.0,
                         current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
                     )
                 elif key == " ":
