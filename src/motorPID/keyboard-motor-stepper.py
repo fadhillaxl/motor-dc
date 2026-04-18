@@ -1632,13 +1632,12 @@ def command_el_with_bounds(
         cur_el = parse_float_safe(st2.get("position_deg"), 0.0)
     else:
         cur_el = parse_float_safe(current_el_deg, 0.0)
-    if direction > 0 and cur_el >= el_max - 1e-3:
+    if direction > 0:
+        motor_2.set_target_speed(abs(float(command_speed)))
+    elif direction < 0:
+        motor_2.set_target_speed(-abs(float(command_speed)))
+    else:
         motor_2.stop_smooth()
-        return
-    if direction < 0 and cur_el <= el_min + 1e-3:
-        motor_2.stop_smooth()
-        return
-    motor_2.set_target_speed(float(direction) * abs(float(command_speed)))
 
 
 def gate_el_speed_by_position(
@@ -1648,19 +1647,10 @@ def gate_el_speed_by_position(
     el_max: float = 90.0,
 ) -> float:
     """
-    EL guard:
-    - jika posisi <= el_min, blok command negatif (turun)
-    - jika posisi >= el_max, blok command positif (naik)
+    Dihapus guard posisi EL agar full manual control bisa dilakukan,
+    terutama untuk mempermudah pergerakan motor jika kalibrasi belum pas.
     """
-    cur = parse_float_safe(current_el_deg, None)
-    cmd = parse_float_safe(cmd_el_speed, 0.0)
-    if cur is None:
-        return float(cmd)
-    if cur <= float(el_min) + 1e-3 and cmd < 0.0:
-        return 0.0
-    if cur >= float(el_max) - 1e-3 and cmd > 0.0:
-        return 0.0
-    return float(cmd)
+    return parse_float_safe(cmd_el_speed, 0.0)
 
 
 def _adaptive_gains_common(axis: str, err_abs_deg: float):
