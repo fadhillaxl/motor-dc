@@ -299,12 +299,22 @@ class WT901Reader:
     def _new_device(self):
         if not WT901_SDK_AVAILABLE:
             raise RuntimeError(f"WT901 SDK tidak tersedia: {WT901_SDK_IMPORT_ERROR}")
-        dev = wt901_deviceModel.DeviceModel(
-            "WT901",
-            Protocol485Resolver(),
-            JY901SDataProcessor(),
-            "51_0",
-        )
+        
+        # Seperti di absolutEL.py, buat device model tahan terhadap 3 atau 4 argumen constructor
+        try:
+            dev = wt901_deviceModel.DeviceModel(
+                "WT901",
+                Protocol485Resolver(),
+                JY901SDataProcessor(),
+            )
+        except TypeError:
+            dev = wt901_deviceModel.DeviceModel(
+                "WT901",
+                Protocol485Resolver(),
+                JY901SDataProcessor(),
+                "51_0",
+            )
+            
         dev.ADDR = int(self.cfg.address) & 0xFF
         port_name = self.cfg.port_name.strip() if self.cfg.port_name else self._default_port()
         if self.cfg.interface.lower() == "uart":
@@ -392,7 +402,10 @@ class WT901Reader:
 
     def _safe_get(self, key: str) -> float | None:
         try:
-            val = self._device.getDeviceData(key)
+            if hasattr(self._device, "get") and key in ["AngleX", "AngleY", "AngleZ"]:
+                val = self._device.get(key)
+            else:
+                val = self._device.getDeviceData(key)
             return float(val) if val is not None else None
         except Exception:
             return None
@@ -427,22 +440,42 @@ class WT901Reader:
     def _read_sample_from_sdk(self) -> WT901Sample:
         if self._device is None:
             raise RuntimeError("WT901 device belum diinisialisasi")
-        regs = self._device.readReg(0x30, 41)
-        self._validate_register_payload(regs)
+        
+        # Sesuai pola absolutEL.py: pastikan kita memanggil readReg 
+        # (yang akan mengupdate memory map deviceModel internal)
+        if hasattr(self._device, "readReg"):
+            regs = self._device.readReg(0x30, 41)
+            self._validate_register_payload(regs)
 
-        roll = self._safe_get("angleX")
-        pitch = self._safe_get("angleY")
-        yaw = self._safe_get("angleZ")
-        ax = self._safe_get("accX")
-        ay = self._safe_get("accY")
-        az_acc = self._safe_get("accZ")
-        gx = self._safe_get("gyroX")
-        gy = self._safe_get("gyroY")
-        gz = self._safe_get("gyroZ")
-        mx = self._safe_get("magX")
-        my = self._safe_get("magY")
-        mz = self._safe_get("magZ")
-        temp_c = self._safe_get("temperature")
+        # Mendukung SDK baru dan lama layaknya absolutEL.py
+        if hasattr(self._device, "get"):
+            roll = self._safe_get("AngleX")
+            pitch = self._safe_get("AngleY")
+            yaw = self._safe_get("AngleZ")
+            ax = self._safe_get("accX")  # getDeviceData names vs get() names bisa berbeda
+            ay = self._safe_get("accY")
+            az_acc = self._safe_get("accZ")
+            gx = self._safe_get("gyroX")
+            gy = self._safe_get("gyroY")
+            gz = self._safe_get("gyroZ")
+            mx = self._safe_get("magX")
+            my = self._safe_get("magY")
+            mz = self._safe_get("magZ")
+            temp_c = self._safe_get("temperature")
+        else:
+            roll = self._safe_get("angleX")
+            pitch = self._safe_get("angleY")
+            yaw = self._safe_get("angleZ")
+            ax = self._safe_get("accX")
+            ay = self._safe_get("accY")
+            az_acc = self._safe_get("accZ")
+            gx = self._safe_get("gyroX")
+            gy = self._safe_get("gyroY")
+            gz = self._safe_get("gyroZ")
+            mx = self._safe_get("magX")
+            my = self._safe_get("magY")
+            mz = self._safe_get("magZ")
+            temp_c = self._safe_get("temperature")
 
         # Validasi (4) penanganan error untuk data sensor yang tidak valid
         if any(v is None for v in (roll, pitch, yaw, ax, ay, az_acc, mx, my, mz)):
