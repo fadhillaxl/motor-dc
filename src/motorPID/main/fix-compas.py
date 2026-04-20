@@ -30,7 +30,7 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 # CONFIG
 # =============================
 INTERVAL = 0.1
-AZ_OFFSET_DEG = 81.6
+AZ_OFFSET_DEG = 0.0
 
 # smoothing
 alpha = 0.15
