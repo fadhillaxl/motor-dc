@@ -1,9 +1,10 @@
 """
-WT901C485 - Elevasi Absolut + Azimuth Stabil (FINAL FIX)
-========================================================
-- Pakai SDK resmi (deviceModel)
-- Azimuth stabil walau tilt 0–90°
-- Blending + smoothing (ANTI LONCAT)
+WT901C485 - FINAL AZIMUTH STABLE (NO JUMP VERSION)
+=================================================
+✔ Tilt compensation (mag + acc)
+✔ Blending yaw + compass
+✔ FIX angle wrap (0-360)
+✔ Smooth azimuth (circular filter)
 """
 
 import os
@@ -32,19 +33,22 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 INTERVAL = 0.1
 AZ_OFFSET_DEG = 0.0
 
-# smoothing
 alpha = 0.15
 last_az = None
 
 # =============================
-# FILTER
+# ANGLE SAFE FILTER
 # =============================
-def lowpass(new, old):
-    if new is None:
-        return old
+def angle_diff(a, b):
+    """selisih sudut terpendek (-180..180)"""
+    return (a - b + 180) % 360 - 180
+
+def angle_lerp(new, old):
+    """smooth tanpa loncat 0/360"""
     if old is None:
         return new
-    return old + alpha * (new - old)
+    d = angle_diff(new, old)
+    return (old + alpha * d) % 360
 
 # =============================
 # DEVICE
@@ -68,8 +72,8 @@ def buat_device_model():
 # RESET ZERO
 # =============================
 def reset_zero_point(device):
-    print("[INFO] Reset zero-point...")
     try:
+        print("[INFO] Reset zero-point...")
         if hasattr(device, "write_register"):
             device.write_register(device.ADDR, 0x69, 0xB588)
             time.sleep(0.1)
@@ -82,6 +86,7 @@ def reset_zero_point(device):
             if hasattr(device, "save"):
                 time.sleep(0.1)
                 device.save()
+
         time.sleep(0.3)
         print("[OK] Zero reset\n")
     except Exception as e:
@@ -102,10 +107,7 @@ def tilt_compass(mx, my, mz, roll, pitch):
     )
 
     heading = math.degrees(math.atan2(Yh, Xh))
-    if heading < 0:
-        heading += 360
-
-    return heading
+    return (heading + 360) % 360
 
 # =============================
 # READ DATA
@@ -117,6 +119,7 @@ def baca_sudut(device):
         if hasattr(device, "readReg"):
             device.readReg(0x30, 41)
 
+        # ambil data
         if hasattr(device, "get"):
             roll = device.get("AngleX")
             pitch = device.get("AngleY")
@@ -146,34 +149,34 @@ def baca_sudut(device):
         yaw = float(yaw) % 360
 
         # =============================
-        # TILT DARI ACC (LEBIH AKURAT)
+        # TILT dari ACC (lebih stabil)
         # =============================
         roll_tilt = roll
         pitch_tilt = pitch
 
-        if accX is not None and accY is not None and accZ is not None:
+        if None not in (accX, accY, accZ):
             ax = float(accX)
             ay = float(accY)
             az = float(accZ)
 
-            den_roll = math.sqrt(ay * ay + az * az)
-            den_pitch = math.sqrt(ax * ax + az * az)
-
-            if den_roll > 1e-6:
+            if abs(ay) + abs(az) > 1e-6:
                 roll_tilt = math.degrees(math.atan2(ay, az))
-            if den_pitch > 1e-6:
-                pitch_tilt = math.degrees(math.atan2(-ax, den_pitch))
+
+            if abs(ax) + abs(az) > 1e-6:
+                pitch_tilt = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az*az)))
 
         # =============================
         # COMPASS
         # =============================
         compass = None
         if None not in (magX, magY, magZ):
-            mx = float(magX)
-            my = float(magY)
-            mz = float(magZ)
-
-            compass = tilt_compass(mx, my, mz, roll_tilt, pitch_tilt)
+            compass = tilt_compass(
+                float(magX),
+                float(magY),
+                float(magZ),
+                roll_tilt,
+                pitch_tilt
+            )
 
         # =============================
         # CONVERT CW
@@ -185,26 +188,22 @@ def baca_sudut(device):
         )
 
         # =============================
-        # 🔥 BLENDING (ANTI LONCAT)
+        # BLENDING
         # =============================
         az = yaw_cw
         src = "YAW"
 
         if compass_cw is not None:
-            roll_rad = math.radians(roll_tilt)
-            pitch_rad = math.radians(pitch_tilt)
-
-            w = math.cos(roll_rad) * math.cos(pitch_rad)
-            if w < 0:
-                w = 0
+            w = math.cos(math.radians(roll_tilt)) * math.cos(math.radians(pitch_tilt))
+            w = max(0, w)
 
             az = (1 - w) * yaw_cw + w * compass_cw
             src = f"BLEND({w:.2f})"
 
         # =============================
-        # 🔥 SMOOTHING
+        # 🔥 FIX SMOOTH (NO JUMP)
         # =============================
-        az = lowpass(az, last_az)
+        az = angle_lerp(az, last_az)
         last_az = az
 
         return roll, pitch, yaw_cw, compass_cw, az, src
@@ -217,9 +216,9 @@ def baca_sudut(device):
 # MAIN
 # =============================
 def main():
-    print("=" * 80)
-    print(" WT901C485 - FINAL STABLE AZIMUTH")
-    print("=" * 80)
+    print("="*80)
+    print(" WT901C485 - FINAL AZIMUTH NO JUMP")
+    print("="*80)
 
     device = buat_device_model()
     device.ADDR = 0x50
@@ -230,10 +229,9 @@ def main():
         device.serialConfig.portName = "/dev/tty.usbserial-1330"
 
     device.serialConfig.baud = 9600
-
     device.openDevice()
-    time.sleep(1)
 
+    time.sleep(1)
     print("[OK] Connected\n")
 
     reset_zero_point(device)
@@ -241,7 +239,7 @@ def main():
     print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}".format(
         "TIME", "ROLL", "PITCH", "YAW", "COMPASS", "AZ", "SRC"
     ))
-    print("-" * 80)
+    print("-"*80)
 
     try:
         while True:
