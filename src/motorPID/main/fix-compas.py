@@ -33,7 +33,7 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 # =============================
 INTERVAL = 0.1
 TILT_THRESHOLD_DEG = 15.0
-AZ_OFFSET_DEG = 0.0
+AZ_OFFSET_DEG = .0
 
 # =============================
 # DEVICE
@@ -200,7 +200,7 @@ def main():
     if platform.system().lower() == "linux":
         device.serialConfig.portName = "/dev/ttyUSB0"
     else:
-        device.serialConfig.portName = "/dev/tty.usbserial-xxxx"
+        device.serialConfig.portName = "/dev/tty.usbserial-110"
 
     device.serialConfig.baud = 9600
     device.openDevice()
