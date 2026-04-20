@@ -175,23 +175,24 @@ def baca_sudut(device):
                 pass
 
         yaw_norm = float(yaw) % 360.0
-        # Membalik arah azimuth berbasis yaw:
+        # Konversi ke arah kanan (clockwise/CW) 0..360
         # 0 -> 0, 10 -> 350, 90 -> 270, 270 -> 90
-        yaw_az_reversed = (360.0 - yaw_norm) % 360.0
+        yaw_cw = (360.0 - yaw_norm) % 360.0
         roll_f = float(roll)
         pitch_f = float(pitch)
         compass_f = float(compass) if compass is not None else None
+        compass_cw = (360.0 - compass_f) % 360.0 if compass_f is not None else None
 
         # Sesuai catatan: YAW akurat saat level; saat tilt besar, gunakan compass tilt-compensated.
         tilt_large = abs(roll_f) > TILT_THRESHOLD_DEG or abs(pitch_f) > TILT_THRESHOLD_DEG
-        if tilt_large and compass_f is not None:
-            az_used = compass_f
-            az_source = "COMPASS"
+        if tilt_large and compass_cw is not None:
+            az_used = compass_cw
+            az_source = "COMPASS_CW"
         else:
-            az_used = yaw_az_reversed
-            az_source = "YAW_REV"
+            az_used = yaw_cw
+            az_source = "YAW_CW"
 
-        return roll_f, pitch_f, yaw_norm, compass_f, az_used, az_source
+        return roll_f, pitch_f, yaw_cw, compass_cw, az_used, az_source
     except Exception:
         return None, None, None, None, None, None
 
