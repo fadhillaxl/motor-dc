@@ -272,6 +272,10 @@ class StepperConfig:
     en_pin: int = 0
     limit_min_pin: Optional[int] = None
     limit_max_pin: Optional[int] = None
+    en_active_high: bool = False
+    dir_active_high: bool = True
+    step_active_high: bool = True
+    enable_limits: bool = True
 
     # Motor tuning
     steps_per_rev: int = 200
@@ -323,8 +327,9 @@ class MotorController:
             GPIO.setwarnings(False)
             GPIO.setup(self.cfg.step_pin, GPIO.OUT, initial=GPIO.LOW)
             GPIO.setup(self.cfg.dir_pin, GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(self.cfg.en_pin, GPIO.OUT, initial=GPIO.LOW)
-            GPIO.output(self.cfg.en_pin, GPIO.HIGH)
+            # Start from disabled state, then enable explicitly using configured polarity.
+            GPIO.setup(self.cfg.en_pin, GPIO.OUT, initial=GPIO.HIGH)
+            self.enable_driver(True)
             if self.cfg.limit_min_pin is not None:
                 GPIO.setup(self.cfg.limit_min_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
             if self.cfg.limit_max_pin is not None:
@@ -378,7 +383,17 @@ class MotorController:
                 self.cfg.soft_limit_max_deg,
             )
 
+    def _set_output(self, pin: int, state: bool):
+        GPIO.output(pin, GPIO.HIGH if state else GPIO.LOW)
+
+    def enable_driver(self, enabled: bool):
+        # Many TB6600 boards are EN active-low; keep polarity configurable.
+        out = enabled if self.cfg.en_active_high else (not enabled)
+        self._set_output(self.cfg.en_pin, out)
+
     def _raw_limit_active(self, which: str) -> bool:
+        if not self.cfg.enable_limits:
+            return False
         if self.is_sim:
             pos = self.get_internal_deg()
             eps = self._steps_to_axis_deg(1.0 / float(self.cfg.microstep))
@@ -523,10 +538,13 @@ class MotorController:
                 continue
 
             if not self.is_sim:
-                GPIO.output(self.cfg.dir_pin, GPIO.HIGH if speed > 0 else GPIO.LOW)
-                GPIO.output(self.cfg.step_pin, GPIO.HIGH)
+                dir_out = (speed > 0) if self.cfg.dir_active_high else (speed <= 0)
+                step_hi = self.cfg.step_active_high
+                step_lo = not step_hi
+                GPIO.output(self.cfg.dir_pin, GPIO.HIGH if dir_out else GPIO.LOW)
+                GPIO.output(self.cfg.step_pin, GPIO.HIGH if step_hi else GPIO.LOW)
                 time.sleep(self.cfg.pulse_width_us / 1_000_000.0)
-                GPIO.output(self.cfg.step_pin, GPIO.LOW)
+                GPIO.output(self.cfg.step_pin, GPIO.HIGH if step_lo else GPIO.LOW)
 
             with self._lock:
                 self._position_full_steps += step_delta_full
@@ -549,7 +567,7 @@ class MotorController:
             self._thread.join(timeout=1.0)
         self._persist_position("shutdown")
         if not self.is_sim:
-            GPIO.output(self.cfg.en_pin, GPIO.LOW)
+            self.enable_driver(False)
 
 # ================= SENSOR CLASS =================
 
@@ -941,6 +959,11 @@ class AzElTrackerService:
         auto_home: bool = True,
         sensor_port: Optional[str] = None,
         sensor_baud: int = 9600,
+        limit_nc: bool = True,
+        enable_limits: bool = True,
+        en_active_high: bool = False,
+        dir_active_high: bool = True,
+        step_active_high: bool = True,
     ):
         self.simulation_mode = setup_hardware(sim)
         self.store = PersistentStateStore()
@@ -953,6 +976,7 @@ class AzElTrackerService:
         self._lock = threading.RLock()
         self._run = True
         self._last_control_ts = time.monotonic()
+        self._last_position = {"az": 0.0, "el": 0.0}
         self._last_debug = {
             "az_error": 0.0,
             "el_error": 0.0,
@@ -969,6 +993,11 @@ class AzElTrackerService:
             en_pin=22,
             limit_min_pin=5,
             limit_max_pin=6,
+            limit_nc=limit_nc,
+            enable_limits=enable_limits,
+            en_active_high=en_active_high,
+            dir_active_high=dir_active_high,
+            step_active_high=step_active_high,
             soft_limit_min_deg=0.0,
             soft_limit_max_deg=360.0,
         )
@@ -979,6 +1008,11 @@ class AzElTrackerService:
             en_pin=25,
             limit_min_pin=12,
             limit_max_pin=16,
+            limit_nc=limit_nc,
+            enable_limits=enable_limits,
+            en_active_high=en_active_high,
+            dir_active_high=dir_active_high,
+            step_active_high=step_active_high,
             soft_limit_min_deg=0.0,
             soft_limit_max_deg=90.0,
         )
@@ -1010,6 +1044,9 @@ class AzElTrackerService:
             self._last_control_ts = control_now
 
             az_angle, el_angle = self.sensor.get_angles()
+            with self._lock:
+                self._last_position["az"] = float(az_angle)
+                self._last_position["el"] = float(el_angle)
             az_st = self.az_motor.get_status()
             el_st = self.el_motor.get_status()
 
@@ -1084,8 +1121,8 @@ class AzElTrackerService:
         logging.info("HAMLIB TARGET -> AZ=%.3f EL=%.3f", self.target_az, self.target_el)
 
     def get_position(self) -> tuple[float, float]:
-        az, el = self.sensor.get_angles()
-        return float(az), float(el)
+        with self._lock:
+            return float(self._last_position["az"]), float(self._last_position["el"])
 
     def get_debug_snapshot(self) -> dict:
         az, el = self.get_position()
@@ -1133,6 +1170,11 @@ def main():
     parser.add_argument("--track", action="store_true", help="Start in automatic tracking mode")
     parser.add_argument("--no-auto-home", action="store_true", help="Skip automatic homing at startup")
     parser.add_argument("--self-test-limits", action="store_true", help="Run AZ/EL overtravel limit self-test")
+    parser.add_argument("--limit-no", action="store_true", help="Use NO limit-switch logic (active LOW)")
+    parser.add_argument("--disable-limits", action="store_true", help="Disable hard limit inputs (debug only)")
+    parser.add_argument("--en-active-high", action="store_true", help="Set EN pin active HIGH (default active LOW)")
+    parser.add_argument("--dir-active-low", action="store_true", help="Invert DIR polarity")
+    parser.add_argument("--step-active-low", action="store_true", help="Invert STEP pulse polarity")
     args = parser.parse_args()
 
     # Determine simulation mode based on arguments and hardware availability
@@ -1143,6 +1185,11 @@ def main():
     print(f"Starting AZ/EL Controller... SIMULATION_MODE = {SIMULATION_MODE}")
     logging.info(f"System started. SIMULATION_MODE={SIMULATION_MODE}")
     
+    limit_nc = not args.limit_no
+    enable_limits = not args.disable_limits
+    dir_active_high = not args.dir_active_low
+    step_active_high = not args.step_active_low
+
     cfg_az = StepperConfig(
         name="AZ",
         step_pin=17,
@@ -1150,6 +1197,11 @@ def main():
         en_pin=22,
         limit_min_pin=5,
         limit_max_pin=6,
+        limit_nc=limit_nc,
+        enable_limits=enable_limits,
+        en_active_high=args.en_active_high,
+        dir_active_high=dir_active_high,
+        step_active_high=step_active_high,
         soft_limit_min_deg=0.0,
         soft_limit_max_deg=360.0,
     )
@@ -1160,6 +1212,11 @@ def main():
         en_pin=25,
         limit_min_pin=12,
         limit_max_pin=16,
+        limit_nc=limit_nc,
+        enable_limits=enable_limits,
+        en_active_high=args.en_active_high,
+        dir_active_high=dir_active_high,
+        step_active_high=step_active_high,
         soft_limit_min_deg=0.0,
         soft_limit_max_deg=90.0,
     )
@@ -1217,7 +1274,8 @@ def main():
         "Z                                 : Zero Calibration\n"
         "+ / -                             : Speed up / down\n"
         "Q                                 : Quit\n"
-        "Limit switch NC + debounce 50 ms aktif.\n"
+        f"Limit switch {'NC' if limit_nc else 'NO'} ({'enabled' if enable_limits else 'disabled'}) + debounce 50 ms.\n"
+        f"Driver polarity EN={'HIGH' if args.en_active_high else 'LOW'} DIR={'HIGH' if dir_active_high else 'LOW'} STEP={'HIGH' if step_active_high else 'LOW'}.\n"
         "Tracking target memakai adaptive PID + gravity compensation EL.\n"
         "Motor jalan saat key ditekan/ditahan dan stop saat key release.\n"
         "Input keyboard disembunyikan; cek status limit dan LastKey.\n"
