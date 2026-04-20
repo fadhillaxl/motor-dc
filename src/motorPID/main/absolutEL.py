@@ -42,7 +42,7 @@ except ImportError as e:
 # ─── Konfigurasi ──────────────────────────────────────────────────────────
 INTERVAL  = 0.5          # Interval baca dalam detik
 TILT_THRESHOLD_DEG = 15.0  # Ambang tilt untuk beralih dari YAW ke COMPASS
-AZ_OFFSET_DEG = 20.3        # Offset heading manual (derajat), contoh: 28.7
+AZ_OFFSET_DEG = 20.5        # Offset heading manual (derajat), contoh: 28.7
 
 # ─── Konstanta Reset Zero-Point ───────────────────────────────────────────
 REG_KEY   = 0x69          # Register kunci untuk operasi tulis
