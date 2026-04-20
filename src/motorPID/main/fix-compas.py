@@ -1,28 +1,38 @@
+import os
+import sys
 import math
 import time
 from datetime import datetime
 
-# ==============================
-# IMPORT LIBRARY WT901
-# ==============================
-from WitMotionSensor import WitMotionSensor
+# =============================
+# PATH SDK
+# =============================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs"))
+sys.path.insert(0, SDK_CHS)
 
-# ==============================
+# =============================
+# IMPORT SDK
+# =============================
+import lib.device_model as deviceModel
+from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
+from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
+
+
+# =============================
 # CONFIG
-# ==============================
-PORT = "/dev/ttyUSB0"   # ganti sesuai device kamu
+# =============================
+PORT = "/dev/ttyUSB0"
 BAUD = 9600
+AZ_OFFSET_DEG = 0
 
-AZ_OFFSET_DEG = 0       # kalibrasi arah (jika perlu)
-
-# smoothing filter
 alpha = 0.15
 last_az = None
 
 
-# ==============================
-# LOW PASS FILTER
-# ==============================
+# =============================
+# FILTER
+# =============================
 def lowpass(new, old):
     if new is None:
         return old
@@ -31,9 +41,9 @@ def lowpass(new, old):
     return old + alpha * (new - old)
 
 
-# ==============================
-# TILT COMPENSATED COMPASS
-# ==============================
+# =============================
+# TILT COMPASS
+# =============================
 def tilt_compass(mx, my, mz, roll, pitch):
     roll_rad = math.radians(roll)
     pitch_rad = math.radians(pitch)
@@ -52,22 +62,21 @@ def tilt_compass(mx, my, mz, roll, pitch):
     return heading
 
 
-# ==============================
-# READ SENSOR
-# ==============================
-def baca_sudut(device):
+# =============================
+# READ DATA
+# =============================
+def read_data(device):
     global last_az
 
     try:
-        device.readReg(0x30, 41)
+        # ambil data dari SDK
+        roll = device.getDeviceData("angleX")
+        pitch = device.getDeviceData("angleY")
+        yaw = device.getDeviceData("angleZ")
 
-        roll = device.get("AngleX")
-        pitch = device.get("AngleY")
-        yaw = device.get("AngleZ")
-
-        mx = device.get("magX")
-        my = device.get("magY")
-        mz = device.get("magZ")
+        mx = device.getDeviceData("magX")
+        my = device.getDeviceData("magY")
+        mz = device.getDeviceData("magZ")
 
         if None in (roll, pitch, yaw):
             return None
@@ -76,9 +85,9 @@ def baca_sudut(device):
         pitch = float(pitch)
         yaw = float(yaw) % 360
 
-        # ==============================
-        # FIX ORIENTASI (SENSOR TERBALIK)
-        # ==============================
+        # =============================
+        # FIX ORIENTASI SENSOR (TERBALIK)
+        # =============================
         roll = 180.0 - roll
         pitch = -pitch
 
@@ -87,37 +96,37 @@ def baca_sudut(device):
         if roll < -180:
             roll += 360
 
-        # ==============================
+        # =============================
         # FIX AXIS MAGNET
-        # ==============================
+        # =============================
         if None not in (mx, my, mz):
             mx = float(mx)
             my = float(my)
             mz = float(mz)
 
-            mx, my = my, mx   # swap
-            mx = -mx          # flip
+            # hasil tuning kamu
+            mx, my = my, mx
+            mx = -mx
 
-        # ==============================
+        # =============================
         # COMPASS
-        # ==============================
+        # =============================
         compass = None
         if None not in (mx, my, mz):
             compass = tilt_compass(mx, my, mz, roll, pitch)
 
-        # ==============================
-        # CONVERT TO AZIMUTH CW
-        # ==============================
+        # =============================
+        # CONVERT CW AZIMUTH
+        # =============================
         yaw_cw = (360 - yaw + AZ_OFFSET_DEG) % 360
         compass_cw = (
             (360 - compass + AZ_OFFSET_DEG) % 360
-            if compass is not None
-            else None
+            if compass is not None else None
         )
 
-        # ==============================
-        # 🔥 BLENDING (KUNCI STABIL)
-        # ==============================
+        # =============================
+        # BLENDING
+        # =============================
         az = yaw_cw
         src = "YAW"
 
@@ -125,57 +134,62 @@ def baca_sudut(device):
             roll_rad = math.radians(roll)
             pitch_rad = math.radians(pitch)
 
-            # weight berdasarkan tilt
             w = math.cos(roll_rad) * math.cos(pitch_rad)
-
             if w < 0:
                 w = 0
 
             az = (1 - w) * yaw_cw + w * compass_cw
             src = f"BLEND({w:.2f})"
 
-        # ==============================
-        # 🔥 SMOOTHING
-        # ==============================
+        # =============================
+        # SMOOTHING
+        # =============================
         az = lowpass(az, last_az)
         last_az = az
 
         return roll, pitch, yaw_cw, compass_cw, az, src
 
     except Exception as e:
-        print("[ERR]", e)
+        print("[ERROR]", e)
         return None
 
 
-# ==============================
+# =============================
 # MAIN
-# ==============================
+# =============================
 def main():
     print("=" * 80)
-    print(" WT901C485 - FINAL (FIXED & STABLE)")
+    print(" WT901C485 - SDK MODE (STABLE AZIMUTH)")
     print("=" * 80)
 
-    device = WitMotionSensor(PORT, BAUD)
-    device.openDevice()
+    # init device model
+    device = deviceModel.DeviceModel(
+        "WT901",
+        Protocol485Resolver(),
+        JY901SDataProcessor()
+    )
+
+    print("Opening serial...")
+    device.openDevice(PORT, BAUD, 1)
 
     time.sleep(1)
 
     print("[OK] Connected\n")
 
-    print("{:<12} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}".format(
+    print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}".format(
         "TIME", "ROLL", "PITCH", "YAW", "COMPASS", "AZ", "SRC"
     ))
     print("-" * 80)
 
     while True:
-        data = baca_sudut(device)
+        data = read_data(device)
 
         if data:
             roll, pitch, yaw, compass, az, src = data
 
             now = datetime.now().strftime("%H:%M:%S")
 
-            print("{:<12} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>10}".format(
+            print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>10}".format(
                 now,
                 roll,
                 pitch,
@@ -188,8 +202,8 @@ def main():
         time.sleep(0.1)
 
 
-# ==============================
+# =============================
 # RUN
-# ==============================
+# =============================
 if __name__ == "__main__":
     main()
