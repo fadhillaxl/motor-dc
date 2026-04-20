@@ -656,7 +656,7 @@ class AbsoluteSensor:
             magY = self._sensor_get("magY")
             magZ = self._sensor_get("magZ")
 
-            if roll is None:
+            if None in (roll, pitch, yaw):
                 return None, None
 
             # Koreksi orientasi sesuai tuning lapangan di fix-compas.py.
