@@ -1315,6 +1315,12 @@ def main():
     parser.add_argument("--en-active-high", action="store_true", help="Set EN pin active HIGH (default active LOW)")
     parser.add_argument("--dir-active-low", action="store_true", help="Invert DIR polarity")
     parser.add_argument("--step-active-low", action="store_true", help="Invert STEP pulse polarity")
+    parser.add_argument(
+        "--keyboard-mode",
+        choices=("hold", "latch"),
+        default="latch",
+        help="Mode keyboard manual: hold=butuh key repeat, latch=sekali tekan jalan terus",
+    )
     args = parser.parse_args()
 
     # Determine simulation mode based on arguments and hardware availability
@@ -1401,6 +1407,7 @@ def main():
     el_pid = GainScheduledPID("EL", integral_limit=35.0, deadband_deg=0.03, derivative_alpha=0.18)
     last_control_ts = time.monotonic()
     hold_timeout_s = 0.18
+    keyboard_latch_mode = args.keyboard_mode == "latch"
     az_hold_until = 0.0
     el_hold_until = 0.0
     az_hold_speed = 0.0
@@ -1419,6 +1426,7 @@ def main():
         "Q                                 : Quit\n"
         f"Limit switch {'NC' if limit_nc else 'NO'} ({'enabled' if enable_limits else 'disabled'}) + debounce 50 ms.\n"
         f"Driver polarity EN={'HIGH' if args.en_active_high else 'LOW'} DIR={'HIGH' if dir_active_high else 'LOW'} STEP={'HIGH' if step_active_high else 'LOW'}.\n"
+        f"Keyboard mode                      : {'LATCH (sekali tekan jalan)' if keyboard_latch_mode else 'HOLD (tekan-tahan)'}\n"
         "Tracking target memakai adaptive PID + gravity compensation EL.\n"
         "Motor jalan saat key ditekan/ditahan dan stop saat key release.\n"
         "Input keyboard disembunyikan; cek status limit dan LastKey.\n"
@@ -1545,28 +1553,28 @@ def main():
                     az_pid.reset()
                     el_pid.reset()
                     az_hold_speed = command_speed
-                    az_hold_until = now + hold_timeout_s
+                    az_hold_until = float("inf") if keyboard_latch_mode else now + hold_timeout_s
                     az_motor.set_target_speed(az_hold_speed)
                 elif key in ("\x1b[D", "a", "A"):
                     tracking_enabled = False
                     az_pid.reset()
                     el_pid.reset()
                     az_hold_speed = -command_speed
-                    az_hold_until = now + hold_timeout_s
+                    az_hold_until = float("inf") if keyboard_latch_mode else now + hold_timeout_s
                     az_motor.set_target_speed(az_hold_speed)
                 elif key in ("\x1b[A", "w", "W"):
                     tracking_enabled = False
                     az_pid.reset()
                     el_pid.reset()
                     el_hold_speed = command_speed
-                    el_hold_until = now + hold_timeout_s
+                    el_hold_until = float("inf") if keyboard_latch_mode else now + hold_timeout_s
                     el_motor.set_target_speed(el_hold_speed)
                 elif key in ("\x1b[B", "s", "S"):
                     tracking_enabled = False
                     az_pid.reset()
                     el_pid.reset()
                     el_hold_speed = -command_speed
-                    el_hold_until = now + hold_timeout_s
+                    el_hold_until = float("inf") if keyboard_latch_mode else now + hold_timeout_s
                     el_motor.set_target_speed(el_hold_speed)
                 elif key == " ":
                     tracking_enabled = False
