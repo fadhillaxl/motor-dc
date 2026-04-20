@@ -113,6 +113,9 @@ def baca_sudut(device):
             roll = device.get("AngleX")
             pitch = device.get("AngleY")
             yaw = device.get("AngleZ")
+            accX = device.get("accX")
+            accY = device.get("accY")
+            accZ = device.get("accZ")
             magX = device.get("magX")
             magY = device.get("magY")
             magZ = device.get("magZ")
@@ -120,6 +123,9 @@ def baca_sudut(device):
             roll = device.getDeviceData("angleX")
             pitch = device.getDeviceData("angleY")
             yaw = device.getDeviceData("angleZ")
+            accX = device.getDeviceData("accX")
+            accY = device.getDeviceData("accY")
+            accZ = device.getDeviceData("accZ")
             magX = device.getDeviceData("magX")
             magY = device.getDeviceData("magY")
             magZ = device.getDeviceData("magZ")
@@ -127,13 +133,31 @@ def baca_sudut(device):
         if roll is None or pitch is None or yaw is None:
             return None, None, None, None, None, None
 
-        # Menghitung Arah Hadap murni dari Medan Magnet (Compass) dengan tilt compensation
+        # Hitung sudut tilt berbasis accelerometer agar kompensasi tilt
+        # benar-benar mengikuti orientasi gravitasi saat sensor miring.
+        roll_tilt = float(roll)
+        pitch_tilt = float(pitch)
+        if accX is not None and accY is not None and accZ is not None:
+            try:
+                ax = float(accX)
+                ay = float(accY)
+                az = float(accZ)
+                den_roll = math.sqrt(ay * ay + az * az)
+                den_pitch = math.sqrt(ax * ax + az * az)
+                if den_roll > 1e-9 and den_pitch > 1e-9:
+                    roll_tilt = math.degrees(math.atan2(ay, az))
+                    pitch_tilt = math.degrees(math.atan2(-ax, den_roll))
+            except Exception:
+                pass
+
+        # Menghitung arah utara dari Medan Magnet dengan tilt compensation
+        # memakai roll/pitch dari accelerometer.
         compass = None
         if magX is not None and magY is not None and magZ is not None:
             try:
                 # Konversi sudut ke radian untuk kompensasi kemiringan (tilt compensation)
-                roll_rad = math.radians(float(roll))
-                pitch_rad = math.radians(float(pitch))
+                roll_rad = math.radians(roll_tilt)
+                pitch_rad = math.radians(pitch_tilt)
 
                 # Kompensasi kemiringan (menggunakan sumbu standar NED/NWD)
                 # Bergantung pada sistem koordinat WT901, asumsi standar:
