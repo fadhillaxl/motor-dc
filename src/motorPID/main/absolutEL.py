@@ -98,8 +98,8 @@ def reset_zero_point(device):
 
 def baca_sudut(device):
     """
-    Membaca sudut Roll (EL), Pitch, Yaw (AZ), dan menghitung Azimuth Kompas murni.
-    Mengembalikan tuple (roll, pitch, yaw_az, compass) dalam derajat.
+    Membaca sudut Roll (EL), Pitch, Yaw, dan menghitung Azimuth Kompas.
+    Mengembalikan tuple (roll, pitch, yaw, azimuth) dalam derajat.
     Menggunakan data register yang diparse oleh JY901SDataProcessor.
     """
     try:
@@ -126,8 +126,8 @@ def baca_sudut(device):
         if roll is None or pitch is None or yaw is None:
             return None, None, None, None
 
-        # Menghitung Arah Hadap murni dari Medan Magnet (Compass) dengan tilt compensation
-        compass = None
+        # Menghitung Azimuth (Arah Hadap) berdasarkan Medan Magnet (Compass)
+        azimuth = None
         if magX is not None and magY is not None and magZ is not None:
             try:
                 # Konversi sudut ke radian untuk kompensasi kemiringan (tilt compensation)
@@ -139,23 +139,17 @@ def baca_sudut(device):
                 X_h = magX * math.cos(pitch_rad) + magZ * math.sin(pitch_rad)
                 Y_h = magX * math.sin(roll_rad) * math.sin(pitch_rad) + magY * math.cos(roll_rad) - magZ * math.sin(roll_rad) * math.cos(pitch_rad)
 
-                # Hitung sudut arah (heading/compass)
-                compass_rad = math.atan2(-Y_h, X_h)
-                compass = math.degrees(compass_rad)
+                # Hitung sudut arah (heading/azimuth)
+                azimuth_rad = math.atan2(-Y_h, X_h)
+                azimuth = math.degrees(azimuth_rad)
                 
                 # Normalisasi ke 0-360 derajat
-                if compass < 0:
-                    compass += 360
+                if azimuth < 0:
+                    azimuth += 360
             except Exception:
                 pass
 
-        # Menggunakan YAW sebagai AZIMUTH utama, compass hanya dikembalikan sebagai nilai tambahan
-        yaw_az = float(yaw)
-        # Normalisasi yaw jika nilainya di luar 0-360 (opsional, tergantung SDK, tapi amannya di-wrap)
-        if yaw_az < 0:
-            yaw_az += 360
-
-        return float(roll), float(pitch), yaw_az, (float(compass) if compass is not None else None)
+        return float(roll), float(pitch), float(yaw), (float(azimuth) if azimuth is not None else None)
     except Exception:
         return None, None, None, None
 
@@ -167,8 +161,8 @@ def tampilkan_header():
     print("Penjelasan sudut:")
     print("  ROLL  (X) : Kemiringan kiri-kanan [ELEVASI/EL]")
     print("  PITCH (Y) : Kemiringan depan-belakang")
-    print("  YAW/AZ  (Z) : Rotasi Z (Giroskop/Fusi) [AZIMUTH UTAMA]")
-    print("  COMPASS   : Arah hadap kompas murni (Medan Magnet dengan Tilt Compensation)")
+    print("  YAW   (Z) : Rotasi Z (Giroskop/Fusi)")
+    print("  AZIMUTH   : Arah hadap kompas (Medan Magnet dengan Tilt Compensation)")
     print()
     print("Referensi: GRAVITASI BUMI (sudut absolut)")
     print("  0°   = Sensor sejajar dengan tanah (datar)")
@@ -177,7 +171,7 @@ def tampilkan_header():
     print()
     print("Tekan Ctrl+C untuk berhenti.")
     print("-" * 75)
-    print(f"{'Waktu':<12} {'ROLL/EL (°)':>14} {'PITCH (°)':>10} {'YAW/AZ (°)':>10} {'COMPASS (°)':>14}")
+    print(f"{'Waktu':<12} {'ROLL/EL (°)':>14} {'PITCH (°)':>10} {'YAW (°)':>10} {'AZIMUTH (°)':>14}")
     print("-" * 75)
 
 
@@ -209,7 +203,7 @@ def main():
     # Loop pembacaan data
     try:
         while True:
-            roll, pitch, yaw_az, compass = baca_sudut(device)
+            roll, pitch, yaw, azimuth = baca_sudut(device)
 
             if roll is None:
                 print(f"[WARN] Gagal membaca data, mencoba lagi...")
@@ -224,8 +218,8 @@ def main():
                 else:
                     status = f"MIRING BELAKANG {abs(roll):.1f}°"
 
-                comp_str = f"{compass:>14.2f}" if compass is not None else "           N/A"
-                print(f"{waktu:<12} {roll:>14.2f} {pitch:>10.2f} {yaw_az:>10.2f} {comp_str}   [{status}]")
+                az_str = f"{azimuth:>14.2f}" if azimuth is not None else "           N/A"
+                print(f"{waktu:<12} {roll:>14.2f} {pitch:>10.2f} {yaw:>10.2f} {az_str}   [{status}]")
 
             time.sleep(INTERVAL)
 

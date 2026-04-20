@@ -13,7 +13,7 @@ import types
 import tty
 
 from rotctl_server import RotctlServer
-from controller import MotorController, AdaptivePIDBridgeController
+from controller import MotorController, AdaptivePIDBridgeController, AzElBridgeController
 from telemetry_sdr import TelemetrySDR
 
 
@@ -143,10 +143,14 @@ def _run_legacy_keyboard_stepper(argv):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=4533)
-    p.add_argument("--backend", choices=["mock", "adaptive"], default="mock")
+    p.add_argument("--backend", choices=["mock", "adaptive", "azel"], default="mock")
     p.add_argument("--mock", action="store_true")
+    p.add_argument("-gpredict", "--gpredict", action="store_true", help="Run Hamlib/Gpredict-compatible rotctld bridge mode")
     p.add_argument("--sim", action="store_true", help="Run adaptive backend in simulation mode")
     p.add_argument("--imu-port", type=str, default=None, help="WT901 serial port for adaptive backend")
+    p.add_argument("-r", "--device-port", type=str, default=None, help="Serial/USB device port for hardware mode")
+    p.add_argument("-s", "--baud-rate", type=int, default=9600, help="Serial baud rate for device/sensor")
+    p.add_argument("--no-auto-home", action="store_true", help="Skip auto-home for azel backend")
     p.add_argument(
         "--config",
         type=str,
@@ -174,8 +178,12 @@ def main():
         return
 
     backend = "adaptive" if args.backend == "adaptive" else "mock"
+    if args.backend == "azel":
+        backend = "azel"
     if args.mock:
         backend = "mock"
+    if args.gpredict and backend == "mock":
+        backend = "azel"
 
     imu_port = args.imu_port if args.imu_port else _default_imu_port()
     if backend == "adaptive":
@@ -183,6 +191,13 @@ def main():
             sim=args.sim,
             imu_port=imu_port,
             config_path=args.config,
+        )
+    elif backend == "azel":
+        ctrl = AzElBridgeController(
+            sim=args.sim,
+            sensor_port=args.device_port or imu_port,
+            sensor_baud=args.baud_rate,
+            auto_home=not args.no_auto_home,
         )
     else:
         ctrl = MotorController(mock=True)
@@ -197,7 +212,10 @@ def main():
     srv.start()
     tel = TelemetrySDR(interval=args.interval)
 
-    print(f"Rotator Bridge listening on port {args.port} (backend={backend})")
+    print(
+        f"Rotator Bridge listening on port {args.port} "
+        f"(backend={backend}, gpredict={args.gpredict}, device={args.device_port or imu_port}, baud={args.baud_rate})"
+    )
     try:
         while True:
             t = tel.poll()

@@ -2,6 +2,8 @@ import time
 import threading
 import os
 import sys
+import importlib.util
+from typing import Optional
 
 
 def _get_repo_root() -> str:
@@ -93,6 +95,51 @@ class AdaptivePIDBridgeController:
 
     def stop(self):
         self._ctl.stop()
+
+    def close(self):
+        self._ctl.close()
+
+
+class AzElBridgeController:
+    """
+    Adapter agar rotctl_server bisa memakai src/motorPID/main/az_el_controller.py.
+    """
+
+    def __init__(
+        self,
+        sim: bool = False,
+        sensor_port: Optional[str] = None,
+        sensor_baud: int = 9600,
+        auto_home: bool = True,
+    ):
+        repo_root = _get_repo_root()
+        azel_path = os.path.join(repo_root, "src", "motorPID", "main", "az_el_controller.py")
+        spec = importlib.util.spec_from_file_location("az_el_controller_bridge", azel_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load az_el_controller module from {azel_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self._ctl = mod.AzElTrackerService(
+            sim=bool(sim),
+            auto_home=bool(auto_home),
+            sensor_port=sensor_port,
+            sensor_baud=int(sensor_baud),
+        )
+
+    def set_target(self, az: float, el: float):
+        self._ctl.set_target(az, el)
+
+    def get_position(self):
+        return self._ctl.get_position()
+
+    def get_debug_snapshot(self):
+        return self._ctl.get_debug_snapshot()
+
+    def stop(self):
+        self._ctl.stop()
+
+    def reset_fault(self):
+        self._ctl.reset_fault()
 
     def close(self):
         self._ctl.close()

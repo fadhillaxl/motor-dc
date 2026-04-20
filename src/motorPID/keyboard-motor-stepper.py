@@ -214,7 +214,7 @@ class WT901Reader:
     """WT901 IMU service for hardware mode with retry, filtering, and buffering.
     
     Fitur dan Parameter Baru (berdasarkan absolutEL.py):
-    1. Azimuth (AZ): Dihitung dari magnetometer (Compass) menggunakan Tilt Compensation.
+    1. Azimuth (AZ): Dihitung dari YAW (AngleZ) sensor IMU.
        - Satuan: Derajat (°)
        - Range Nilai: 0° hingga 360°
     2. Elevasi Absolut (EL): Dibaca dari sensor Roll setelah kalibrasi gravitasi bumi.
@@ -506,8 +506,8 @@ class WT901Reader:
         except Exception:
             compass = self._wrap_360(yaw + self.cfg.declination_deg)
 
-        # Azimuth utama sekarang menggunakan compass (magnetometer)
-        az = compass
+        # Azimuth utama menggunakan nilai mentah YAW + kalibrasi deklinasi (bukan lagi full magnetometer compass)
+        az = self._wrap_360(yaw + self.cfg.declination_deg)
         
         # (2) Kalkulasi elevasi absolut menggunakan accelerometer. 
         # (Meskipun WT901 sudah memberikan pitch yang difusi gravitasi setelah reset_zero_point,
