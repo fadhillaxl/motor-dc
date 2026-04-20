@@ -1,8 +1,16 @@
+"""
+WT901C485 - Elevasi Absolut + Azimuth Stabil (FINAL FIX)
+========================================================
+- Pakai SDK resmi (deviceModel)
+- Azimuth stabil walau tilt 0–90°
+- Blending + smoothing (ANTI LONCAT)
+"""
+
 import os
 import sys
-import math
 import time
-from datetime import datetime
+import platform
+import math
 
 # =============================
 # PATH SDK
@@ -18,17 +26,15 @@ import lib.device_model as deviceModel
 from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
 from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
 
-
 # =============================
 # CONFIG
 # =============================
-PORT = "/dev/ttyUSB0"
-BAUD = 9600
-AZ_OFFSET_DEG = 0
+INTERVAL = 0.1
+AZ_OFFSET_DEG = 81.6
 
+# smoothing
 alpha = 0.15
 last_az = None
-
 
 # =============================
 # FILTER
@@ -40,6 +46,46 @@ def lowpass(new, old):
         return new
     return old + alpha * (new - old)
 
+# =============================
+# DEVICE
+# =============================
+def buat_device_model():
+    try:
+        return deviceModel.DeviceModel(
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
+        )
+    except TypeError:
+        return deviceModel.DeviceModel(
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
+            "AZ",
+        )
+
+# =============================
+# RESET ZERO
+# =============================
+def reset_zero_point(device):
+    print("[INFO] Reset zero-point...")
+    try:
+        if hasattr(device, "write_register"):
+            device.write_register(device.ADDR, 0x69, 0xB588)
+            time.sleep(0.1)
+            device.write_register(device.ADDR, 0x01, 0x0000)
+        else:
+            if hasattr(device, "unlock"):
+                device.unlock()
+                time.sleep(0.1)
+            device.writeReg(0x01, 0x0000)
+            if hasattr(device, "save"):
+                time.sleep(0.1)
+                device.save()
+        time.sleep(0.3)
+        print("[OK] Zero reset\n")
+    except Exception as e:
+        print("[WARN]", e)
 
 # =============================
 # TILT COMPASS
@@ -61,62 +107,76 @@ def tilt_compass(mx, my, mz, roll, pitch):
 
     return heading
 
-
 # =============================
 # READ DATA
 # =============================
-def read_data(device):
+def baca_sudut(device):
     global last_az
 
     try:
-        # ambil data dari SDK
-        roll = device.getDeviceData("angleX")
-        pitch = device.getDeviceData("angleY")
-        yaw = device.getDeviceData("angleZ")
+        if hasattr(device, "readReg"):
+            device.readReg(0x30, 41)
 
-        mx = device.getDeviceData("magX")
-        my = device.getDeviceData("magY")
-        mz = device.getDeviceData("magZ")
+        if hasattr(device, "get"):
+            roll = device.get("AngleX")
+            pitch = device.get("AngleY")
+            yaw = device.get("AngleZ")
+            accX = device.get("accX")
+            accY = device.get("accY")
+            accZ = device.get("accZ")
+            magX = device.get("magX")
+            magY = device.get("magY")
+            magZ = device.get("magZ")
+        else:
+            roll = device.getDeviceData("angleX")
+            pitch = device.getDeviceData("angleY")
+            yaw = device.getDeviceData("angleZ")
+            accX = device.getDeviceData("accX")
+            accY = device.getDeviceData("accY")
+            accZ = device.getDeviceData("accZ")
+            magX = device.getDeviceData("magX")
+            magY = device.getDeviceData("magY")
+            magZ = device.getDeviceData("magZ")
 
         if None in (roll, pitch, yaw):
-            return None
+            return None, None, None, None, None, None
 
         roll = float(roll)
         pitch = float(pitch)
         yaw = float(yaw) % 360
 
         # =============================
-        # FIX ORIENTASI SENSOR (TERBALIK)
+        # TILT DARI ACC (LEBIH AKURAT)
         # =============================
-        roll = 180.0 - roll
-        pitch = -pitch
+        roll_tilt = roll
+        pitch_tilt = pitch
 
-        if roll > 180:
-            roll -= 360
-        if roll < -180:
-            roll += 360
+        if accX is not None and accY is not None and accZ is not None:
+            ax = float(accX)
+            ay = float(accY)
+            az = float(accZ)
 
-        # =============================
-        # FIX AXIS MAGNET
-        # =============================
-        if None not in (mx, my, mz):
-            mx = float(mx)
-            my = float(my)
-            mz = float(mz)
+            den_roll = math.sqrt(ay * ay + az * az)
+            den_pitch = math.sqrt(ax * ax + az * az)
 
-            # hasil tuning kamu
-            mx, my = my, mx
-            mx = -mx
+            if den_roll > 1e-6:
+                roll_tilt = math.degrees(math.atan2(ay, az))
+            if den_pitch > 1e-6:
+                pitch_tilt = math.degrees(math.atan2(-ax, den_pitch))
 
         # =============================
         # COMPASS
         # =============================
         compass = None
-        if None not in (mx, my, mz):
-            compass = tilt_compass(mx, my, mz, roll, pitch)
+        if None not in (magX, magY, magZ):
+            mx = float(magX)
+            my = float(magY)
+            mz = float(magZ)
+
+            compass = tilt_compass(mx, my, mz, roll_tilt, pitch_tilt)
 
         # =============================
-        # CONVERT CW AZIMUTH
+        # CONVERT CW
         # =============================
         yaw_cw = (360 - yaw + AZ_OFFSET_DEG) % 360
         compass_cw = (
@@ -125,14 +185,14 @@ def read_data(device):
         )
 
         # =============================
-        # BLENDING
+        # 🔥 BLENDING (ANTI LONCAT)
         # =============================
         az = yaw_cw
         src = "YAW"
 
         if compass_cw is not None:
-            roll_rad = math.radians(roll)
-            pitch_rad = math.radians(pitch)
+            roll_rad = math.radians(roll_tilt)
+            pitch_rad = math.radians(pitch_tilt)
 
             w = math.cos(roll_rad) * math.cos(pitch_rad)
             if w < 0:
@@ -142,7 +202,7 @@ def read_data(device):
             src = f"BLEND({w:.2f})"
 
         # =============================
-        # SMOOTHING
+        # 🔥 SMOOTHING
         # =============================
         az = lowpass(az, last_az)
         last_az = az
@@ -150,57 +210,67 @@ def read_data(device):
         return roll, pitch, yaw_cw, compass_cw, az, src
 
     except Exception as e:
-        print("[ERROR]", e)
-        return None
-
+        print("[ERR]", e)
+        return None, None, None, None, None, None
 
 # =============================
 # MAIN
 # =============================
 def main():
     print("=" * 80)
-    print(" WT901C485 - SDK MODE (STABLE AZIMUTH)")
+    print(" WT901C485 - FINAL STABLE AZIMUTH")
     print("=" * 80)
 
-    # init device model
-    device = deviceModel.DeviceModel(
-        "WT901",
-        Protocol485Resolver(),
-        JY901SDataProcessor()
-    )
+    device = buat_device_model()
+    device.ADDR = 0x50
 
-    print("Opening serial...")
-    device.openDevice(PORT, BAUD, 1)
+    if platform.system().lower() == "linux":
+        device.serialConfig.portName = "/dev/ttyUSB0"
+    else:
+        device.serialConfig.portName = "/dev/tty.usbserial-1330"
 
+    device.serialConfig.baud = 9600
+
+    device.openDevice()
     time.sleep(1)
 
     print("[OK] Connected\n")
+
+    reset_zero_point(device)
 
     print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}".format(
         "TIME", "ROLL", "PITCH", "YAW", "COMPASS", "AZ", "SRC"
     ))
     print("-" * 80)
 
-    while True:
-        data = read_data(device)
+    try:
+        while True:
+            data = baca_sudut(device)
 
-        if data:
-            roll, pitch, yaw, compass, az, src = data
+            if data[0] is not None:
+                roll, pitch, yaw, comp, az, src = data
+                now = time.strftime("%H:%M:%S")
 
-            now = datetime.now().strftime("%H:%M:%S")
+                print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>10}".format(
+                    now,
+                    roll,
+                    pitch,
+                    yaw,
+                    f"{comp:.2f}" if comp else "-",
+                    az,
+                    src
+                ))
 
-            print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>10}".format(
-                now,
-                roll,
-                pitch,
-                yaw,
-                f"{compass:.2f}" if compass is not None else "-",
-                az,
-                src
-            ))
+            time.sleep(INTERVAL)
 
-        time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n[STOP]")
 
+    finally:
+        try:
+            device.closeDevice()
+        except:
+            pass
 
 # =============================
 # RUN
