@@ -23,7 +23,7 @@ import math
 # PYTHON PATH -> folder chs lokal project
 # =====================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "Python-SDK-WT901C485", "chs"))
+SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs"))
 sys.path.insert(0, SDK_CHS)
 
 # ─── Import dari SDK WITMOTION ─────────────────────────────────────────────
@@ -41,6 +41,8 @@ except ImportError as e:
 
 # ─── Konfigurasi ──────────────────────────────────────────────────────────
 INTERVAL  = 0.5          # Interval baca dalam detik
+TILT_THRESHOLD_DEG = 15.0  # Ambang tilt untuk beralih dari YAW ke COMPASS
+AZ_OFFSET_DEG = 30.0        # Offset heading manual (derajat), contoh: 28.7
 
 # ─── Konstanta Reset Zero-Point ───────────────────────────────────────────
 REG_KEY   = 0x69          # Register kunci untuk operasi tulis
@@ -98,8 +100,8 @@ def reset_zero_point(device):
 
 def baca_sudut(device):
     """
-    Membaca sudut Roll (EL), Pitch, Yaw, dan menghitung Azimuth Kompas.
-    Mengembalikan tuple (roll, pitch, yaw, azimuth) dalam derajat.
+    Membaca sudut Roll (EL), Pitch, Yaw, dan menghitung Azimuth Kompas murni.
+    Mengembalikan tuple (roll, pitch, yaw, compass, az_used, az_source) dalam derajat.
     Menggunakan data register yang diparse oleh JY901SDataProcessor.
     """
     try:
@@ -112,6 +114,9 @@ def baca_sudut(device):
             roll = device.get("AngleX")
             pitch = device.get("AngleY")
             yaw = device.get("AngleZ")
+            accX = device.get("accX")
+            accY = device.get("accY")
+            accZ = device.get("accZ")
             magX = device.get("magX")
             magY = device.get("magY")
             magZ = device.get("magZ")
@@ -119,39 +124,78 @@ def baca_sudut(device):
             roll = device.getDeviceData("angleX")
             pitch = device.getDeviceData("angleY")
             yaw = device.getDeviceData("angleZ")
+            accX = device.getDeviceData("accX")
+            accY = device.getDeviceData("accY")
+            accZ = device.getDeviceData("accZ")
             magX = device.getDeviceData("magX")
             magY = device.getDeviceData("magY")
             magZ = device.getDeviceData("magZ")
 
         if roll is None or pitch is None or yaw is None:
-            return None, None, None, None
+            return None, None, None, None, None, None
 
-        # Menghitung Azimuth (Arah Hadap) berdasarkan Medan Magnet (Compass)
-        azimuth = None
+        # Hitung sudut tilt berbasis accelerometer agar kompensasi tilt
+        # benar-benar mengikuti orientasi gravitasi saat sensor miring.
+        roll_tilt = float(roll)
+        pitch_tilt = float(pitch)
+        if accX is not None and accY is not None and accZ is not None:
+            try:
+                ax = float(accX)
+                ay = float(accY)
+                az = float(accZ)
+                den_roll = math.sqrt(ay * ay + az * az)
+                den_pitch = math.sqrt(ax * ax + az * az)
+                if den_roll > 1e-9 and den_pitch > 1e-9:
+                    roll_tilt = math.degrees(math.atan2(ay, az))
+                    pitch_tilt = math.degrees(math.atan2(-ax, den_roll))
+            except Exception:
+                pass
+
+        # Menghitung arah utara dari Medan Magnet dengan tilt compensation
+        # memakai roll/pitch dari accelerometer.
+        compass = None
         if magX is not None and magY is not None and magZ is not None:
             try:
                 # Konversi sudut ke radian untuk kompensasi kemiringan (tilt compensation)
-                roll_rad = math.radians(float(roll))
-                pitch_rad = math.radians(float(pitch))
+                roll_rad = math.radians(roll_tilt)
+                pitch_rad = math.radians(pitch_tilt)
 
                 # Kompensasi kemiringan (menggunakan sumbu standar NED/NWD)
                 # Bergantung pada sistem koordinat WT901, asumsi standar:
                 X_h = magX * math.cos(pitch_rad) + magZ * math.sin(pitch_rad)
                 Y_h = magX * math.sin(roll_rad) * math.sin(pitch_rad) + magY * math.cos(roll_rad) - magZ * math.sin(roll_rad) * math.cos(pitch_rad)
 
-                # Hitung sudut arah (heading/azimuth)
-                azimuth_rad = math.atan2(-Y_h, X_h)
-                azimuth = math.degrees(azimuth_rad)
+                # Hitung sudut arah (heading/compass)
+                compass_rad = math.atan2(-Y_h, X_h)
+                compass = math.degrees(compass_rad)
                 
                 # Normalisasi ke 0-360 derajat
-                if azimuth < 0:
-                    azimuth += 360
+                if compass < 0:
+                    compass += 360
             except Exception:
                 pass
 
-        return float(roll), float(pitch), float(yaw), (float(azimuth) if azimuth is not None else None)
+        yaw_norm = float(yaw) % 360.0
+        # Konversi ke arah kanan (clockwise/CW) 0..360
+        # 0 -> 0, 10 -> 350, 90 -> 270, 270 -> 90
+        yaw_cw = (360.0 - yaw_norm + AZ_OFFSET_DEG) % 360.0
+        roll_f = float(roll)
+        pitch_f = float(pitch)
+        compass_f = float(compass) if compass is not None else None
+        compass_cw = (360.0 - compass_f + AZ_OFFSET_DEG) % 360.0 if compass_f is not None else None
+
+        # Sesuai catatan: YAW akurat saat level; saat tilt besar, gunakan compass tilt-compensated.
+        tilt_large = abs(roll_f) > TILT_THRESHOLD_DEG or abs(pitch_f) > TILT_THRESHOLD_DEG
+        if tilt_large and compass_cw is not None:
+            az_used = compass_cw
+            az_source = "COMPASS_CW"
+        else:
+            az_used = yaw_cw
+            az_source = "YAW_CW"
+
+        return roll_f, pitch_f, yaw_cw, compass_cw, az_used, az_source
     except Exception:
-        return None, None, None, None
+        return None, None, None, None, None, None
 
 
 def tampilkan_header():
@@ -162,7 +206,10 @@ def tampilkan_header():
     print("  ROLL  (X) : Kemiringan kiri-kanan [ELEVASI/EL]")
     print("  PITCH (Y) : Kemiringan depan-belakang")
     print("  YAW   (Z) : Rotasi Z (Giroskop/Fusi)")
-    print("  AZIMUTH   : Arah hadap kompas (Medan Magnet dengan Tilt Compensation)")
+    print("                *CATATAN: YAW/Heading WT901 hanya akurat jika sensor datar (level).")
+    print("                *Jika Pitch/Roll besar, heading bisa drift tanpa Tilt Compensation.")
+    print("  COMPASS   : Arah hadap kompas murni (Medan Magnet dengan Tilt Compensation)")
+    print("  AZ_USED   : Azimuth final adaptif (YAW saat level, COMPASS saat tilt besar)")
     print()
     print("Referensi: GRAVITASI BUMI (sudut absolut)")
     print("  0°   = Sensor sejajar dengan tanah (datar)")
@@ -171,7 +218,7 @@ def tampilkan_header():
     print()
     print("Tekan Ctrl+C untuk berhenti.")
     print("-" * 75)
-    print(f"{'Waktu':<12} {'ROLL/EL (°)':>14} {'PITCH (°)':>10} {'YAW (°)':>10} {'AZIMUTH (°)':>14}")
+    print(f"{'Waktu':<12} {'ROLL/EL (°)':>14} {'PITCH (°)':>10} {'YAW (°)':>10} {'COMPASS (°)':>14} {'AZ_USED (°)':>12} {'SRC':>7}")
     print("-" * 75)
 
 
@@ -203,7 +250,7 @@ def main():
     # Loop pembacaan data
     try:
         while True:
-            roll, pitch, yaw, azimuth = baca_sudut(device)
+            roll, pitch, yaw, compass, az_used, az_source = baca_sudut(device)
 
             if roll is None:
                 print(f"[WARN] Gagal membaca data, mencoba lagi...")
@@ -218,8 +265,10 @@ def main():
                 else:
                     status = f"MIRING BELAKANG {abs(roll):.1f}°"
 
-                az_str = f"{azimuth:>14.2f}" if azimuth is not None else "           N/A"
-                print(f"{waktu:<12} {roll:>14.2f} {pitch:>10.2f} {yaw:>10.2f} {az_str}   [{status}]")
+                comp_str = f"{compass:>14.2f}" if compass is not None else "           N/A"
+                az_used_str = f"{az_used:>12.2f}" if az_used is not None else "         N/A"
+                src_str = f"{az_source:>7}" if az_source is not None else "    N/A"
+                print(f"{waktu:<12} {roll:>14.2f} {pitch:>10.2f} {yaw:>10.2f} {comp_str} {az_used_str} {src_str}   [{status}]")
 
             time.sleep(INTERVAL)
 
