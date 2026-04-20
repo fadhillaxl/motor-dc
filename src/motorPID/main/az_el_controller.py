@@ -51,6 +51,8 @@ GPIO = None
 deviceModel = None
 JY901SDataProcessor = None
 Protocol485Resolver = None
+TILT_THRESHOLD_DEG = 15.0
+AZ_OFFSET_DEG = 30.0
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
@@ -225,7 +227,7 @@ def setup_hardware(is_sim: bool) -> bool:
 
     # Setup WITMOTION SDK path
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "Python-SDK-WT901C485", "chs"))
+    SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs"))
     if SDK_CHS not in sys.path:
         sys.path.insert(0, SDK_CHS)
 
@@ -623,12 +625,20 @@ class AbsoluteSensor:
             if hasattr(self.device, "get"):
                 roll = self.device.get("AngleX")
                 pitch = self.device.get("AngleY")
+                yaw = self.device.get("AngleZ")
+                accX = self.device.get("accX")
+                accY = self.device.get("accY")
+                accZ = self.device.get("accZ")
                 magX = self.device.get("magX")
                 magY = self.device.get("magY")
                 magZ = self.device.get("magZ")
             else:
                 roll = self.device.getDeviceData("angleX")
                 pitch = self.device.getDeviceData("angleY")
+                yaw = self.device.getDeviceData("angleZ")
+                accX = self.device.getDeviceData("accX")
+                accY = self.device.getDeviceData("accY")
+                accZ = self.device.getDeviceData("accZ")
                 magX = self.device.getDeviceData("magX")
                 magY = self.device.getDeviceData("magY")
                 magZ = self.device.getDeviceData("magZ")
@@ -637,19 +647,53 @@ class AbsoluteSensor:
                 return None, None
 
             roll_deg = float(roll)
+            pitch_deg = float(pitch) if pitch is not None else 0.0
             el = self._convert_roll_to_el_deg(roll_deg)
+
+            # Heading YAW (CW 0..360) dengan offset manual.
+            yaw_cw = None
+            if yaw is not None:
+                yaw_norm = float(yaw) % 360.0
+                yaw_cw = (360.0 - yaw_norm + AZ_OFFSET_DEG) % 360.0
+
+            # Roll/Pitch berbasis accelerometer untuk tilt compensation.
+            roll_tilt = roll_deg
+            pitch_tilt = pitch_deg
+            if accX is not None and accY is not None and accZ is not None:
+                try:
+                    ax = float(accX)
+                    ay = float(accY)
+                    az = float(accZ)
+                    den_roll = math.sqrt(ay * ay + az * az)
+                    if den_roll > 1e-9:
+                        roll_tilt = math.degrees(math.atan2(ay, az))
+                        pitch_tilt = math.degrees(math.atan2(-ax, den_roll))
+                except Exception:
+                    pass
+
             azimuth = None
+            compass_cw = None
             if magX is not None and magY is not None and magZ is not None:
                 try:
-                    r_rad, p_rad = math.radians(roll_deg), math.radians(float(pitch))
+                    r_rad, p_rad = math.radians(roll_tilt), math.radians(pitch_tilt)
                     X_h = magX * math.cos(p_rad) + magZ * math.sin(p_rad)
                     Y_h = magX * math.sin(r_rad) * math.sin(p_rad) + magY * math.cos(r_rad) - magZ * math.sin(r_rad) * math.cos(p_rad)
                     az_rad = math.atan2(-Y_h, X_h)
-                    azimuth = (math.degrees(az_rad) + 360) % 360
-                except:
+                    compass = (math.degrees(az_rad) + 360) % 360
+                    compass_cw = (360.0 - compass + AZ_OFFSET_DEG) % 360.0
+                except Exception:
                     pass
-            
-            # If azimuth fails, fallback to internal motor position for azimuth
+
+            # Saat tilt besar, utamakan compass tilt-compensated.
+            tilt_large = abs(roll_deg) > TILT_THRESHOLD_DEG or abs(pitch_deg) > TILT_THRESHOLD_DEG
+            if tilt_large and compass_cw is not None:
+                azimuth = compass_cw
+            elif yaw_cw is not None:
+                azimuth = yaw_cw
+            elif compass_cw is not None:
+                azimuth = compass_cw
+
+            # If azimuth still fails, fallback to internal motor position for azimuth.
             if azimuth is None:
                 azimuth = self.az_motor.get_internal_deg()
                 
