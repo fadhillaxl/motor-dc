@@ -343,6 +343,14 @@ class MotorController:
         self._thread.start()
         logging.info("%s Motor initialized. SIM: %s", cfg.name, is_sim)
 
+    @staticmethod
+    def _is_valid_number(value: float) -> bool:
+        try:
+            v = float(value)
+        except Exception:
+            return False
+        return math.isfinite(v)
+
     def _axis_deg_to_steps(self, value_deg: float) -> float:
         return (value_deg / 360.0) * float(self.cfg.steps_per_rev)
 
@@ -357,6 +365,8 @@ class MotorController:
             self.store.save_axis_position(self.cfg.name, bounded, "set_position")
 
     def set_target_speed(self, speed_sps: float):
+        if not self._is_valid_number(speed_sps):
+            raise ValueError("speed_sps harus angka finite")
         with self._lock:
             if self._fault_latched and not self._homing:
                 return
@@ -366,6 +376,112 @@ class MotorController:
     def stop_smooth(self):
         with self._lock:
             self._target_speed_sps = 0.0
+
+    def hold_position(self):
+        """Tahan posisi saat ini dengan menghentikan command kecepatan."""
+        self.stop_smooth()
+
+    def rotate(self, direction: int, speed_sps: Optional[float] = None):
+        """
+        Rotasi kontinu.
+        direction: +1 (CW/positif) atau -1 (CCW/negatif)
+        """
+        if direction not in (-1, 1):
+            raise ValueError("direction harus -1 atau 1")
+        speed = abs(float(self.cfg.max_speed_sps if speed_sps is None else speed_sps))
+        if speed <= 0.0:
+            raise ValueError("speed_sps harus > 0")
+        self.set_target_speed(float(direction) * speed)
+
+    def emergency_stop(self, reason: str = "Emergency stop"):
+        """Hentikan motor segera dan latch fault."""
+        self._latch_fault("EMERGENCY", f"{self.cfg.name} {reason}")
+
+    def _microstep_deg(self) -> float:
+        return self._steps_to_axis_deg(1.0 / float(self.cfg.microstep))
+
+    def _wait_until_position(
+        self,
+        target_deg: float,
+        timeout_s: float,
+        settle_eps_deg: float,
+        stall_timeout_s: float = 0.35,
+    ) -> bool:
+        start = time.monotonic()
+        last_progress_t = start
+        last_pos = self.get_internal_deg()
+        progress_eps = max(0.02, settle_eps_deg * 0.5)
+        while time.monotonic() - start < timeout_s:
+            pos = self.get_internal_deg()
+            if abs(pos - target_deg) <= settle_eps_deg:
+                return True
+            if abs(pos - last_pos) >= progress_eps:
+                last_pos = pos
+                last_progress_t = time.monotonic()
+            elif time.monotonic() - last_progress_t > stall_timeout_s:
+                self._latch_fault("STALL_TIMEOUT", f"{self.cfg.name} tidak ada progress gerak")
+                return False
+            time.sleep(0.01)
+        return False
+
+    def move_deg(self, delta_deg: float, speed_sps: Optional[float] = None, timeout_s: float = 6.0) -> bool:
+        """Gerak relatif sebesar delta derajat (blocking)."""
+        if not self._is_valid_number(delta_deg):
+            raise ValueError("delta_deg harus angka finite")
+        if abs(float(delta_deg)) < 1e-9:
+            raise ValueError("delta_deg tidak boleh 0")
+        max_speed = abs(float(self.cfg.max_speed_sps * 0.3 if speed_sps is None else speed_sps))
+        if max_speed <= 0.0:
+            raise ValueError("speed_sps harus > 0")
+
+        start_pos = self.get_internal_deg()
+        target = start_pos + float(delta_deg)
+        if target < self.cfg.soft_limit_min_deg or target > self.cfg.soft_limit_max_deg:
+            raise ValueError(
+                f"Target {target:.3f}° di luar soft limit [{self.cfg.soft_limit_min_deg}, {self.cfg.soft_limit_max_deg}]"
+            )
+        eps = max(0.05, min(0.1, abs(float(delta_deg)) * 0.25, self._microstep_deg() * 0.75))
+        min_speed = max(25.0, min(max_speed, 80.0))
+
+        start_t = time.monotonic()
+        last_progress_t = start_t
+        last_err = abs(target - start_pos)
+        try:
+            while time.monotonic() - start_t < timeout_s:
+                pos = self.get_internal_deg()
+                err = target - pos
+                abs_err = abs(err)
+                if abs_err <= eps:
+                    return True
+
+                # Proportional speed profile untuk akurasi posisi saat mendekati target.
+                cmd_speed = max(min_speed, min(max_speed, abs_err * 180.0))
+                self.set_target_speed((1.0 if err > 0.0 else -1.0) * cmd_speed)
+
+                if abs_err + 1e-4 < last_err:
+                    last_err = abs_err
+                    last_progress_t = time.monotonic()
+                elif time.monotonic() - last_progress_t > 0.6:
+                    self._latch_fault("STALL_TIMEOUT", f"{self.cfg.name} tidak ada progress gerak")
+                    return False
+                time.sleep(0.01)
+            return False
+        finally:
+            self.stop_smooth()
+
+    def move_steps(self, steps: float, speed_sps: Optional[float] = None, timeout_s: float = 6.0) -> bool:
+        """Gerak relatif sebesar jumlah microstep-equivalent (blocking)."""
+        if not self._is_valid_number(steps):
+            raise ValueError("steps harus angka finite")
+        if abs(float(steps)) < 1e-9:
+            raise ValueError("steps tidak boleh 0")
+        return self.move_deg(self._steps_to_axis_deg(float(steps)), speed_sps=speed_sps, timeout_s=timeout_s)
+
+    def single_step(self, direction: int = 1, speed_sps: Optional[float] = None) -> bool:
+        """Gerak satu microstep-equivalent."""
+        if direction not in (-1, 1):
+            raise ValueError("direction harus -1 atau 1")
+        return self.move_steps(float(direction) / float(self.cfg.microstep), speed_sps=speed_sps, timeout_s=2.0)
 
     def clear_fault(self):
         with self._lock:
