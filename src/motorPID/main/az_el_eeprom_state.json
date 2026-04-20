@@ -3,14 +3,14 @@
     "AZ": {
       "position_deg": 350.325,
       "reason": "idle",
-      "saved_at": "2026-04-20 13:55:04"
+      "saved_at": "2026-04-20 14:35:39"
     },
     "EL": {
       "position_deg": 30.15,
       "reason": "idle",
-      "saved_at": "2026-04-20 13:55:04"
+      "saved_at": "2026-04-20 14:35:39"
     }
   },
   "fault": null,
-  "updated_at": "2026-04-20 13:55:04"
+  "updated_at": "2026-04-20 14:35:39"
 }

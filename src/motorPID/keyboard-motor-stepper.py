@@ -217,6 +217,11 @@ class WT901Reader:
     1. Azimuth (AZ): Dihitung dari YAW (AngleZ) sensor IMU.
        - Satuan: Derajat (°)
        - Range Nilai: 0° hingga 360°
+       - CATATAN PENTING: WT901 menggabungkan magnetometer + accelerometer + gyro 
+         untuk menghasilkan yaw yang stabil. Namun, nilai YAW/Heading ini hanya 
+         akurat jika sensor dalam posisi datar (level). Jika pitch/roll berubah 
+         banyak (dimiringkan ekstrem), heading bisa drift atau tidak akurat tanpa 
+         tilt compensation yang memadai.
     2. Elevasi Absolut (EL): Dibaca dari sensor Roll setelah kalibrasi gravitasi bumi.
        - Satuan: Derajat (°)
        - Range Nilai: -90° hingga +90° (-90 tegak ke bawah, +90 tegak ke atas, 0 datar)

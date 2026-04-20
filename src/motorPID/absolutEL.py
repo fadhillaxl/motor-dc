@@ -41,6 +41,7 @@ except ImportError as e:
 
 # ─── Konfigurasi ──────────────────────────────────────────────────────────
 INTERVAL  = 0.5          # Interval baca dalam detik
+TILT_THRESHOLD_DEG = 15.0  # Ambang tilt untuk beralih dari YAW ke COMPASS
 
 # ─── Konstanta Reset Zero-Point ───────────────────────────────────────────
 REG_KEY   = 0x69          # Register kunci untuk operasi tulis
@@ -98,8 +99,8 @@ def reset_zero_point(device):
 
 def baca_sudut(device):
     """
-    Membaca sudut Roll (EL), Pitch, Yaw (AZ), dan menghitung Azimuth Kompas murni.
-    Mengembalikan tuple (roll, pitch, yaw_az, compass) dalam derajat.
+    Membaca sudut Roll (EL), Pitch, Yaw, dan menghitung Azimuth Kompas murni.
+    Mengembalikan tuple (roll, pitch, yaw, compass, az_used, az_source) dalam derajat.
     Menggunakan data register yang diparse oleh JY901SDataProcessor.
     """
     try:
@@ -124,7 +125,7 @@ def baca_sudut(device):
             magZ = device.getDeviceData("magZ")
 
         if roll is None or pitch is None or yaw is None:
-            return None, None, None, None
+            return None, None, None, None, None, None
 
         # Menghitung Arah Hadap murni dari Medan Magnet (Compass) dengan tilt compensation
         compass = None
@@ -149,15 +150,23 @@ def baca_sudut(device):
             except Exception:
                 pass
 
-        # Menggunakan YAW sebagai AZIMUTH utama, compass hanya dikembalikan sebagai nilai tambahan
-        yaw_az = float(yaw)
-        # Normalisasi yaw jika nilainya di luar 0-360 (opsional, tergantung SDK, tapi amannya di-wrap)
-        if yaw_az < 0:
-            yaw_az += 360
+        yaw_norm = float(yaw) % 360.0
+        roll_f = float(roll)
+        pitch_f = float(pitch)
+        compass_f = float(compass) if compass is not None else None
 
-        return float(roll), float(pitch), yaw_az, (float(compass) if compass is not None else None)
+        # Sesuai catatan: YAW akurat saat level; saat tilt besar, gunakan compass tilt-compensated.
+        tilt_large = abs(roll_f) > TILT_THRESHOLD_DEG or abs(pitch_f) > TILT_THRESHOLD_DEG
+        if tilt_large and compass_f is not None:
+            az_used = compass_f
+            az_source = "COMPASS"
+        else:
+            az_used = yaw_norm
+            az_source = "YAW"
+
+        return roll_f, pitch_f, yaw_norm, compass_f, az_used, az_source
     except Exception:
-        return None, None, None, None
+        return None, None, None, None, None, None
 
 
 def tampilkan_header():
@@ -167,8 +176,11 @@ def tampilkan_header():
     print("Penjelasan sudut:")
     print("  ROLL  (X) : Kemiringan kiri-kanan [ELEVASI/EL]")
     print("  PITCH (Y) : Kemiringan depan-belakang")
-    print("  YAW/AZ  (Z) : Rotasi Z (Giroskop/Fusi) [AZIMUTH UTAMA]")
+    print("  YAW   (Z) : Rotasi Z (Giroskop/Fusi)")
+    print("                *CATATAN: YAW/Heading WT901 hanya akurat jika sensor datar (level).")
+    print("                *Jika Pitch/Roll besar, heading bisa drift tanpa Tilt Compensation.")
     print("  COMPASS   : Arah hadap kompas murni (Medan Magnet dengan Tilt Compensation)")
+    print("  AZ_USED   : Azimuth final adaptif (YAW saat level, COMPASS saat tilt besar)")
     print()
     print("Referensi: GRAVITASI BUMI (sudut absolut)")
     print("  0°   = Sensor sejajar dengan tanah (datar)")
@@ -177,7 +189,7 @@ def tampilkan_header():
     print()
     print("Tekan Ctrl+C untuk berhenti.")
     print("-" * 75)
-    print(f"{'Waktu':<12} {'ROLL/EL (°)':>14} {'PITCH (°)':>10} {'YAW/AZ (°)':>10} {'COMPASS (°)':>14}")
+    print(f"{'Waktu':<12} {'ROLL/EL (°)':>14} {'PITCH (°)':>10} {'YAW (°)':>10} {'COMPASS (°)':>14} {'AZ_USED (°)':>12} {'SRC':>7}")
     print("-" * 75)
 
 
@@ -209,7 +221,7 @@ def main():
     # Loop pembacaan data
     try:
         while True:
-            roll, pitch, yaw_az, compass = baca_sudut(device)
+            roll, pitch, yaw, compass, az_used, az_source = baca_sudut(device)
 
             if roll is None:
                 print(f"[WARN] Gagal membaca data, mencoba lagi...")
@@ -225,7 +237,9 @@ def main():
                     status = f"MIRING BELAKANG {abs(roll):.1f}°"
 
                 comp_str = f"{compass:>14.2f}" if compass is not None else "           N/A"
-                print(f"{waktu:<12} {roll:>14.2f} {pitch:>10.2f} {yaw_az:>10.2f} {comp_str}   [{status}]")
+                az_used_str = f"{az_used:>12.2f}" if az_used is not None else "         N/A"
+                src_str = f"{az_source:>7}" if az_source is not None else "    N/A"
+                print(f"{waktu:<12} {roll:>14.2f} {pitch:>10.2f} {yaw:>10.2f} {comp_str} {az_used_str} {src_str}   [{status}]")
 
             time.sleep(INTERVAL)
 
