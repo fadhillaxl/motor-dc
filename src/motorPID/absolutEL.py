@@ -42,6 +42,7 @@ except ImportError as e:
 # ─── Konfigurasi ──────────────────────────────────────────────────────────
 INTERVAL  = 0.5          # Interval baca dalam detik
 TILT_THRESHOLD_DEG = 15.0  # Ambang tilt untuk beralih dari YAW ke COMPASS
+AZ_OFFSET_DEG = 30.0        # Offset heading manual (derajat), contoh: 28.7
 
 # ─── Konstanta Reset Zero-Point ───────────────────────────────────────────
 REG_KEY   = 0x69          # Register kunci untuk operasi tulis
@@ -177,11 +178,11 @@ def baca_sudut(device):
         yaw_norm = float(yaw) % 360.0
         # Konversi ke arah kanan (clockwise/CW) 0..360
         # 0 -> 0, 10 -> 350, 90 -> 270, 270 -> 90
-        yaw_cw = (360.0 - yaw_norm) % 360.0
+        yaw_cw = (360.0 - yaw_norm + AZ_OFFSET_DEG) % 360.0
         roll_f = float(roll)
         pitch_f = float(pitch)
         compass_f = float(compass) if compass is not None else None
-        compass_cw = (360.0 - compass_f) % 360.0 if compass_f is not None else None
+        compass_cw = (360.0 - compass_f + AZ_OFFSET_DEG) % 360.0 if compass_f is not None else None
 
         # Sesuai catatan: YAW akurat saat level; saat tilt besar, gunakan compass tilt-compensated.
         tilt_large = abs(roll_f) > TILT_THRESHOLD_DEG or abs(pitch_f) > TILT_THRESHOLD_DEG
