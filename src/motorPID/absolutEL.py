@@ -175,6 +175,9 @@ def baca_sudut(device):
                 pass
 
         yaw_norm = float(yaw) % 360.0
+        # Membalik arah azimuth berbasis yaw:
+        # 0 -> 0, 10 -> 350, 90 -> 270, 270 -> 90
+        yaw_az_reversed = (360.0 - yaw_norm) % 360.0
         roll_f = float(roll)
         pitch_f = float(pitch)
         compass_f = float(compass) if compass is not None else None
@@ -185,8 +188,8 @@ def baca_sudut(device):
             az_used = compass_f
             az_source = "COMPASS"
         else:
-            az_used = yaw_norm
-            az_source = "YAW"
+            az_used = yaw_az_reversed
+            az_source = "YAW_REV"
 
         return roll_f, pitch_f, yaw_norm, compass_f, az_used, az_source
     except Exception:
