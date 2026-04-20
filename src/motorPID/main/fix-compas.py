@@ -192,33 +192,55 @@ def koreksi_mag(mx, my, mz):
     return v[0], v[1], v[2]
 
 
-def hitung_compass_tc(roll_deg, pitch_deg, mx, my, mz):
+def hitung_compass_tc(ax, ay, az, mx, my, mz):
     """
-    Compass heading dengan tilt compensation (STMicroelectronics AN3192).
+    Tilt compensated compass heading.
 
-    Konvensi WT901:
-        angleX = Roll  (kiri-kanan)
-        angleY = Pitch (depan-belakang, nose-up = positif)
-        magX/Y/Z = raw magnetometer dalam body frame
+    Referensi: Instructables "Tilt Compensated Compass"
+               jarzebski/Arduino-HMC5883L (HMC5883L_compensation_MPU6050)
 
-    Rotation ke horizontal plane:
-        Bx_h =  Bx·cos(P)  +  Bz·sin(P)
-        By_h =  Bx·sin(R)·sin(P)  +  By·cos(R)  -  Bz·sin(R)·cos(P)
+    Input:
+        ax, ay, az  : accelerometer (g), belum dinormalisasi
+        mx, my, mz  : magnetometer raw
 
-    Heading (CW dari North):
-        heading = atan2(-By_h, Bx_h)
+    Langkah:
+        1. Hard iron + soft iron correction pada mag
+        2. Normalisasi accel → unit vektor
+        3. roll  = asin(ay_norm)
+           pitch = asin(-ax_norm)
+        4. Xh = mx·cos(P) + mz·sin(P)
+           Yh = mx·sin(R)·sin(P) + my·cos(R) - mz·sin(R)·cos(P)
+        5. heading = atan2(Yh, Xh)   ← sesuai referensi jarzebski
+
+    Batas tilt ±45°: di luar itu return None → fallback ke YAW_FUSI.
     """
     mx_c, my_c, mz_c = koreksi_mag(mx, my, mz)
 
-    R = math.radians(roll_deg)
-    P = math.radians(pitch_deg)
+    # Normalisasi accelerometer
+    norm = math.sqrt(ax**2 + ay**2 + az**2)
+    if norm < 1e-9:
+        return None
+    ax_n = max(-1.0, min(1.0, ax / norm))
+    ay_n = max(-1.0, min(1.0, ay / norm))
 
-    Bx_h = mx_c * math.cos(P) + mz_c * math.sin(P)
-    By_h = (mx_c * math.sin(R) * math.sin(P)
-            + my_c * math.cos(R)
-            - mz_c * math.sin(R) * math.cos(P))
+    roll  = math.asin(ay_n)
+    pitch = math.asin(-ax_n)
 
-    heading = math.degrees(math.atan2(-By_h, Bx_h))
+    # Batas tilt ±45° — di luar itu formula tidak reliable
+    LIMIT = math.radians(45.0)
+    if abs(roll) > LIMIT or abs(pitch) > LIMIT:
+        return None
+
+    cosR = math.cos(roll)
+    sinR = math.sin(roll)
+    cosP = math.cos(pitch)
+    sinP = math.sin(pitch)
+
+    Xh = mx_c * cosP + mz_c * sinP
+    Yh = mx_c * sinR * sinP + my_c * cosR - mz_c * sinR * cosP
+
+    # atan2(Yh, Xh) sesuai referensi Instructables/jarzebski
+    heading = math.degrees(math.atan2(Yh, Xh))
     heading += MAGNETIC_DECLINATION_DEG
     heading %= 360.0
     return heading
@@ -253,27 +275,16 @@ def baca_sudut(device):
         pitch_f = float(pitch)
         yaw_f   = float(yaw)
 
-        # Roll/Pitch dari accelerometer (lebih akurat untuk tilt comp)
-        roll_acc  = roll_f
-        pitch_acc = pitch_f
-        if None not in (accX, accY, accZ):
-            try:
-                ax, ay, az = float(accX), float(accY), float(accZ)
-                den = math.sqrt(ay**2 + az**2)
-                if abs(az) > 1e-9 and den > 1e-9:
-                    roll_acc  = math.degrees(math.atan2(ay, az))
-                    pitch_acc = math.degrees(math.atan2(-ax, den))
-            except Exception:
-                pass
-
-        # Compass tilt compensated
+        # Compass tilt compensated — kirim raw accel + raw mag langsung
+        # hitung_compass_tc akan normalisasi accel sendiri (metode jarzebski)
         compass_tc = None
-        if None not in (magX, magY, magZ):
+        if None not in (accX, accY, accZ, magX, magY, magZ):
             try:
                 compass_tc = hitung_compass_tc(
-                    roll_acc, pitch_acc,
+                    float(accX), float(accY), float(accZ),
                     float(magX), float(magY), float(magZ)
                 )
+                # None = tilt > 45°, akan fallback ke YAW_FUSI
             except Exception:
                 pass
 
@@ -281,13 +292,13 @@ def baca_sudut(device):
         yaw_cw = (360.0 - (yaw_f % 360.0)) % 360.0
 
         # Pilih heading adaptif
-        tilt_besar = abs(roll_f) > TILT_THRESHOLD_DEG or abs(pitch_f) > TILT_THRESHOLD_DEG
-        if tilt_besar and compass_tc is not None:
+        # compass_tc = None berarti tilt > 45° (jarzebski limit) → fallback ke YAW
+        if compass_tc is not None:
             az_used   = compass_tc
             az_source = "COMPASS_TC"
         else:
             az_used   = yaw_cw
-            az_source = "YAW_FUSI "
+            az_source = "YAW_FUSI " 
 
         return roll_f, pitch_f, yaw_cw, compass_tc, az_used, az_source
 
@@ -314,7 +325,7 @@ def tampilkan_header():
     print("  PITCH (Y) : Kemiringan depan-belakang")
     print("  YAW_FUSI  : Heading fusi WT901 (akurat saat datar)")
     print("  COMPASS_TC: Heading magnetometer + Tilt Compensation (akurat saat miring)")
-    print("  AZ_USED   : Heading final adaptif")
+    print("  AZ_USED   : Heading final (COMPASS_TC jika tilt ≤45°, YAW_FUSI jika >45°)")
     print()
     if HARD_IRON_OFFSET == [0.0, 0.0, 0.0]:
         print("  [!] BELUM KALIBRASI! Jalankan: python fix-compas.py --kalibrasi")
