@@ -835,7 +835,10 @@ def axis_hold_label(speed: float) -> str:
 
 
 def bounded_az_error_deg(target_deg: float, current_deg: float) -> float:
-    return clamp(target_deg, 0.0, 360.0) - clamp(current_deg, 0.0, 360.0)
+    # Shortest signed angular error in range [-180, 180).
+    target = clamp(target_deg, 0.0, 360.0)
+    current = clamp(current_deg, 0.0, 360.0)
+    return ((target - current + 540.0) % 360.0) - 180.0
 
 
 def gravity_comp(el_deg: float) -> float:
@@ -899,6 +902,26 @@ def restore_positions(az_motor: MotorController, el_motor: MotorController, stor
         az_motor.set_position_deg(az_saved, persist=False)
     if el_saved is not None:
         el_motor.set_position_deg(el_saved, persist=False)
+
+
+def sync_positions_from_sensor(
+    az_motor: MotorController,
+    el_motor: MotorController,
+    sensor: AbsoluteSensor,
+    store: PersistentStateStore,
+) -> bool:
+    """
+    Sinkronkan posisi internal motor ke sudut absolut sensor.
+    Berguna saat startup tanpa homing agar state lama tidak memicu soft-limit palsu.
+    """
+    raw_az, raw_el = sensor._read_raw()
+    if raw_az is None or raw_el is None:
+        return False
+    az_motor.set_position_deg(float(raw_az), persist=False)
+    el_motor.set_position_deg(float(raw_el), persist=False)
+    store.save_axis_position("AZ", float(raw_az), "sync_sensor")
+    store.save_axis_position("EL", float(raw_el), "sync_sensor")
+    return True
 
 
 def auto_home_axes(az_motor: MotorController, el_motor: MotorController, sensor: AbsoluteSensor) -> bool:
@@ -1032,7 +1055,8 @@ class AzElTrackerService:
             if not auto_home_axes(self.az_motor, self.el_motor, self.sensor):
                 raise RuntimeError("Auto-home gagal. Periksa limit switch atau koneksi sensor.")
         else:
-            restore_positions(self.az_motor, self.el_motor, self.store)
+            if not sync_positions_from_sensor(self.az_motor, self.el_motor, self.sensor, self.store):
+                restore_positions(self.az_motor, self.el_motor, self.store)
 
         self._thread = threading.Thread(target=self._loop, daemon=True, name="az-el-tracker")
         self._thread.start()
@@ -1226,8 +1250,11 @@ def main():
     sensor = AbsoluteSensor(SIMULATION_MODE, az_motor, el_motor)
 
     if args.no_auto_home:
-        restore_positions(az_motor, el_motor, store)
-        print("[INFO] Auto-home dilewati. Posisi dipulihkan dari state persisten jika tersedia.")
+        if sync_positions_from_sensor(az_motor, el_motor, sensor, store):
+            print("[INFO] Auto-home dilewati. Posisi motor disinkronkan dari sensor absolut.")
+        else:
+            restore_positions(az_motor, el_motor, store)
+            print("[INFO] Auto-home dilewati. Posisi dipulihkan dari state persisten jika tersedia.")
     else:
         if not auto_home_axes(az_motor, el_motor, sensor):
             print("[ERROR] Homing gagal. Periksa limit switch dan file fault state.")
