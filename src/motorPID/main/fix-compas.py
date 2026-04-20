@@ -1,11 +1,11 @@
 """
-WT901C485 - FINAL PRO (AZ_USED OUTPUT)
-=====================================
-- Sensor terbalik FIX
-- Magnetometer tuning OK
-- Tilt compensation OK
-- BLENDING (cos roll)
-- Output AZ_USED (final azimuth)
+WT901C485 - FINAL FIX (REAL DATA TUNED)
+======================================
+Fix:
+- Sensor terbalik (menghadap bawah)
+- Roll jadi positif
+- Compass tidak lari ke 261°
+- Stabil saat roll 90°
 """
 
 import os
@@ -32,6 +32,7 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 # CONFIG
 # =============================
 INTERVAL = 0.1
+TILT_THRESHOLD_DEG = 15.0
 AZ_OFFSET_DEG = -104.0
 
 # =============================
@@ -75,24 +76,6 @@ def reset_zero_point(device):
         print("[WARN] Reset gagal:", e)
 
 # =============================
-# MATH HELPER
-# =============================
-def normalize_angle(a):
-    return (a + 360) % 360
-
-def angle_blend(a, b, w):
-    """
-    Blend 2 sudut tanpa loncat 0/360
-    """
-    a_rad = math.radians(a)
-    b_rad = math.radians(b)
-
-    x = w * math.cos(a_rad) + (1 - w) * math.cos(b_rad)
-    y = w * math.sin(a_rad) + (1 - w) * math.sin(b_rad)
-
-    return normalize_angle(math.degrees(math.atan2(y, x)))
-
-# =============================
 # TILT COMPASS
 # =============================
 def tilt_compass(mx, my, mz, roll, pitch):
@@ -106,7 +89,11 @@ def tilt_compass(mx, my, mz, roll, pitch):
               mz * math.sin(roll_rad) * math.cos(pitch_rad))
 
         heading = math.degrees(math.atan2(Yh, Xh))
-        return normalize_angle(heading)
+
+        if heading < 0:
+            heading += 360
+
+        return heading
     except:
         return None
 
@@ -140,9 +127,9 @@ def baca_sudut(device):
         pitch = float(pitch)
         yaw = float(yaw) % 360
 
-        # =============================
-        # FIX ORIENTASI SENSOR
-        # =============================
+        # ======================================
+        # FIX ORIENTASI SENSOR (FINAL DARI DATA)
+        # ======================================
         roll = 180.0 - roll
         pitch = -pitch
 
@@ -151,38 +138,42 @@ def baca_sudut(device):
         if roll < -180:
             roll += 360
 
-        # =============================
-        # FIX MAGNETOMETER (TUNED)
-        # =============================
-        compass = None
+        # ======================================
+        # FIX MAGNETOMETER (DARI DEBUG REAL)
+        # ======================================
         if None not in (mx, my, mz):
             mx = float(mx)
             my = float(my)
             mz = float(mz)
 
+            # swap + invert (hasil tuning dari data kamu)
             mx, my = my, mx
             mx = -mx
 
+        # ======================================
+        # COMPASS
+        # ======================================
+        compass = None
+        if None not in (mx, my, mz):
             compass = tilt_compass(mx, my, mz, roll, pitch)
 
-        # =============================
-        # CONVERT CW + OFFSET
-        # =============================
-        yaw_cw = normalize_angle(360 - yaw + AZ_OFFSET_DEG)
-        compass_cw = normalize_angle(360 - compass + AZ_OFFSET_DEG) if compass is not None else None
+        # ======================================
+        # CONVERT CW
+        # ======================================
+        yaw_cw = (360 - yaw + AZ_OFFSET_DEG) % 360
+        compass_cw = (360 - compass + AZ_OFFSET_DEG) % 360 if compass is not None else None
 
-        # =============================
-        # BLENDING (FINAL AZ_USED)
-        # =============================
-        if compass_cw is not None:
-            w = abs(math.cos(math.radians(roll)))  # weight 0-1
-            az_used = angle_blend(compass_cw, yaw_cw, w)
-            src = f"COMP:{w:.2f} YAW:{1-w:.2f}"
+        # ======================================
+        # SMART SWITCH
+        # ======================================
+        if abs(roll) > TILT_THRESHOLD_DEG or abs(pitch) > TILT_THRESHOLD_DEG:
+            az = compass_cw
+            src = "COMPASS"
         else:
-            az_used = yaw_cw
-            src = "YAW_ONLY"
+            az = yaw_cw
+            src = "YAW"
 
-        return roll, pitch, yaw_cw, compass_cw, az_used, src
+        return roll, pitch, yaw_cw, compass_cw, az, src
 
     except:
         return None
@@ -191,11 +182,11 @@ def baca_sudut(device):
 # UI
 # =============================
 def header():
-    print("=" * 95)
-    print(" WT901C485 - FINAL PRO (AZ_USED)")
-    print("=" * 95)
-    print(f"{'TIME':<10} {'ROLL':>8} {'PITCH':>8} {'YAW':>8} {'COMPASS':>10} {'AZ_USED':>12} {'SRC':>15}")
-    print("-" * 95)
+    print("=" * 80)
+    print(" WT901C485 - FINAL (FIXED & TUNED)")
+    print("=" * 80)
+    print(f"{'TIME':<10} {'ROLL':>8} {'PITCH':>8} {'YAW':>8} {'COMPASS':>10} {'AZ':>10} {'SRC':>8}")
+    print("-" * 80)
 
 # =============================
 # MAIN
@@ -223,13 +214,11 @@ def main():
             data = baca_sudut(device)
 
             if data:
-                roll, pitch, yaw, comp, az_used, src = data
+                roll, pitch, yaw, comp, az, src = data
                 t = time.strftime("%H:%M:%S")
 
-                comp_str = f"{comp:.2f}" if comp is not None else "N/A"
-
                 print(f"{t:<10} {roll:>8.2f} {pitch:>8.2f} {yaw:>8.2f} "
-                      f"{comp_str:>10} {az_used:>12.2f} {src:>15}")
+                      f"{(comp if comp else 0):>10.2f} {az:>10.2f} {src:>8}")
             else:
                 print("[WARN] No data")
 
