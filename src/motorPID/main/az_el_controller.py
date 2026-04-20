@@ -52,7 +52,7 @@ deviceModel = None
 JY901SDataProcessor = None
 Protocol485Resolver = None
 TILT_THRESHOLD_DEG = 15.0
-AZ_OFFSET_DEG = 30.0
+AZ_OFFSET_DEG = -104.0
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
@@ -61,6 +61,19 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
 
 def format_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def configure_sensor_heading(
+    *,
+    az_offset_deg: Optional[float] = None,
+    tilt_threshold_deg: Optional[float] = None,
+):
+    """Apply runtime heading config used by AbsoluteSensor."""
+    global AZ_OFFSET_DEG, TILT_THRESHOLD_DEG
+    if az_offset_deg is not None:
+        AZ_OFFSET_DEG = float(az_offset_deg)
+    if tilt_threshold_deg is not None:
+        TILT_THRESHOLD_DEG = max(0.0, float(tilt_threshold_deg))
 
 
 class PersistentStateStore:
@@ -607,12 +620,27 @@ class AbsoluteSensor:
 
     def _convert_roll_to_el_deg(self, roll_deg: float) -> float:
         """
-        Mapping mekanik sensor:
-        - clinometer 0 deg  -> WT901 roll ~180
-        - clinometer 90 deg -> WT901 roll ~90
-        Konversi yang diinginkan: EL = 180 - roll, dibatasi 0..90.
+        Roll sudah dalam orientasi mekanik final:
+        - sekitar 0° saat datar
+        - sekitar 90° saat elevasi maksimum
         """
-        return clamp(180.0 - float(roll_deg), 0.0, 90.0)
+        return clamp(float(roll_deg), 0.0, 90.0)
+
+    def _sensor_get(self, key: str):
+        """Baca nilai sensor lintas variasi SDK (getDeviceData/get + variasi key)."""
+        variants = [key, key[0].upper() + key[1:]]
+        for getter_name in ("getDeviceData", "get"):
+            getter = getattr(self.device, getter_name, None)
+            if getter is None:
+                continue
+            for k in variants:
+                try:
+                    value = getter(k)
+                except Exception:
+                    continue
+                if value is not None:
+                    return value
+        return None
 
     def _read_raw(self) -> Tuple[Optional[float], Optional[float]]:
         if self.is_sim:
@@ -621,33 +649,23 @@ class AbsoluteSensor:
         try:
             if hasattr(self.device, "readReg"):
                 self.device.readReg(0x30, 41)
-            
-            if hasattr(self.device, "get"):
-                roll = self.device.get("AngleX")
-                pitch = self.device.get("AngleY")
-                yaw = self.device.get("AngleZ")
-                accX = self.device.get("accX")
-                accY = self.device.get("accY")
-                accZ = self.device.get("accZ")
-                magX = self.device.get("magX")
-                magY = self.device.get("magY")
-                magZ = self.device.get("magZ")
-            else:
-                roll = self.device.getDeviceData("angleX")
-                pitch = self.device.getDeviceData("angleY")
-                yaw = self.device.getDeviceData("angleZ")
-                accX = self.device.getDeviceData("accX")
-                accY = self.device.getDeviceData("accY")
-                accZ = self.device.getDeviceData("accZ")
-                magX = self.device.getDeviceData("magX")
-                magY = self.device.getDeviceData("magY")
-                magZ = self.device.getDeviceData("magZ")
+            roll = self._sensor_get("angleX")
+            pitch = self._sensor_get("angleY")
+            yaw = self._sensor_get("angleZ")
+            magX = self._sensor_get("magX")
+            magY = self._sensor_get("magY")
+            magZ = self._sensor_get("magZ")
 
             if roll is None:
                 return None, None
 
-            roll_deg = float(roll)
-            pitch_deg = float(pitch) if pitch is not None else 0.0
+            # Koreksi orientasi sesuai tuning lapangan di fix-compas.py.
+            roll_deg = 180.0 - float(roll)
+            pitch_deg = -(float(pitch) if pitch is not None else 0.0)
+            if roll_deg > 180.0:
+                roll_deg -= 360.0
+            elif roll_deg < -180.0:
+                roll_deg += 360.0
             el = self._convert_roll_to_el_deg(roll_deg)
 
             # Heading YAW (CW 0..360) dengan offset manual.
@@ -656,30 +674,29 @@ class AbsoluteSensor:
                 yaw_norm = float(yaw) % 360.0
                 yaw_cw = (360.0 - yaw_norm + AZ_OFFSET_DEG) % 360.0
 
-            # Roll/Pitch berbasis accelerometer untuk tilt compensation.
-            roll_tilt = roll_deg
-            pitch_tilt = pitch_deg
-            if accX is not None and accY is not None and accZ is not None:
-                try:
-                    ax = float(accX)
-                    ay = float(accY)
-                    az = float(accZ)
-                    den_roll = math.sqrt(ay * ay + az * az)
-                    if den_roll > 1e-9:
-                        roll_tilt = math.degrees(math.atan2(ay, az))
-                        pitch_tilt = math.degrees(math.atan2(-ax, den_roll))
-                except Exception:
-                    pass
-
             azimuth = None
             compass_cw = None
             if magX is not None and magY is not None and magZ is not None:
                 try:
-                    r_rad, p_rad = math.radians(roll_tilt), math.radians(pitch_tilt)
-                    X_h = magX * math.cos(p_rad) + magZ * math.sin(p_rad)
-                    Y_h = magX * math.sin(r_rad) * math.sin(p_rad) + magY * math.cos(r_rad) - magZ * math.sin(r_rad) * math.cos(p_rad)
-                    az_rad = math.atan2(-Y_h, X_h)
-                    compass = (math.degrees(az_rad) + 360) % 360
+                    mx = float(magX)
+                    my = float(magY)
+                    mz = float(magZ)
+                    # Koreksi orientasi magnetometer dari tuning real-data.
+                    mx, my = my, mx
+                    mx = -mx
+
+                    r_rad = math.radians(roll_deg)
+                    p_rad = math.radians(pitch_deg)
+                    X_h = mx * math.cos(p_rad) + mz * math.sin(p_rad)
+                    Y_h = (
+                        mx * math.sin(r_rad) * math.sin(p_rad)
+                        + my * math.cos(r_rad)
+                        - mz * math.sin(r_rad) * math.cos(p_rad)
+                    )
+                    heading = math.degrees(math.atan2(Y_h, X_h))
+                    if heading < 0.0:
+                        heading += 360.0
+                    compass = heading
                     compass_cw = (360.0 - compass + AZ_OFFSET_DEG) % 360.0
                 except Exception:
                     pass

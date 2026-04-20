@@ -1,16 +1,11 @@
 """
-Baca Elevasi Absolut & Kompas Tilt Compensated - WT901C485
-===========================================================
-Perbaikan dari absolutEL.py:
-- Tilt compensation formula diperbaiki (AN3192 standard)
-- Hard iron + soft iron correction
-- Tidak ada hardcoded AZ_OFFSET
-- Magnetic declination Yogyakarta (+0.9°) otomatis
-- Key SDK mengikuti yang terbukti jalan (getDeviceData / angleX lowercase)
-
-Cara pakai:
-    python fix-compas.py              # baca data normal
-    python fix-compas.py --kalibrasi  # kalibrasi magnetometer dulu
+WT901C485 - FINAL FIX (REAL DATA TUNED)
+======================================
+Fix:
+- Sensor terbalik (menghadap bawah)
+- Roll jadi positif
+- Compass tidak lari ke 261°
+- Stabil saat roll 90°
 """
 
 import os
@@ -18,74 +13,53 @@ import sys
 import time
 import platform
 import math
-import numpy as np
 
+# =============================
+# PATH SDK
+# =============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs"))
 sys.path.insert(0, SDK_CHS)
 
-try:
-    import lib.device_model as deviceModel
-    from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
-    from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
-except ImportError as e:
-    print(f"[ERROR] Library WITMOTION tidak ditemukan: {e}")
-    sys.exit(1)
+# =============================
+# IMPORT SDK
+# =============================
+import lib.device_model as deviceModel
+from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
+from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
 
-# ─── Konfigurasi ──────────────────────────────────────────────────────────
-INTERVAL           = 0.5
+# =============================
+# CONFIG
+# =============================
+INTERVAL = 0.1
 TILT_THRESHOLD_DEG = 15.0
-REG_KEY            = 0x69
+AZ_OFFSET_DEG = -104.0
 
-# Magnetic declination Yogyakarta (positif = east)
-MAGNETIC_DECLINATION_DEG = 0.9
-
-# ─── Kalibrasi Hard Iron ──────────────────────────────────────────────────
-# Isi setelah jalankan --kalibrasi, lalu salin hasilnya ke sini
-HARD_IRON_OFFSET = [0.0, 0.0, 0.0]   # [offset_x, offset_y, offset_z]
-
-# Soft iron matrix (default identity = tidak ada koreksi)
-SOFT_IRON_MATRIX = np.eye(3)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  HELPER — key SDK pakai getDeviceData (lowercase) sesuai SDK ini
-# ══════════════════════════════════════════════════════════════════════════
-
-def _get(device, key):
-    """
-    Baca satu nilai dari sensor.
-    Prioritas: getDeviceData (SDK 485) → get (SDK generik)
-    """
-    val = None
-    try:
-        val = device.getDeviceData(key)
-    except Exception:
-        pass
-    if val is None:
-        try:
-            val = device.get(key)
-        except Exception:
-            pass
-    return val
-
-
+# =============================
+# DEVICE
+# =============================
 def buat_device_model():
     try:
         return deviceModel.DeviceModel(
-            "WT901C485", Protocol485Resolver(), JY901SDataProcessor()
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
         )
     except TypeError:
         return deviceModel.DeviceModel(
-            "WT901C485", Protocol485Resolver(), JY901SDataProcessor(), "EL_0"
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
+            "EL_0",
         )
 
-
+# =============================
+# RESET
+# =============================
 def reset_zero_point(device):
-    print("[INFO] Mereset zero-point ke default (sudut absolut)...")
     try:
         if hasattr(device, "write_register"):
-            device.write_register(device.ADDR, REG_KEY, 0xB588)
+            device.write_register(device.ADDR, 0x69, 0xB588)
             time.sleep(0.1)
             device.write_register(device.ADDR, 0x01, 0x0000)
         else:
@@ -97,314 +71,165 @@ def reset_zero_point(device):
                 time.sleep(0.1)
                 device.save()
         time.sleep(0.3)
-        print("[OK] Zero-point direset. Sensor menggunakan gravitasi sebagai referensi.\n")
+        print("[OK] Zero reset")
     except Exception as e:
-        print(f"[WARN] Gagal reset zero-point: {e}\n")
+        print("[WARN] Reset gagal:", e)
 
-
-def tutup_device(device):
+# =============================
+# TILT COMPASS
+# =============================
+def tilt_compass(mx, my, mz, roll, pitch):
     try:
-        if hasattr(device, "closeDevice"):
-            device.closeDevice()
-        elif hasattr(device, "close"):
-            device.close()
-    except Exception:
-        pass
+        roll_rad = math.radians(roll)
+        pitch_rad = math.radians(pitch)
 
+        Xh = mx * math.cos(pitch_rad) + mz * math.sin(pitch_rad)
+        Yh = (mx * math.sin(roll_rad) * math.sin(pitch_rad) +
+              my * math.cos(roll_rad) -
+              mz * math.sin(roll_rad) * math.cos(pitch_rad))
 
-# ══════════════════════════════════════════════════════════════════════════
-#  KALIBRASI MAGNETOMETER
-# ══════════════════════════════════════════════════════════════════════════
+        heading = math.degrees(math.atan2(Yh, Xh))
 
-def jalankan_kalibrasi(device, durasi_detik=30):
-    """
-    Kalibrasi hard iron & soft iron.
-    Putar sensor ke semua arah (figure-8) selama durasi_detik.
-    """
-    global HARD_IRON_OFFSET, SOFT_IRON_MATRIX
+        if heading < 0:
+            heading += 360
 
-    print("\n" + "=" * 60)
-    print("  MODE KALIBRASI MAGNETOMETER")
-    print("=" * 60)
-    print(f"Putar sensor figure-8 di semua bidang selama {durasi_detik} detik.")
-    print("Mulai sekarang...\n")
-
-    samples = []
-    t_start = time.time()
-
-    while time.time() - t_start < durasi_detik:
-        sisa = durasi_detik - (time.time() - t_start)
-        if hasattr(device, "readReg"):
-            device.readReg(0x30, 41)
-
-        mx = _get(device, "magX")
-        my = _get(device, "magY")
-        mz = _get(device, "magZ")
-
-        if mx is not None and my is not None and mz is not None:
-            samples.append([float(mx), float(my), float(mz)])
-            print(f"\r  Sampel: {len(samples):4d} | Sisa: {sisa:5.1f}s | ({float(mx):.1f}, {float(my):.1f}, {float(mz):.1f})", end="")
-
-        time.sleep(0.05)
-
-    print(f"\n\n[INFO] Sampel terkumpul: {len(samples)}")
-
-    if len(samples) < 50:
-        print("[WARN] Sampel kurang, kalibrasi tidak valid.")
-        return
-
-    data = np.array(samples)
-
-    # Hard iron: midpoint min-max
-    hi = np.array([
-        (data[:, 0].max() + data[:, 0].min()) / 2.0,
-        (data[:, 1].max() + data[:, 1].min()) / 2.0,
-        (data[:, 2].max() + data[:, 2].min()) / 2.0,
-    ])
-
-    # Soft iron: normalisasi radius per sumbu
-    dc = data - hi
-    radius = np.array([
-        (dc[:, 0].max() - dc[:, 0].min()) / 2.0,
-        (dc[:, 1].max() - dc[:, 1].min()) / 2.0,
-        (dc[:, 2].max() - dc[:, 2].min()) / 2.0,
-    ])
-    avg_r  = np.mean(radius)
-    scale  = avg_r / np.where(radius > 1e-9, radius, 1e-9)
-    si_mat = np.diag(scale)
-
-    HARD_IRON_OFFSET = hi.tolist()
-    SOFT_IRON_MATRIX = si_mat
-
-    print("\n[OK] Kalibrasi selesai! Salin nilai berikut ke kode:\n")
-    print(f"HARD_IRON_OFFSET = [{hi[0]:.4f}, {hi[1]:.4f}, {hi[2]:.4f}]")
-    print(f"SOFT_IRON_MATRIX = np.diag([{scale[0]:.4f}, {scale[1]:.4f}, {scale[2]:.4f}])\n")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  KOREKSI & TILT COMPENSATION
-# ══════════════════════════════════════════════════════════════════════════
-
-def koreksi_mag(mx, my, mz):
-    """Hard iron + soft iron correction."""
-    v = np.array([mx, my, mz]) - np.array(HARD_IRON_OFFSET)
-    v = SOFT_IRON_MATRIX @ v
-    return v[0], v[1], v[2]
-
-
-def hitung_compass_tc(ax, ay, az, mx, my, mz):
-    """
-    Tilt compensated compass heading.
-
-    Referensi: Instructables "Tilt Compensated Compass"
-               jarzebski/Arduino-HMC5883L (HMC5883L_compensation_MPU6050)
-
-    Input:
-        ax, ay, az  : accelerometer (g), belum dinormalisasi
-        mx, my, mz  : magnetometer raw
-
-    Langkah:
-        1. Hard iron + soft iron correction pada mag
-        2. Normalisasi accel → unit vektor
-        3. roll  = asin(ay_norm)
-           pitch = asin(-ax_norm)
-        4. Xh = mx·cos(P) + mz·sin(P)
-           Yh = mx·sin(R)·sin(P) + my·cos(R) - mz·sin(R)·cos(P)
-        5. heading = atan2(Yh, Xh)   ← sesuai referensi jarzebski
-
-    Batas tilt ±45°: di luar itu return None → fallback ke YAW_FUSI.
-    """
-    mx_c, my_c, mz_c = koreksi_mag(mx, my, mz)
-
-    # Normalisasi accelerometer
-    norm = math.sqrt(ax**2 + ay**2 + az**2)
-    if norm < 1e-9:
-        return None
-    ax_n = max(-1.0, min(1.0, ax / norm))
-    ay_n = max(-1.0, min(1.0, ay / norm))
-
-    roll  = math.asin(ay_n)
-    pitch = math.asin(-ax_n)
-
-    # Batas tilt ±45° — di luar itu formula tidak reliable
-    LIMIT = math.radians(45.0)
-    if abs(roll) > LIMIT or abs(pitch) > LIMIT:
+        return heading
+    except:
         return None
 
-    cosR = math.cos(roll)
-    sinR = math.sin(roll)
-    cosP = math.cos(pitch)
-    sinP = math.sin(pitch)
-
-    Xh = mx_c * cosP + mz_c * sinP
-    Yh = mx_c * sinR * sinP + my_c * cosR - mz_c * sinR * cosP
-
-    # atan2(Yh, Xh) sesuai referensi Instructables/jarzebski
-    heading = math.degrees(math.atan2(Yh, Xh))
-    heading += MAGNETIC_DECLINATION_DEG
-    heading %= 360.0
-    return heading
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  BACA SUDUT
-# ══════════════════════════════════════════════════════════════════════════
-
+# =============================
+# READ DATA
+# =============================
 def baca_sudut(device):
     try:
-        # Trigger baca register (wajib untuk SDK 485)
         if hasattr(device, "readReg"):
             device.readReg(0x30, 41)
-        time.sleep(0.05)
 
-        # Key lowercase sesuai SDK yang terbukti jalan
-        roll  = _get(device, "angleX")
-        pitch = _get(device, "angleY")
-        yaw   = _get(device, "angleZ")
-        accX  = _get(device, "accX")
-        accY  = _get(device, "accY")
-        accZ  = _get(device, "accZ")
-        magX  = _get(device, "magX")
-        magY  = _get(device, "magY")
-        magZ  = _get(device, "magZ")
-
-        if roll is None or pitch is None or yaw is None:
-            return None, None, None, None, None, None
-
-        roll_f  = float(roll)
-        pitch_f = float(pitch)
-        yaw_f   = float(yaw)
-
-        # Compass tilt compensated — kirim raw accel + raw mag langsung
-        # hitung_compass_tc akan normalisasi accel sendiri (metode jarzebski)
-        compass_tc = None
-        if None not in (accX, accY, accZ, magX, magY, magZ):
-            try:
-                compass_tc = hitung_compass_tc(
-                    float(accX), float(accY), float(accZ),
-                    float(magX), float(magY), float(magZ)
-                )
-                # None = tilt > 45°, akan fallback ke YAW_FUSI
-            except Exception:
-                pass
-
-        # Yaw dari fusi WT901 (CCW) → konversi ke CW 0..360
-        yaw_cw = (360.0 - (yaw_f % 360.0)) % 360.0
-
-        # Pilih heading adaptif
-        # compass_tc = None berarti tilt > 45° (jarzebski limit) → fallback ke YAW
-        if compass_tc is not None:
-            az_used   = compass_tc
-            az_source = "COMPASS_TC"
+        if hasattr(device, "get"):
+            roll = device.get("AngleX")
+            pitch = device.get("AngleY")
+            yaw = device.get("AngleZ")
+            mx = device.get("magX")
+            my = device.get("magY")
+            mz = device.get("magZ")
         else:
-            az_used   = yaw_cw
-            az_source = "YAW_FUSI " 
+            roll = device.getDeviceData("angleX")
+            pitch = device.getDeviceData("angleY")
+            yaw = device.getDeviceData("angleZ")
+            mx = device.getDeviceData("magX")
+            my = device.getDeviceData("magY")
+            mz = device.getDeviceData("magZ")
 
-        return roll_f, pitch_f, yaw_cw, compass_tc, az_used, az_source
+        if None in (roll, pitch, yaw):
+            return None
 
-    except Exception as e:
-        return None, None, None, None, None, None
+        roll = float(roll)
+        pitch = float(pitch)
+        yaw = float(yaw) % 360
 
+        # ======================================
+        # FIX ORIENTASI SENSOR (FINAL DARI DATA)
+        # ======================================
+        roll = 180.0 - roll
+        pitch = -pitch
 
-# ══════════════════════════════════════════════════════════════════════════
-#  TAMPILAN
-# ══════════════════════════════════════════════════════════════════════════
+        if roll > 180:
+            roll -= 360
+        if roll < -180:
+            roll += 360
 
-MATA_ANGIN = ["U  ", "UTL", "TL ", "TTL", "T  ", "TTG", "TG ", "UTG",
-              "S  ", "STG", "BD ", "BBD", "B  ", "BBL", "BL ", "SBL"]
+        # ======================================
+        # FIX MAGNETOMETER (DARI DEBUG REAL)
+        # ======================================
+        if None not in (mx, my, mz):
+            mx = float(mx)
+            my = float(my)
+            mz = float(mz)
 
-def arah(deg):
-    return MATA_ANGIN[int((deg + 11.25) / 22.5) % 16]
+            # swap + invert (hasil tuning dari data kamu)
+            mx, my = my, mx
+            mx = -mx
 
+        # ======================================
+        # COMPASS
+        # ======================================
+        compass = None
+        if None not in (mx, my, mz):
+            compass = tilt_compass(mx, my, mz, roll, pitch)
 
-def tampilkan_header():
-    print("=" * 85)
-    print("  WT901C485 - Elevasi Absolut & Kompas Tilt Compensated")
-    print("=" * 85)
-    print("  ROLL  (X) : Kemiringan kiri-kanan [ELEVASI]")
-    print("  PITCH (Y) : Kemiringan depan-belakang")
-    print("  YAW_FUSI  : Heading fusi WT901 (akurat saat datar)")
-    print("  COMPASS_TC: Heading magnetometer + Tilt Compensation (akurat saat miring)")
-    print("  AZ_USED   : Heading final (COMPASS_TC jika tilt ≤45°, YAW_FUSI jika >45°)")
-    print()
-    if HARD_IRON_OFFSET == [0.0, 0.0, 0.0]:
-        print("  [!] BELUM KALIBRASI! Jalankan: python fix-compas.py --kalibrasi")
-        print("      Compass mungkin tidak akurat tanpa kalibrasi.")
-    else:
-        print("  [OK] Kalibrasi magnetometer aktif.")
-    print()
-    print("Ctrl+C untuk berhenti.")
-    print("-" * 85)
-    print(f"{'Waktu':<10} {'ROLL(°)':>9} {'PITCH(°)':>9} {'YAW_FUSI':>10} "
-          f"{'COMPASS_TC':>12} {'AZ_USED':>10} {'ARAH':>5} {'SRC':>11}")
-    print("-" * 85)
+        # ======================================
+        # CONVERT CW
+        # ======================================
+        yaw_cw = (360 - yaw + AZ_OFFSET_DEG) % 360
+        compass_cw = (360 - compass + AZ_OFFSET_DEG) % 360 if compass is not None else None
 
+        # ======================================
+        # SMART SWITCH
+        # ======================================
+        if abs(roll) > TILT_THRESHOLD_DEG or abs(pitch) > TILT_THRESHOLD_DEG:
+            az = compass_cw
+            src = "COMPASS"
+        else:
+            az = yaw_cw
+            src = "YAW"
 
-# ══════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════
+        return roll, pitch, yaw_cw, compass_cw, az, src
 
+    except:
+        return None
+
+# =============================
+# UI
+# =============================
+def header():
+    print("=" * 80)
+    print(" WT901C485 - FINAL (FIXED & TUNED)")
+    print("=" * 80)
+    print(f"{'TIME':<10} {'ROLL':>8} {'PITCH':>8} {'YAW':>8} {'COMPASS':>10} {'AZ':>10} {'SRC':>8}")
+    print("-" * 80)
+
+# =============================
+# MAIN
+# =============================
 def main():
-    mode_kalibrasi = "--kalibrasi" in sys.argv or "-k" in sys.argv
+    header()
 
-    tampilkan_header()
+    device = buat_device_model()
+    device.ADDR = 0x50
 
-    try:
-        device = buat_device_model()
-        device.ADDR = 0x50
-        if platform.system().lower() == "linux":
-            device.serialConfig.portName = "/dev/ttyUSB0"
-        else:
-            device.serialConfig.portName = "/dev/tty.usbserial-1330"
-        device.serialConfig.baud = 9600
-        device.openDevice()
-        print(f"[OK] Terhubung ke {device.serialConfig.portName} @ {device.serialConfig.baud} baud\n")
-    except Exception as e:
-        print(f"[ERROR] Tidak bisa membuka port: {e}")
-        sys.exit(1)
+    if platform.system().lower() == "linux":
+        device.serialConfig.portName = "/dev/ttyUSB0"
+    else:
+        device.serialConfig.portName = "/dev/tty.usbserial-110"
+
+    device.serialConfig.baud = 9600
+    device.openDevice()
+
+    print("[OK] Connected\n")
 
     reset_zero_point(device)
 
-    if mode_kalibrasi:
-        jalankan_kalibrasi(device, durasi_detik=30)
-        print("[INFO] Selesai kalibrasi. Salin nilai ke kode, lalu jalankan normal.")
-        tutup_device(device)
-        return
-
     try:
         while True:
-            roll, pitch, yaw, compass, az_used, az_source = baca_sudut(device)
+            data = baca_sudut(device)
 
-            if roll is None:
-                print("[WARN] Gagal membaca data, mencoba lagi...")
+            if data:
+                roll, pitch, yaw, comp, az, src = data
+                t = time.strftime("%H:%M:%S")
+
+                print(f"{t:<10} {roll:>8.2f} {pitch:>8.2f} {yaw:>8.2f} "
+                      f"{(comp if comp else 0):>10.2f} {az:>10.2f} {src:>8}")
             else:
-                waktu = time.strftime("%H:%M:%S")
-
-                if abs(roll) < 5:
-                    status = "DATAR"
-                elif roll > 0:
-                    status = f"MRG-KA {roll:.1f}°"
-                else:
-                    status = f"MRG-KI {abs(roll):.1f}°"
-
-                comp_str = f"{compass:>12.2f}" if compass is not None else "          N/A"
-                az_str   = f"{az_used:>10.2f}" if az_used  is not None else "        N/A"
-                ar_str   = arah(az_used)        if az_used  is not None else "---"
-                src_str  = az_source if az_source else "N/A"
-
-                print(f"{waktu:<10} {roll:>9.2f} {pitch:>9.2f} {yaw:>10.2f} "
-                      f"{comp_str} {az_str} {ar_str:>5} {src_str:>11}  [{status}]")
+                print("[WARN] No data")
 
             time.sleep(INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n" + "-" * 85)
-        print("[INFO] Program dihentikan.")
+        print("\n[STOP]")
 
     finally:
-        tutup_device(device)
-        print("[INFO] Koneksi serial ditutup.")
-
+        device.closeDevice()
+        print("[CLOSED]")
 
 if __name__ == "__main__":
     main()

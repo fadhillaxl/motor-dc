@@ -20,7 +20,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
-from az_el_controller import AzElTrackerService
+from az_el_controller import AzElTrackerService, configure_sensor_heading
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -183,8 +183,24 @@ def main():
     parser.add_argument("--port", type=int, default=4533, help="Listen port (Hamlib default 4533)")
     parser.add_argument("--sim", action="store_true", help="Run backend in simulation mode")
     parser.add_argument("--no-auto-home", action="store_true", help="Skip automatic homing")
+    parser.add_argument(
+        "--az-offset",
+        type=float,
+        default=-104.0,
+        help="Heading offset derajat (CW conversion) untuk WT901 tuning",
+    )
+    parser.add_argument(
+        "--tilt-threshold",
+        type=float,
+        default=15.0,
+        help="Ambang tilt derajat untuk switch YAW <-> COMPASS",
+    )
     args = parser.parse_args()
 
+    configure_sensor_heading(
+        az_offset_deg=args.az_offset,
+        tilt_threshold_deg=args.tilt_threshold,
+    )
     controller = AzElTrackerService(
         sim=args.sim,
         auto_home=not args.no_auto_home,
@@ -197,7 +213,8 @@ def main():
     print(
         f"rotctld-compatible server aktif di {args.host}:{args.port} "
         f"(mode={args.mode}, gpredict={args.gpredict}, sim={args.sim}, "
-        f"device={args.device_port}, baud={args.baud_rate})"
+        f"device={args.device_port}, baud={args.baud_rate}, "
+        f"az_offset={args.az_offset}, tilt_threshold={args.tilt_threshold})"
     )
     print("Gunakan Gpredict -> Hamlib NET rotctld -> host 127.0.0.1 port 4533")
 
