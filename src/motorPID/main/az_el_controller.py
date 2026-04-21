@@ -1296,6 +1296,10 @@ class RotctlServer:
             self.logger.info("rotctl client disconnected: %s", addr)
 
     def _process_command(self, req: str) -> tuple[str, bool]:
+        def _parse_num(token: str) -> float:
+            # Gpredict on some locales sends decimal comma (e.g. "13,80").
+            return float(token.replace(",", "."))
+
         parts = req.split()
         if not parts:
             return "", False
@@ -1312,9 +1316,10 @@ class RotctlServer:
             if len(parts) < 3:
                 return "RPRT -1\n", False
             try:
-                az = float(parts[1]) % 360.0
-                el = float(parts[2])
+                az = _parse_num(parts[1]) % 360.0
+                el = _parse_num(parts[2])
             except ValueError:
+                self.logger.warning("Invalid set_pos payload: %s", req)
                 return "RPRT -1\n", False
             ok, reason = self.controller.set_target(az, el)
             if not ok:
