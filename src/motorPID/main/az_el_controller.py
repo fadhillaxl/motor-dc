@@ -59,7 +59,7 @@ except Exception as exc:
 # =============================
 # GLOBAL TARGETS / LIMITS
 # =============================
-POSITION_TOL_DEG = 0.5
+POSITION_TOL_DEG = 0.2
 CONTROL_INTERVAL_S = 0.05
 CONTROL_TIMEOUT_S = 120.0
 CONTROL_KP_AZ = 18.0
@@ -102,11 +102,11 @@ class StepperConfig:
     estop_active_low: bool = True
 
     # Motor tuning
-    steps_per_rev: int = 200  # full steps (1.8 deg/step)
+    steps_per_rev: int = 400  # full steps (1.8 deg/step)
     microstep: int = 8
     min_microstep: int = 1
     max_microstep: int = 16
-    max_speed_sps: float = 2200.0  # pulses per second
+    max_speed_sps: float = 1200.0  # pulses per second
     accel_sps2: float = 3000.0     # pulses per second^2
     pulse_width_us: int = 8
 
