@@ -292,6 +292,18 @@ class TB6600Stepper:
             return True
         return False
 
+    def _soft_stop_at_limit(self, moving_positive: bool):
+        """
+        Soft stop saat menyentuh batas software.
+        Tidak melatch fault agar kontrol bisa recovery dan lanjut operasi.
+        """
+        with self._lock:
+            self._target_speed_sps = 0.0
+            self._current_speed_sps = 0.0
+            boundary = self.cfg.soft_limit_max_deg if moving_positive else self.cfg.soft_limit_min_deg
+            if boundary is not None:
+                self._position_full_steps = (float(boundary) / 360.0) * float(self.cfg.steps_per_rev)
+
     def _set_direction(self, cw: bool):
         out = cw if self.cfg.dir_active_high else (not cw)
         self._set_output(self.cfg.dir_pin, out)
@@ -353,7 +365,7 @@ class TB6600Stepper:
             step_delta_full = (1.0 / float(microstep)) * (1.0 if cw else -1.0)
             next_deg = ((self.get_position_steps() + step_delta_full) / self.cfg.steps_per_rev) * 360.0
             if self._soft_limit_reached(next_deg):
-                self.emergency_stop("Soft limit tercapai")
+                self._soft_stop_at_limit(cw)
                 continue
 
             try:
