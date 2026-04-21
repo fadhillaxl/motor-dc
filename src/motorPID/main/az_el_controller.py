@@ -1428,7 +1428,10 @@ def main():
     logger = setup_logger()
     logger.info("=== AZ/EL CLOSED-LOOP CONTROL START ===")
     logger.info("Mode | %s", args.mode)
-    logger.info("Target | az=%.2f el=%.2f", target_az_deg, target_el_deg)
+    if args.mode == "target":
+        logger.info("Target | az=%.2f el=%.2f", target_az_deg, target_el_deg)
+    else:
+        logger.info("rotctl mode: hold current position, waiting target from Gpredict (P az el).")
 
     motor_az = None
     motor_el = None
@@ -1483,7 +1486,8 @@ def main():
             logger=logger,
         )
         rt_controller.start()
-        rt_controller.set_target(target_az_deg, target_el_deg)
+        # In rotctl mode, do not auto-move on startup.
+        # Wait for external command from Gpredict ("P <az> <el>").
 
         server = RotctlServer(
             controller=rt_controller,
