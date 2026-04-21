@@ -235,6 +235,11 @@ class TB6600Stepper:
         with self._lock:
             return (self._position_full_steps / self.cfg.steps_per_rev) * 360.0
 
+    def set_position_deg(self, deg: float):
+        """Sync internal position estimate to an external absolute sensor."""
+        with self._lock:
+            self._position_full_steps = (float(deg) / 360.0) * float(self.cfg.steps_per_rev)
+
     def get_status(self) -> dict:
         with self._lock:
             return {
@@ -828,6 +833,18 @@ def main():
 
         # Calibration routine replicated from fix-compas.py flow.
         wt.reset_zero_point()
+
+        # Sync internal motor positions from absolute sensor to avoid false soft-limit trips.
+        boot_data = wt.read_with_retry(attempts=40, delay_s=0.05)
+        if boot_data is None:
+            raise RuntimeError("Gagal membaca AZ/EL untuk sinkronisasi posisi awal.")
+        motor_az.set_position_deg(boot_data["az"])
+        motor_el.set_position_deg(boot_data["el"])
+        logger.info(
+            "Motor position synced from sensor | az=%.3f el=%.3f",
+            boot_data["az"],
+            boot_data["el"],
+        )
 
         controller = ClosedLoopAzElController(
             motor_az=motor_az,
