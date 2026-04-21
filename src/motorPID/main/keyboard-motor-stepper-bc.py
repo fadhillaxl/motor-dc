@@ -62,6 +62,7 @@ except Exception as exc:
 
 INTERVAL = 0.1
 AZ_OFFSET_DEG = 0.0
+KEY_HOLD_TIMEOUT = 0.18
 
 alpha = 0.15
 last_az = None
@@ -556,11 +557,16 @@ def main():
 
     command_speed = 600.0
     last_report = 0.0
+    hold_until_m1 = 0.0
+    hold_until_m2 = 0.0
+    hold_dir_m1 = 0.0
+    hold_dir_m2 = 0.0
 
     print(
         "\n=== DUAL TB6600 KEYBOARD STEPPER CONTROL ===\n"
         "Motor 1 (GPIO17/27/22): Arrow Left/Right atau A/D\n"
         "Motor 2 (GPIO23/24/25): Arrow Up/Down  atau W/S\n"
+        "Mode gerak        : Hold key = jalan, lepas key = stop\n"
         "Space            : Smooth stop kedua motor\n"
         "E                : Emergency stop kedua motor (latch)\n"
         "R                : Reset fault kedua motor\n"
@@ -576,20 +582,33 @@ def main():
     try:
         while True:
             key = get_key_nonblocking(0.01)
+            now = time.time()
             if key in ("\x1b[C", "d", "D"):
-                motor_1.set_target_speed(abs(command_speed))
+                hold_dir_m1 = 1.0
+                hold_until_m1 = now + KEY_HOLD_TIMEOUT
             elif key in ("\x1b[D", "a", "A"):
-                motor_1.set_target_speed(-abs(command_speed))
+                hold_dir_m1 = -1.0
+                hold_until_m1 = now + KEY_HOLD_TIMEOUT
             elif key in ("\x1b[A", "w", "W"):
-                motor_2.set_target_speed(abs(command_speed))
+                hold_dir_m2 = 1.0
+                hold_until_m2 = now + KEY_HOLD_TIMEOUT
             elif key in ("\x1b[B", "s", "S"):
-                motor_2.set_target_speed(-abs(command_speed))
+                hold_dir_m2 = -1.0
+                hold_until_m2 = now + KEY_HOLD_TIMEOUT
             elif key == " ":
                 motor_1.stop_smooth()
                 motor_2.stop_smooth()
+                hold_dir_m1 = 0.0
+                hold_dir_m2 = 0.0
+                hold_until_m1 = 0.0
+                hold_until_m2 = 0.0
             elif key in ("e", "E"):
                 motor_1.emergency_stop("Emergency stop keyboard")
                 motor_2.emergency_stop("Emergency stop keyboard")
+                hold_dir_m1 = 0.0
+                hold_dir_m2 = 0.0
+                hold_until_m1 = 0.0
+                hold_until_m2 = 0.0
             elif key in ("r", "R"):
                 motor_1.reset_fault()
                 motor_2.reset_fault()
@@ -615,7 +634,16 @@ def main():
             elif key in ("q", "Q"):
                 break
 
-            now = time.time()
+            if now <= hold_until_m1 and hold_dir_m1 != 0.0:
+                motor_1.set_target_speed(hold_dir_m1 * abs(command_speed))
+            else:
+                motor_1.stop_smooth()
+
+            if now <= hold_until_m2 and hold_dir_m2 != 0.0:
+                motor_2.set_target_speed(hold_dir_m2 * abs(command_speed))
+            else:
+                motor_2.stop_smooth()
+
             if now - last_report >= INTERVAL:
                 st1 = motor_1.get_status()
                 st2 = motor_2.get_status()
