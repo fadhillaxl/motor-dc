@@ -1,16 +1,21 @@
 {
   "axes": {
     "AZ": {
-      "position_deg": 350.325,
+      "position_deg": 254.925,
       "reason": "idle",
-      "saved_at": "2026-04-20 14:57:36"
+      "saved_at": "2026-04-20 18:33:29"
     },
     "EL": {
-      "position_deg": 30.15,
+      "position_deg": 69.75,
       "reason": "idle",
-      "saved_at": "2026-04-20 14:57:36"
+      "saved_at": "2026-04-20 18:33:30"
     }
   },
-  "fault": null,
-  "updated_at": "2026-04-20 14:57:36"
+  "fault": {
+    "axis": "EL",
+    "code": "LIMIT_MAX",
+    "message": "EL limit switch max aktif",
+    "timestamp": "2026-04-20 17:54:47"
+  },
+  "updated_at": "2026-04-20 18:33:30"
 }

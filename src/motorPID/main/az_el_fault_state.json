@@ -1,4 +1,6 @@
 {
-  "fault": null,
-  "timestamp": "2026-04-20 00:46:10"
+  "axis": "EL",
+  "code": "LIMIT_MAX",
+  "message": "EL limit switch max aktif",
+  "timestamp": "2026-04-20 17:54:47"
 }

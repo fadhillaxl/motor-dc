@@ -39,7 +39,19 @@ import time
 import tty
 import termios
 import threading
+import os
+import math
+import select
+import platform
 from dataclasses import dataclass
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs"))
+sys.path.insert(0, SDK_CHS)
+
+import lib.device_model as deviceModel
+from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
+from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
 
 try:
     import RPi.GPIO as GPIO
@@ -47,6 +59,133 @@ except Exception as exc:
     print(f"ERROR: gagal import RPi.GPIO: {exc}")
     print("Jalankan file ini di Raspberry Pi dengan library RPi.GPIO terpasang.")
     sys.exit(1)
+
+INTERVAL = 0.1
+AZ_OFFSET_DEG = 0.0
+
+alpha = 0.15
+last_az = None
+
+
+def angle_diff(a, b):
+    return (a - b + 180) % 360 - 180
+
+
+def angle_lerp(new, old):
+    if old is None:
+        return new
+    d = angle_diff(new, old)
+    return (old + alpha * d) % 360
+
+
+def tilt_compass(mx, my, mz, roll, pitch):
+    roll_rad = math.radians(roll)
+    pitch_rad = math.radians(pitch)
+
+    xh = mx * math.cos(pitch_rad) + mz * math.sin(pitch_rad)
+    yh = (
+        mx * math.sin(roll_rad) * math.sin(pitch_rad)
+        + my * math.cos(roll_rad)
+        - mz * math.sin(roll_rad) * math.cos(pitch_rad)
+    )
+
+    heading = math.degrees(math.atan2(yh, xh))
+    return (heading + 360) % 360
+
+
+def buat_device_model():
+    try:
+        return deviceModel.DeviceModel(
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
+        )
+    except TypeError:
+        return deviceModel.DeviceModel(
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor(),
+            "AZ",
+        )
+
+
+def baca_sudut(device):
+    global last_az
+
+    try:
+        if hasattr(device, "readReg"):
+            device.readReg(0x30, 41)
+
+        if hasattr(device, "get"):
+            roll = device.get("AngleX")
+            pitch = device.get("AngleY")
+            yaw = device.get("AngleZ")
+            accX = device.get("accX")
+            accY = device.get("accY")
+            accZ = device.get("accZ")
+            magX = device.get("magX")
+            magY = device.get("magY")
+            magZ = device.get("magZ")
+        else:
+            roll = device.getDeviceData("angleX")
+            pitch = device.getDeviceData("angleY")
+            yaw = device.getDeviceData("angleZ")
+            accX = device.getDeviceData("accX")
+            accY = device.getDeviceData("accY")
+            accZ = device.getDeviceData("accZ")
+            magX = device.getDeviceData("magX")
+            magY = device.getDeviceData("magY")
+            magZ = device.getDeviceData("magZ")
+
+        if None in (roll, pitch, yaw):
+            return None, None, None, None, None, None
+
+        roll = float(roll)
+        pitch = float(pitch)
+        yaw = float(yaw) % 360
+
+        roll_tilt = roll
+        pitch_tilt = pitch
+
+        if None not in (accX, accY, accZ):
+            ax = float(accX)
+            ay = float(accY)
+            az = float(accZ)
+
+            if abs(ay) + abs(az) > 1e-6:
+                roll_tilt = math.degrees(math.atan2(ay, az))
+
+            if abs(ax) + abs(az) > 1e-6:
+                pitch_tilt = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+
+        compass = None
+        if None not in (magX, magY, magZ):
+            compass = tilt_compass(
+                float(magX),
+                float(magY),
+                float(magZ),
+                roll_tilt,
+                pitch_tilt,
+            )
+
+        yaw_cw = (360 - yaw + AZ_OFFSET_DEG) % 360
+        compass_cw = (360 - compass + AZ_OFFSET_DEG) % 360 if compass is not None else None
+
+        az = yaw_cw
+        src = "YAW"
+
+        if compass_cw is not None:
+            w = math.cos(math.radians(roll_tilt)) * math.cos(math.radians(pitch_tilt))
+            w = max(0, w)
+            az = (1 - w) * yaw_cw + w * compass_cw
+            src = f"BLEND({w:.2f})"
+
+        az = angle_lerp(az, last_az)
+        last_az = az
+
+        return roll, pitch, yaw_cw, compass_cw, az, src
+    except Exception:
+        return None, None, None, None, None, None
 
 
 @dataclass
@@ -350,6 +489,27 @@ def get_key() -> str:
     return ch
 
 
+def get_key_nonblocking(timeout: float = 0.01) -> str:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not ready:
+            return ""
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            ready, _, _ = select.select([sys.stdin], [], [], 0.001)
+            if ready:
+                ch += sys.stdin.read(1)
+            ready, _, _ = select.select([sys.stdin], [], [], 0.001)
+            if ready:
+                ch += sys.stdin.read(1)
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def main():
     # Motor 1 (sesuai mapping user)
     cfg_m1 = StepperConfig(
@@ -379,6 +539,21 @@ def main():
     motor_1 = TB6600Stepper(cfg_m1)
     motor_2 = TB6600Stepper(cfg_m2)
 
+    device = None
+    try:
+        device = buat_device_model()
+        device.ADDR = 0x50
+        if platform.system().lower() == "linux":
+            device.serialConfig.portName = "/dev/ttyUSB0"
+        else:
+            device.serialConfig.portName = "/dev/tty.usbserial-1330"
+        device.serialConfig.baud = 9600
+        device.openDevice()
+        time.sleep(1)
+    except Exception as exc:
+        print(f"[WARN] IMU tidak aktif: {exc}")
+        device = None
+
     command_speed = 600.0
     last_report = 0.0
 
@@ -393,25 +568,14 @@ def main():
         "1/2/3/4/5       : Set microstep kedua motor = 1/2/4/8/16\n"
         "Q               : Quit\n"
     )
+    print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}".format(
+        "TIME", "ROLL", "EL", "YAW", "COMPASS", "AZ", "SRC"
+    ))
+    print("-" * 80)
 
     try:
         while True:
-            now = time.time()
-            if now - last_report > 0.25:
-                st1 = motor_1.get_status()
-                st2 = motor_2.get_status()
-                fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
-                fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
-                sys.stdout.write(
-                    f"\rM1 POS={st1['position_deg']:7.2f} SPD={st1['current_speed_sps']:7.1f} "
-                    f"| M2 POS={st2['position_deg']:7.2f} SPD={st2['current_speed_sps']:7.1f} "
-                    f"| MS={st1['microstep']:2d}{fault1}{fault2}       "
-                )
-                sys.stdout.flush()
-                last_report = now
-
-            key = get_key()
-
+            key = get_key_nonblocking(0.01)
             if key in ("\x1b[C", "d", "D"):
                 motor_1.set_target_speed(abs(command_speed))
             elif key in ("\x1b[D", "a", "A"):
@@ -434,17 +598,43 @@ def main():
             elif key == "-":
                 command_speed = max(50.0, command_speed - 100.0)
             elif key == "1":
-                motor_1.set_microstep(1); motor_2.set_microstep(1)
+                motor_1.set_microstep(1)
+                motor_2.set_microstep(1)
             elif key == "2":
-                motor_1.set_microstep(2); motor_2.set_microstep(2)
+                motor_1.set_microstep(2)
+                motor_2.set_microstep(2)
             elif key == "3":
-                motor_1.set_microstep(4); motor_2.set_microstep(4)
+                motor_1.set_microstep(4)
+                motor_2.set_microstep(4)
             elif key == "4":
-                motor_1.set_microstep(8); motor_2.set_microstep(8)
+                motor_1.set_microstep(8)
+                motor_2.set_microstep(8)
             elif key == "5":
-                motor_1.set_microstep(16); motor_2.set_microstep(16)
+                motor_1.set_microstep(16)
+                motor_2.set_microstep(16)
             elif key in ("q", "Q"):
                 break
+
+            now = time.time()
+            if now - last_report >= INTERVAL:
+                st1 = motor_1.get_status()
+                st2 = motor_2.get_status()
+                moving = abs(st1["current_speed_sps"]) > 1e-3 or abs(st2["current_speed_sps"]) > 1e-3
+                if moving and device is not None:
+                    data = baca_sudut(device)
+                    if data[0] is not None:
+                        roll, pitch, yaw, comp, az, src = data
+                        now_text = time.strftime("%H:%M:%S")
+                        print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>10}".format(
+                            now_text,
+                            roll,
+                            pitch,
+                            yaw,
+                            f"{comp:.2f}" if comp is not None else "-",
+                            az,
+                            src,
+                        ))
+                last_report = now
     except KeyboardInterrupt:
         pass
     except Exception as exc:
@@ -453,6 +643,11 @@ def main():
         print("\nShutdown controller...")
         motor_1.close()
         motor_2.close()
+        if device is not None:
+            try:
+                device.closeDevice()
+            except Exception:
+                pass
         GPIO.cleanup()
         print("GPIO cleaned up.")
 
