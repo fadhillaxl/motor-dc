@@ -66,6 +66,7 @@ CONTROL_TIMEOUT_S = 120.0
 CONTROL_KP_AZ = 18.0
 CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 80.0
+CONTROL_MAX_SPS_EL = 300.0
 LOG_FILE = os.path.join(BASE_DIR, "az_el_closed_loop.log")
 
 
@@ -671,7 +672,7 @@ class ClosedLoopAzElController:
         stable_hits = 0
         t0 = time.time()
         max_speed_az = float(self.motor_az.cfg.max_speed_sps)
-        max_speed_el = float(self.motor_el.cfg.max_speed_sps)
+        max_speed_el = min(float(self.motor_el.cfg.max_speed_sps), CONTROL_MAX_SPS_EL)
         sensor_fail_count = 0
 
         while True:
@@ -697,6 +698,11 @@ class ClosedLoopAzElController:
             sensor_fail_count = 0
 
             curr_az, curr_el, _, _ = pkt
+            # Keep internal motor position estimate aligned with absolute sensor feedback.
+            # This prevents false soft-limit trips when step->deg model differs from mechanics.
+            self.motor_az.set_position_deg(curr_az)
+            self.motor_el.set_position_deg(curr_el)
+
             err_az = angle_diff(target_az_deg, curr_az)
             err_el = target_el_deg - curr_el
 
