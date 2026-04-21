@@ -379,16 +379,6 @@ def angle_lerp(new: float, old: float | None, alpha: float) -> float:
     return (old + alpha * d) % 360.0
 
 
-def map_roll_to_el(roll_deg: float, el_offset_deg: float = 0.0) -> float:
-    """
-    Map roll to elevation with user convention:
-    - roll ~= 90  -> EL = 0 (front)
-    - roll ~= 180 -> EL = 90 (up)
-    """
-    el = (float(roll_deg) - 90.0) + float(el_offset_deg)
-    return max(0.0, min(180.0, el))
-
-
 class WT901AxisReader:
     """WT901 reader that mirrors the acquisition flow from fix-compas.py."""
 
@@ -564,8 +554,9 @@ class WT901AxisReader:
             az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
 
-            # EL pakai mapping ROLL -> EL: depan=0, atas=90.
-            el = map_roll_to_el(roll, self.el_offset_deg)
+            # EL pakai ROLL (sesuai request user), AZ tetap pakai tilt-compensation fix-compas.
+            el = roll + self.el_offset_deg
+            el = max(0.0, min(180.0, el))
 
             return {
                 "roll": roll,
