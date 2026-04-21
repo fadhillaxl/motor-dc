@@ -1,57 +1,29 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-TB6600 Stepper Keyboard Controller
+TB6600 Dual Stepper Controller + WT901 Closed-Loop AZ/EL Targeting
 
-Fitur utama:
-- Kontrol STEP / DIR / ENABLE untuk driver TB6600.
-- Dukungan microstepping: 1, 2, 4, 8, 16.
-- Arah CW/CCW dengan kecepatan yang bisa diatur dari keyboard.
-- Profil percepatan/deselerasi smooth (linear ramp).
-- Safety:
-  - Limit switch minimum dan maksimum.
-  - Input proteksi arus berlebih (digital fault input).
-  - Emergency stop dari keyboard dan dari pin GPIO.
-- Feedback posisi:
-  - Posisi disimpan dalam "full-step equivalent" agar tetap akurat walau
-    microstepping diubah saat runtime.
+This script drives a dual-axis antenna system to a precise target:
+- Azimuth target: 20 deg
+- Elevation target: 94 deg
 
-Mapping pin sesuai request:
-- Motor 1:
-  - PUL+ -> GPIO17 (Pin 11)
-  - DIR+ -> GPIO27 (Pin 13)
-  - EN+  -> GPIO22 (Pin 15)
-- Motor 2:
-  - PUL+ -> GPIO23 (Pin 16)
-  - DIR+ -> GPIO24 (Pin 18)
-  - EN+  -> GPIO25 (Pin 22)
-- PUL- / DIR- / EN- -> GND (sesuai wiring driver)
-
-Catatan penting hardware:
-- TB6600 biasanya memiliki pin ENA/EN+, ENA-, DIR+/DIR-, PUL+/PUL-.
-- Sesuaikan wiring active-high / active-low melalui parameter *_active_high.
-- Input overcurrent diasumsikan berasal dari sensor/comparator eksternal
-  yang memberikan sinyal digital fault.
+Key features:
+- TB6600 control (STEP / DIR / ENABLE) with acceleration ramp.
+- Safety checks (limit switches, overcurrent, estop).
+- WT901 sensor acquisition/reset/error handling replicated from fix-compas.py.
+- Closed-loop correction using AZ/EL feedback from WT901.
+- Logging of start/target/end position and correction steps.
 """
 
-import sys
-import time
-import tty
-import termios
-import threading
-import os
+import json
+import logging
 import math
-import select
+import os
 import platform
+import sys
+import threading
+import time
 from dataclasses import dataclass
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs"))
-sys.path.insert(0, SDK_CHS)
-
-import lib.device_model as deviceModel
-from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
-from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
 
 try:
     import RPi.GPIO as GPIO
@@ -60,133 +32,42 @@ except Exception as exc:
     print("Jalankan file ini di Raspberry Pi dengan library RPi.GPIO terpasang.")
     sys.exit(1)
 
-INTERVAL = 0.1
-AZ_OFFSET_DEG = 0.0
-KEY_HOLD_TIMEOUT = 0.18
+# =============================
+# PATH SDK (same style as fix-compas.py)
+# =============================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SDK_CHS = os.path.abspath(
+    os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs")
+)
+if SDK_CHS not in sys.path:
+    sys.path.insert(0, SDK_CHS)
 
-alpha = 0.15
-last_az = None
-
-
-def angle_diff(a, b):
-    return (a - b + 180) % 360 - 180
-
-
-def angle_lerp(new, old):
-    if old is None:
-        return new
-    d = angle_diff(new, old)
-    return (old + alpha * d) % 360
-
-
-def tilt_compass(mx, my, mz, roll, pitch):
-    roll_rad = math.radians(roll)
-    pitch_rad = math.radians(pitch)
-
-    xh = mx * math.cos(pitch_rad) + mz * math.sin(pitch_rad)
-    yh = (
-        mx * math.sin(roll_rad) * math.sin(pitch_rad)
-        + my * math.cos(roll_rad)
-        - mz * math.sin(roll_rad) * math.cos(pitch_rad)
-    )
-
-    heading = math.degrees(math.atan2(yh, xh))
-    return (heading + 360) % 360
+try:
+    import lib.device_model as deviceModel
+    from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
+    from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
+    WT901_AVAILABLE = True
+except Exception as exc:
+    WT901_AVAILABLE = False
+    print(f"ERROR: gagal import WT901 SDK: {exc}")
+    print(f"Pastikan path SDK valid: {SDK_CHS}")
+    sys.exit(1)
 
 
-def buat_device_model():
-    try:
-        return deviceModel.DeviceModel(
-            "WT901C485",
-            Protocol485Resolver(),
-            JY901SDataProcessor(),
-        )
-    except TypeError:
-        return deviceModel.DeviceModel(
-            "WT901C485",
-            Protocol485Resolver(),
-            JY901SDataProcessor(),
-            "AZ",
-        )
-
-
-def baca_sudut(device):
-    global last_az
-
-    try:
-        if hasattr(device, "readReg"):
-            device.readReg(0x30, 41)
-
-        if hasattr(device, "get"):
-            roll = device.get("AngleX")
-            pitch = device.get("AngleY")
-            yaw = device.get("AngleZ")
-            accX = device.get("accX")
-            accY = device.get("accY")
-            accZ = device.get("accZ")
-            magX = device.get("magX")
-            magY = device.get("magY")
-            magZ = device.get("magZ")
-        else:
-            roll = device.getDeviceData("angleX")
-            pitch = device.getDeviceData("angleY")
-            yaw = device.getDeviceData("angleZ")
-            accX = device.getDeviceData("accX")
-            accY = device.getDeviceData("accY")
-            accZ = device.getDeviceData("accZ")
-            magX = device.getDeviceData("magX")
-            magY = device.getDeviceData("magY")
-            magZ = device.getDeviceData("magZ")
-
-        if None in (roll, pitch, yaw):
-            return None, None, None, None, None, None
-
-        roll = float(roll)
-        pitch = float(pitch)
-        yaw = float(yaw) % 360
-
-        roll_tilt = roll
-        pitch_tilt = pitch
-
-        if None not in (accX, accY, accZ):
-            ax = float(accX)
-            ay = float(accY)
-            az = float(accZ)
-
-            if abs(ay) + abs(az) > 1e-6:
-                roll_tilt = math.degrees(math.atan2(ay, az))
-
-            if abs(ax) + abs(az) > 1e-6:
-                pitch_tilt = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
-
-        compass = None
-        if None not in (magX, magY, magZ):
-            compass = tilt_compass(
-                float(magX),
-                float(magY),
-                float(magZ),
-                roll_tilt,
-                pitch_tilt,
-            )
-
-        yaw_cw = (360 - yaw + AZ_OFFSET_DEG) % 360
-        compass_cw = (360 - compass + AZ_OFFSET_DEG) % 360 if compass is not None else None
-
-        az = yaw_cw
-        src = "YAW"
-
-        if compass_cw is not None:
-            w = math.cos(math.radians(roll_tilt)) * math.cos(math.radians(pitch_tilt))
-            w = max(0, w)
-            az = (1 - w) * yaw_cw + w * compass_cw
-            src = f"BLEND({w:.2f})"
-
-        az = angle_lerp(az, last_az)
-        last_az = az
-
-        return roll, pitch, yaw_cw, compass_cw, az, src
-    except Exception:
-        return None, None, None, None, None, None
+# =============================
+# GLOBAL TARGETS / LIMITS
+# =============================
+TARGET_AZ_DEG = 20.0
+TARGET_EL_DEG = 94.0
+KNOWN_START_AZ_DEG = 0.0
+KNOWN_START_EL_DEG = 90.0
+POSITION_TOL_DEG = 0.5
+CONTROL_INTERVAL_S = 0.05
+CONTROL_TIMEOUT_S = 120.0
+CONTROL_KP_AZ = 18.0
+CONTROL_KP_EL = 18.0
+CONTROL_MIN_SPS = 80.0
+LOG_FILE = os.path.join(BASE_DIR, "az_el_closed_loop.log")
 
 
 @dataclass
@@ -477,42 +358,370 @@ class TB6600Stepper:
         self.enable_driver(False)
 
 
-def get_key() -> str:
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            ch += sys.stdin.read(2)  # arrow key sequence
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    return ch
+def angle_diff(a: float, b: float) -> float:
+    """Shortest circular angle diff in degree (-180..180)."""
+    return (a - b + 180.0) % 360.0 - 180.0
 
 
-def get_key_nonblocking(timeout: float = 0.01) -> str:
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        if not ready:
-            return ""
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            ready, _, _ = select.select([sys.stdin], [], [], 0.001)
-            if ready:
-                ch += sys.stdin.read(1)
-            ready, _, _ = select.select([sys.stdin], [], [], 0.001)
-            if ready:
-                ch += sys.stdin.read(1)
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+def angle_lerp(new: float, old: float | None, alpha: float) -> float:
+    """Circular smoothing with wrap-safe interpolation."""
+    if old is None:
+        return new % 360.0
+    d = angle_diff(new, old)
+    return (old + alpha * d) % 360.0
 
 
-def main():
-    # Motor 1 (sesuai mapping user)
+class WT901AxisReader:
+    """WT901 reader that mirrors the acquisition flow from fix-compas.py."""
+
+    def __init__(
+        self,
+        label: str,
+        addr: int,
+        az_offset_deg: float = 0.0,
+        el_offset_deg: float = 0.0,
+        alpha: float = 0.15,
+    ):
+        self.label = label
+        self.addr = addr
+        self.az_offset_deg = az_offset_deg
+        self.el_offset_deg = el_offset_deg
+        self.alpha = alpha
+        self.last_az = None
+        self.device = self._buat_device_model()
+        self.device.ADDR = addr
+
+        if platform.system().lower() == "linux":
+            self.device.serialConfig.portName = "/dev/ttyUSB0"
+        else:
+            self.device.serialConfig.portName = "/dev/tty.usbserial-1330"
+        self.device.serialConfig.baud = 9600
+
+    @staticmethod
+    def _buat_device_model():
+        try:
+            return deviceModel.DeviceModel(
+                "WT901C485",
+                Protocol485Resolver(),
+                JY901SDataProcessor(),
+            )
+        except TypeError:
+            return deviceModel.DeviceModel(
+                "WT901C485",
+                Protocol485Resolver(),
+                JY901SDataProcessor(),
+                "AZ",
+            )
+
+    def open(self):
+        self.device.openDevice()
+        time.sleep(1.0)
+
+    def close(self):
+        try:
+            self.device.closeDevice()
+        except Exception:
+            pass
+
+    def reset_zero_point(self):
+        # Replicated behavior from fix-compas.py
+        try:
+            print(f"[INFO][{self.label}] Reset zero-point...")
+            if hasattr(self.device, "write_register"):
+                self.device.write_register(self.device.ADDR, 0x69, 0xB588)
+                time.sleep(0.1)
+                self.device.write_register(self.device.ADDR, 0x01, 0x0000)
+            else:
+                if hasattr(self.device, "unlock"):
+                    self.device.unlock()
+                    time.sleep(0.1)
+                self.device.writeReg(0x01, 0x0000)
+                if hasattr(self.device, "save"):
+                    time.sleep(0.1)
+                    self.device.save()
+            time.sleep(0.3)
+            print(f"[OK][{self.label}] Zero reset")
+        except Exception as exc:
+            print(f"[WARN][{self.label}] {exc}")
+
+    @staticmethod
+    def _tilt_compass(mx: float, my: float, mz: float, roll: float, pitch: float) -> float:
+        roll_rad = math.radians(roll)
+        pitch_rad = math.radians(pitch)
+        xh = mx * math.cos(pitch_rad) + mz * math.sin(pitch_rad)
+        yh = (
+            mx * math.sin(roll_rad) * math.sin(pitch_rad)
+            + my * math.cos(roll_rad)
+            - mz * math.sin(roll_rad) * math.cos(pitch_rad)
+        )
+        heading = math.degrees(math.atan2(yh, xh))
+        return (heading + 360.0) % 360.0
+
+    def read(self) -> dict | None:
+        # Replicated acquisition + error handling style from fix-compas.py
+        try:
+            if hasattr(self.device, "readReg"):
+                self.device.readReg(0x30, 41)
+
+            if hasattr(self.device, "get"):
+                roll = self.device.get("AngleX")
+                pitch = self.device.get("AngleY")
+                yaw = self.device.get("AngleZ")
+                acc_x = self.device.get("accX")
+                acc_y = self.device.get("accY")
+                acc_z = self.device.get("accZ")
+                mag_x = self.device.get("magX")
+                mag_y = self.device.get("magY")
+                mag_z = self.device.get("magZ")
+            else:
+                roll = self.device.getDeviceData("angleX")
+                pitch = self.device.getDeviceData("angleY")
+                yaw = self.device.getDeviceData("angleZ")
+                acc_x = self.device.getDeviceData("accX")
+                acc_y = self.device.getDeviceData("accY")
+                acc_z = self.device.getDeviceData("accZ")
+                mag_x = self.device.getDeviceData("magX")
+                mag_y = self.device.getDeviceData("magY")
+                mag_z = self.device.getDeviceData("magZ")
+
+            if None in (roll, pitch, yaw):
+                return None
+
+            roll = float(roll)
+            pitch = float(pitch)
+            yaw = float(yaw) % 360.0
+
+            # Tilt from ACC (same as fix-compas.py)
+            roll_tilt = roll
+            pitch_tilt = pitch
+            if None not in (acc_x, acc_y, acc_z):
+                ax = float(acc_x)
+                ay = float(acc_y)
+                az = float(acc_z)
+
+                if abs(ay) + abs(az) > 1e-6:
+                    roll_tilt = math.degrees(math.atan2(ay, az))
+
+                if abs(ax) + abs(az) > 1e-6:
+                    pitch_tilt = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+
+            compass = None
+            if None not in (mag_x, mag_y, mag_z):
+                compass = self._tilt_compass(
+                    float(mag_x),
+                    float(mag_y),
+                    float(mag_z),
+                    roll_tilt,
+                    pitch_tilt,
+                )
+
+            yaw_cw = (360.0 - yaw + self.az_offset_deg) % 360.0
+            compass_cw = (
+                (360.0 - compass + self.az_offset_deg) % 360.0
+                if compass is not None
+                else None
+            )
+
+            az = yaw_cw
+            src = "YAW"
+            if compass_cw is not None:
+                w = math.cos(math.radians(roll_tilt)) * math.cos(math.radians(pitch_tilt))
+                w = max(0.0, w)
+                az = (1.0 - w) * yaw_cw + w * compass_cw
+                src = f"BLEND({w:.2f})"
+
+            az = angle_lerp(az, self.last_az, self.alpha)
+            self.last_az = az
+
+            # EL from pitch tilt, with wrap-safe normalization
+            el = (pitch_tilt + self.el_offset_deg) % 360.0
+
+            return {
+                "roll": roll,
+                "pitch": pitch,
+                "roll_tilt": roll_tilt,
+                "pitch_tilt": pitch_tilt,
+                "yaw_cw": yaw_cw,
+                "compass_cw": compass_cw,
+                "az": az,
+                "el": el,
+                "src": src,
+            }
+        except Exception as exc:
+            print(f"[ERR][{self.label}] {exc}")
+            return None
+
+
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("az_el_closed_loop")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+    fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    return logger
+
+
+class ClosedLoopAzElController:
+    def __init__(
+        self,
+        motor_az: TB6600Stepper,
+        motor_el: TB6600Stepper,
+        wt_az: WT901AxisReader,
+        wt_el: WT901AxisReader,
+        logger: logging.Logger,
+    ):
+        self.motor_az = motor_az
+        self.motor_el = motor_el
+        self.wt_az = wt_az
+        self.wt_el = wt_el
+        self.logger = logger
+        self.corrections: list[dict] = []
+
+    @staticmethod
+    def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
+        cmd = kp * err_deg
+        if abs(cmd) < CONTROL_MIN_SPS and abs(err_deg) > 0.05:
+            cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
+        return max(-max_sps, min(max_sps, cmd))
+
+    def _read_azel(self) -> tuple[float, float, dict, dict] | None:
+        az_data = self.wt_az.read()
+        el_data = self.wt_el.read()
+        if az_data is None or el_data is None:
+            return None
+        return az_data["az"], el_data["el"], az_data, el_data
+
+    def drive_to_target(
+        self,
+        target_az_deg: float,
+        target_el_deg: float,
+        tolerance_deg: float = POSITION_TOL_DEG,
+        timeout_s: float = CONTROL_TIMEOUT_S,
+    ) -> tuple[bool, dict]:
+        self.corrections.clear()
+        start_packet = self._read_azel()
+        if start_packet is None:
+            raise RuntimeError("Gagal membaca posisi awal AZ/EL dari WT901.")
+
+        start_az, start_el, start_az_raw, start_el_raw = start_packet
+        self.logger.info(
+            "START position | az=%.3f el=%.3f | target az=%.3f el=%.3f",
+            start_az,
+            start_el,
+            target_az_deg,
+            target_el_deg,
+        )
+        self.logger.info(
+            "START raw | az_src=%s az_yaw=%.3f az_compass=%s el_pitch_tilt=%.3f",
+            start_az_raw["src"],
+            start_az_raw["yaw_cw"],
+            "-" if start_az_raw["compass_cw"] is None else f"{start_az_raw['compass_cw']:.3f}",
+            start_el_raw["pitch_tilt"],
+        )
+
+        stable_hits = 0
+        t0 = time.time()
+        max_speed_az = float(self.motor_az.cfg.max_speed_sps)
+        max_speed_el = float(self.motor_el.cfg.max_speed_sps)
+        sensor_fail_count = 0
+
+        while True:
+            # Latch validation from hard safety / limit switches / estop
+            st_az = self.motor_az.get_status()
+            st_el = self.motor_el.get_status()
+            if st_az["fault_latched"] or st_el["fault_latched"]:
+                self.motor_az.emergency_stop("Fault latched during closed-loop move")
+                self.motor_el.emergency_stop("Fault latched during closed-loop move")
+                self.logger.error("FAULT LATCHED | az=%s | el=%s", st_az["fault_msg"], st_el["fault_msg"])
+                break
+
+            pkt = self._read_azel()
+            if pkt is None:
+                sensor_fail_count += 1
+                self.logger.warning("Sensor read failed (%d).", sensor_fail_count)
+                if sensor_fail_count > 20:
+                    self.motor_az.emergency_stop("Too many WT901 read failures")
+                    self.motor_el.emergency_stop("Too many WT901 read failures")
+                    break
+                time.sleep(CONTROL_INTERVAL_S)
+                continue
+            sensor_fail_count = 0
+
+            curr_az, curr_el, _, _ = pkt
+            err_az = angle_diff(target_az_deg, curr_az)
+            err_el = target_el_deg - curr_el
+
+            in_tol = abs(err_az) <= tolerance_deg and abs(err_el) <= tolerance_deg
+            if in_tol:
+                stable_hits += 1
+                self.motor_az.stop_smooth()
+                self.motor_el.stop_smooth()
+            else:
+                stable_hits = 0
+                cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
+                cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
+                self.motor_az.set_target_speed(cmd_az)
+                self.motor_el.set_target_speed(cmd_el)
+
+                corr = {
+                    "t": round(time.time() - t0, 3),
+                    "curr_az": round(curr_az, 3),
+                    "curr_el": round(curr_el, 3),
+                    "err_az": round(err_az, 3),
+                    "err_el": round(err_el, 3),
+                    "cmd_az_sps": round(cmd_az, 3),
+                    "cmd_el_sps": round(cmd_el, 3),
+                }
+                self.corrections.append(corr)
+                self.logger.info("CORR %s", json.dumps(corr, separators=(",", ":")))
+
+            if stable_hits >= 5:
+                self.logger.info("Stable target lock reached.")
+                break
+            if (time.time() - t0) > timeout_s:
+                self.logger.error("Timeout while moving to target.")
+                break
+
+            time.sleep(CONTROL_INTERVAL_S)
+
+        self.motor_az.stop_smooth()
+        self.motor_el.stop_smooth()
+        time.sleep(0.5)
+
+        end_packet = self._read_azel()
+        if end_packet is None:
+            raise RuntimeError("Gagal membaca posisi akhir AZ/EL dari WT901.")
+        end_az, end_el, _, _ = end_packet
+
+        end_err_az = angle_diff(target_az_deg, end_az)
+        end_err_el = target_el_deg - end_el
+        success = abs(end_err_az) <= tolerance_deg and abs(end_err_el) <= tolerance_deg
+
+        report = {
+            "start_position": {"az": start_az, "el": start_el},
+            "target_position": {"az": target_az_deg, "el": target_el_deg},
+            "actual_end_position": {"az": end_az, "el": end_el},
+            "final_error": {"az": end_err_az, "el": end_err_el},
+            "tolerance_deg": tolerance_deg,
+            "success": success,
+            "correction_steps": self.corrections,
+        }
+        self.logger.info("END report %s", json.dumps(report, separators=(",", ":")))
+        return success, report
+
+
+def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
+    # Motor 1 (AZ)
     cfg_m1 = StepperConfig(
         step_pin=17,  # PUL+
         dir_pin=27,   # DIR+
@@ -521,10 +730,10 @@ def main():
         microstep=8,
         max_speed_sps=2200.0,
         accel_sps2=3000.0,
-        soft_limit_min_deg=None,
-        soft_limit_max_deg=None,
+        soft_limit_min_deg=0.0,
+        soft_limit_max_deg=360.0,
     )
-    # Motor 2 (sesuai mapping user)
+    # Motor 2 (EL)
     cfg_m2 = StepperConfig(
         step_pin=23,  # PUL+
         dir_pin=24,   # DIR+
@@ -533,151 +742,108 @@ def main():
         microstep=8,
         max_speed_sps=2200.0,
         accel_sps2=3000.0,
-        soft_limit_min_deg=None,
-        soft_limit_max_deg=None,
+        soft_limit_min_deg=0.0,
+        soft_limit_max_deg=180.0,
     )
+    return TB6600Stepper(cfg_m1), TB6600Stepper(cfg_m2)
 
-    motor_1 = TB6600Stepper(cfg_m1)
-    motor_2 = TB6600Stepper(cfg_m2)
 
-    device = None
-    try:
-        device = buat_device_model()
-        device.ADDR = 0x50
-        if platform.system().lower() == "linux":
-            device.serialConfig.portName = "/dev/ttyUSB0"
-        else:
-            device.serialConfig.portName = "/dev/tty.usbserial-1330"
-        device.serialConfig.baud = 9600
-        device.openDevice()
-        time.sleep(1)
-    except Exception as exc:
-        print(f"[WARN] IMU tidak aktif: {exc}")
-        device = None
-
-    command_speed = 600.0
-    last_report = 0.0
-    hold_until_m1 = 0.0
-    hold_until_m2 = 0.0
-    hold_dir_m1 = 0.0
-    hold_dir_m2 = 0.0
-
-    print(
-        "\n=== DUAL TB6600 KEYBOARD STEPPER CONTROL ===\n"
-        "Motor 1 (GPIO17/27/22): Arrow Left/Right atau A/D\n"
-        "Motor 2 (GPIO23/24/25): Arrow Up/Down  atau W/S\n"
-        "Mode gerak        : Hold key = jalan, lepas key = stop\n"
-        "Space            : Smooth stop kedua motor\n"
-        "E                : Emergency stop kedua motor (latch)\n"
-        "R                : Reset fault kedua motor\n"
-        "+ / -           : Speed up / down\n"
-        "1/2/3/4/5       : Set microstep kedua motor = 1/2/4/8/16\n"
-        "Q               : Quit\n"
+def validate_target_move(
+    controller: ClosedLoopAzElController,
+    logger: logging.Logger,
+) -> bool:
+    logger.info("Validation run start.")
+    logger.info(
+        "Phase-1 move to known start az=%.2f el=%.2f",
+        KNOWN_START_AZ_DEG,
+        KNOWN_START_EL_DEG,
     )
-    print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}".format(
-        "TIME", "ROLL", "EL", "YAW", "COMPASS", "AZ", "SRC"
-    ))
-    print("-" * 80)
+    ok_start, report_start = controller.drive_to_target(
+        KNOWN_START_AZ_DEG,
+        KNOWN_START_EL_DEG,
+        tolerance_deg=1.0,
+    )
+    if not ok_start:
+        logger.error("Failed to reach known start. report=%s", json.dumps(report_start))
+        return False
+
+    logger.info(
+        "Phase-2 move to target az=%.2f el=%.2f",
+        TARGET_AZ_DEG,
+        TARGET_EL_DEG,
+    )
+    ok_target, report_target = controller.drive_to_target(
+        TARGET_AZ_DEG,
+        TARGET_EL_DEG,
+        tolerance_deg=POSITION_TOL_DEG,
+    )
+    if not ok_target:
+        logger.error("Target validation failed. report=%s", json.dumps(report_target))
+        return False
+
+    logger.info(
+        "Validation PASS: final position within +/-%.2f deg of target.",
+        POSITION_TOL_DEG,
+    )
+    return True
+
+
+def main():
+    logger = setup_logger()
+    logger.info("=== AZ/EL CLOSED-LOOP CONTROL START ===")
+
+    motor_az = None
+    motor_el = None
+    wt_az = None
+    wt_el = None
 
     try:
-        while True:
-            key = get_key_nonblocking(0.01)
-            now = time.time()
-            if key in ("\x1b[C", "d", "D"):
-                hold_dir_m1 = 1.0
-                hold_until_m1 = now + KEY_HOLD_TIMEOUT
-            elif key in ("\x1b[D", "a", "A"):
-                hold_dir_m1 = -1.0
-                hold_until_m1 = now + KEY_HOLD_TIMEOUT
-            elif key in ("\x1b[A", "w", "W"):
-                hold_dir_m2 = 1.0
-                hold_until_m2 = now + KEY_HOLD_TIMEOUT
-            elif key in ("\x1b[B", "s", "S"):
-                hold_dir_m2 = -1.0
-                hold_until_m2 = now + KEY_HOLD_TIMEOUT
-            elif key == " ":
-                motor_1.stop_smooth()
-                motor_2.stop_smooth()
-                hold_dir_m1 = 0.0
-                hold_dir_m2 = 0.0
-                hold_until_m1 = 0.0
-                hold_until_m2 = 0.0
-            elif key in ("e", "E"):
-                motor_1.emergency_stop("Emergency stop keyboard")
-                motor_2.emergency_stop("Emergency stop keyboard")
-                hold_dir_m1 = 0.0
-                hold_dir_m2 = 0.0
-                hold_until_m1 = 0.0
-                hold_until_m2 = 0.0
-            elif key in ("r", "R"):
-                motor_1.reset_fault()
-                motor_2.reset_fault()
-            elif key == "+":
-                command_speed = min(cfg_m1.max_speed_sps, command_speed + 100.0)
-            elif key == "-":
-                command_speed = max(50.0, command_speed - 100.0)
-            elif key == "1":
-                motor_1.set_microstep(1)
-                motor_2.set_microstep(1)
-            elif key == "2":
-                motor_1.set_microstep(2)
-                motor_2.set_microstep(2)
-            elif key == "3":
-                motor_1.set_microstep(4)
-                motor_2.set_microstep(4)
-            elif key == "4":
-                motor_1.set_microstep(8)
-                motor_2.set_microstep(8)
-            elif key == "5":
-                motor_1.set_microstep(16)
-                motor_2.set_microstep(16)
-            elif key in ("q", "Q"):
-                break
+        motor_az, motor_el = build_default_motors()
 
-            if now <= hold_until_m1 and hold_dir_m1 != 0.0:
-                motor_1.set_target_speed(hold_dir_m1 * abs(command_speed))
-            else:
-                motor_1.stop_smooth()
+        # Separate WT901 device addresses for AZ and EL axis.
+        wt_az = WT901AxisReader(label="AZ", addr=0x50, az_offset_deg=0.0, el_offset_deg=0.0)
+        wt_el = WT901AxisReader(label="EL", addr=0x51, az_offset_deg=0.0, el_offset_deg=0.0)
 
-            if now <= hold_until_m2 and hold_dir_m2 != 0.0:
-                motor_2.set_target_speed(hold_dir_m2 * abs(command_speed))
-            else:
-                motor_2.stop_smooth()
+        wt_az.open()
+        wt_el.open()
+        logger.info("WT901 connected for AZ and EL.")
 
-            if now - last_report >= INTERVAL:
-                st1 = motor_1.get_status()
-                st2 = motor_2.get_status()
-                moving = abs(st1["current_speed_sps"]) > 1e-3 or abs(st2["current_speed_sps"]) > 1e-3
-                if moving and device is not None:
-                    data = baca_sudut(device)
-                    if data[0] is not None:
-                        roll, pitch, yaw, comp, az, src = data
-                        now_text = time.strftime("%H:%M:%S")
-                        print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>10}".format(
-                            now_text,
-                            roll,
-                            pitch,
-                            yaw,
-                            f"{comp:.2f}" if comp is not None else "-",
-                            az,
-                            src,
-                        ))
-                last_report = now
+        # Calibration routine replicated from fix-compas.py flow.
+        wt_az.reset_zero_point()
+        wt_el.reset_zero_point()
+
+        controller = ClosedLoopAzElController(
+            motor_az=motor_az,
+            motor_el=motor_el,
+            wt_az=wt_az,
+            wt_el=wt_el,
+            logger=logger,
+        )
+        ok = validate_target_move(controller, logger)
+        if not ok:
+            logger.error("Validation FAILED.")
+            sys.exit(2)
+
+        logger.info("Validation completed successfully.")
+        sys.exit(0)
     except KeyboardInterrupt:
-        pass
+        logger.warning("Interrupted by user.")
+        sys.exit(130)
     except Exception as exc:
-        print(f"\nERROR runtime: {exc}")
+        logger.exception("Runtime error: %s", exc)
+        sys.exit(1)
     finally:
-        print("\nShutdown controller...")
-        motor_1.close()
-        motor_2.close()
-        if device is not None:
-            try:
-                device.closeDevice()
-            except Exception:
-                pass
+        logger.info("Shutting down...")
+        if motor_az is not None:
+            motor_az.close()
+        if motor_el is not None:
+            motor_el.close()
+        if wt_az is not None:
+            wt_az.close()
+        if wt_el is not None:
+            wt_el.close()
         GPIO.cleanup()
-        print("GPIO cleaned up.")
+        logger.info("GPIO cleanup done.")
 
 
 if __name__ == "__main__":
