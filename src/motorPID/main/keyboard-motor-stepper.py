@@ -488,22 +488,22 @@ class WT901AxisReader:
                 roll = self.device.get("AngleX")
                 pitch = self.device.get("AngleY")
                 yaw = self.device.get("AngleZ")
-                acc_x = self.device.get("accX")
-                acc_y = self.device.get("accY")
-                acc_z = self.device.get("accZ")
-                mag_x = self.device.get("magX")
-                mag_y = self.device.get("magY")
-                mag_z = self.device.get("magZ")
+                accX = self.device.get("accX")
+                accY = self.device.get("accY")
+                accZ = self.device.get("accZ")
+                magX = self.device.get("magX")
+                magY = self.device.get("magY")
+                magZ = self.device.get("magZ")
             else:
                 roll = self.device.getDeviceData("angleX")
                 pitch = self.device.getDeviceData("angleY")
                 yaw = self.device.getDeviceData("angleZ")
-                acc_x = self.device.getDeviceData("accX")
-                acc_y = self.device.getDeviceData("accY")
-                acc_z = self.device.getDeviceData("accZ")
-                mag_x = self.device.getDeviceData("magX")
-                mag_y = self.device.getDeviceData("magY")
-                mag_z = self.device.getDeviceData("magZ")
+                accX = self.device.getDeviceData("accX")
+                accY = self.device.getDeviceData("accY")
+                accZ = self.device.getDeviceData("accZ")
+                magX = self.device.getDeviceData("magX")
+                magY = self.device.getDeviceData("magY")
+                magZ = self.device.getDeviceData("magZ")
 
             if None in (roll, pitch, yaw):
                 return None
@@ -512,13 +512,13 @@ class WT901AxisReader:
             pitch = float(pitch)
             yaw = float(yaw) % 360.0
 
-            # Tilt from ACC (same as fix-compas.py)
+            # TILT dari ACC (samakan dengan fix-compas.py)
             roll_tilt = roll
             pitch_tilt = pitch
-            if None not in (acc_x, acc_y, acc_z):
-                ax = float(acc_x)
-                ay = float(acc_y)
-                az = float(acc_z)
+            if None not in (accX, accY, accZ):
+                ax = float(accX)
+                ay = float(accY)
+                az = float(accZ)
 
                 if abs(ay) + abs(az) > 1e-6:
                     roll_tilt = math.degrees(math.atan2(ay, az))
@@ -527,11 +527,11 @@ class WT901AxisReader:
                     pitch_tilt = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
 
             compass = None
-            if None not in (mag_x, mag_y, mag_z):
+            if None not in (magX, magY, magZ):
                 compass = self._tilt_compass(
-                    float(mag_x),
-                    float(mag_y),
-                    float(mag_z),
+                    float(magX),
+                    float(magY),
+                    float(magZ),
                     roll_tilt,
                     pitch_tilt,
                 )
@@ -554,8 +554,8 @@ class WT901AxisReader:
             az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
 
-            # EL from roll (requested): match fix-compas observation where roll tracks elevation.
-            el = roll_tilt + self.el_offset_deg
+            # EL pakai ROLL (sesuai request user), AZ tetap pakai tilt-compensation fix-compas.
+            el = roll + self.el_offset_deg
             el = max(0.0, min(180.0, el))
 
             return {
