@@ -61,7 +61,6 @@ TARGET_AZ_DEG = 20.0
 TARGET_EL_DEG = 94.0
 KNOWN_START_AZ_DEG = 0.0
 KNOWN_START_EL_DEG = 90.0
-EL_ZERO_REF_DEG = 90.0
 POSITION_TOL_DEG = 0.5
 CONTROL_INTERVAL_S = 0.05
 CONTROL_TIMEOUT_S = 120.0
@@ -547,8 +546,8 @@ class WT901AxisReader:
             az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
 
-            # EL mapping: pitch_tilt (-90..+90) -> elevation (0..180), where level is ~90 deg.
-            el = pitch_tilt + self.el_offset_deg + EL_ZERO_REF_DEG
+            # EL from roll (requested): match fix-compas observation where roll tracks elevation.
+            el = roll_tilt + self.el_offset_deg
             el = max(0.0, min(180.0, el))
 
             return {
@@ -556,6 +555,7 @@ class WT901AxisReader:
                 "pitch": pitch,
                 "roll_tilt": roll_tilt,
                 "pitch_tilt": pitch_tilt,
+                "el_roll": el,
                 "yaw_cw": yaw_cw,
                 "compass_cw": compass_cw,
                 "az": az,
@@ -644,11 +644,11 @@ class ClosedLoopAzElController:
             target_el_deg,
         )
         self.logger.info(
-            "START raw | az_src=%s az_yaw=%.3f az_compass=%s el_pitch_tilt=%.3f",
+            "START raw | az_src=%s az_yaw=%.3f az_compass=%s el_roll=%.3f",
             start_az_raw["src"],
             start_az_raw["yaw_cw"],
             "-" if start_az_raw["compass_cw"] is None else f"{start_az_raw['compass_cw']:.3f}",
-            start_el_raw["pitch_tilt"],
+            start_el_raw["el_roll"],
         )
 
         stable_hits = 0
