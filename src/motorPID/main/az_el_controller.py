@@ -1354,7 +1354,7 @@ def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
         en_pin=22,    # EN+
         steps_per_rev=200,
         microstep=8,
-        max_speed_sps=2200.0,
+        max_speed_sps=1500.0,
         accel_sps2=3000.0,
         soft_limit_min_deg=None,
         soft_limit_max_deg=None,
