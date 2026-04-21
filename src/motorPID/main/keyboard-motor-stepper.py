@@ -107,6 +107,8 @@ class StepperConfig:
     # Soft-limit in degree (optional, None untuk nonaktif)
     soft_limit_min_deg: float | None = 0.0
     soft_limit_max_deg: float | None = 360.0
+    # AZ biasanya circular (0-360 wrap), jadi soft-limit linear bisa dinonaktifkan.
+    circular_axis: bool = False
 
 
 class TB6600Stepper:
@@ -272,6 +274,8 @@ class TB6600Stepper:
         return self._is_active(self._safe_input(self.cfg.limit_min_pin), self.cfg.limit_active_low)
 
     def _soft_limit_reached(self, next_deg: float) -> bool:
+        if self.cfg.circular_axis:
+            return False
         mn = self.cfg.soft_limit_min_deg
         mx = self.cfg.soft_limit_max_deg
         if mn is not None and next_deg < mn:
@@ -756,8 +760,9 @@ def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
         microstep=8,
         max_speed_sps=2200.0,
         accel_sps2=3000.0,
-        soft_limit_min_deg=0.0,
-        soft_limit_max_deg=360.0,
+        soft_limit_min_deg=None,
+        soft_limit_max_deg=None,
+        circular_axis=True,
     )
     # Motor 2 (EL)
     cfg_m2 = StepperConfig(
