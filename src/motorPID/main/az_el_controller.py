@@ -60,7 +60,7 @@ except Exception as exc:
 # GLOBAL TARGETS / LIMITS
 # =============================
 DEFAULT_TARGET_AZ_DEG = 20.0
-DEFAULT_TARGET_EL_DEG = 94.0
+DEFAULT_TARGET_EL_DEG = 70.0
 POSITION_TOL_DEG = 0.5
 CONTROL_INTERVAL_S = 0.05
 CONTROL_TIMEOUT_S = 120.0
@@ -68,6 +68,10 @@ CONTROL_KP_AZ = 18.0
 CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 80.0
 CONTROL_MAX_SPS_EL = 300.0
+AZ_SOFT_LIMIT_DEG = 280.0
+EL_MIN_DEG = 0.0
+EL_MAX_DEG = 90.0
+TRACKING_EPS_DEG = 0.1
 LOG_FILE = os.path.join(BASE_DIR, "az_el_closed_loop.log")
 ROTCTL_DEFAULT_HOST = "127.0.0.1"
 ROTCTL_DEFAULT_PORT = 4533
@@ -390,7 +394,137 @@ def map_roll_to_el(roll_deg: float, el_offset_deg: float = 0.0) -> float:
     - roll ~= 180 -> EL = 90 (up)
     """
     el = (float(roll_deg) - 90.0) + float(el_offset_deg)
-    return max(0.0, min(180.0, el))
+    return max(EL_MIN_DEG, min(EL_MAX_DEG, el))
+
+
+class AZLimitSwitch:
+    """Logika limit switch software AZ dengan batas crossing di sudut tertentu."""
+
+    def __init__(self, limit_deg: float = AZ_SOFT_LIMIT_DEG):
+        self.limit_deg = float(limit_deg) % 360.0
+
+    @staticmethod
+    def _norm360(deg: float) -> float:
+        return float(deg) % 360.0
+
+    def _crosses_limit(self, current_deg: float, target_deg: float, direction: int) -> bool:
+        """Cek apakah lintasan CW/CCW menyeberang titik limit AZ."""
+        c = self._norm360(current_deg)
+        t = self._norm360(target_deg)
+        b = self.limit_deg
+        if direction > 0:
+            t_u = t if t >= c else t + 360.0
+            b_u = b if b >= c else b + 360.0
+            return c < b_u <= t_u
+        t_u = t if t <= c else t - 360.0
+        b_u = b if b <= c else b - 360.0
+        return t_u <= b_u < c
+
+    def detectMovementDirection(self, prev_deg: float, curr_deg: float, eps_deg: float = TRACKING_EPS_DEG) -> int:
+        """Deteksi arah gerak saat ini: +1 (CW), -1 (CCW), 0 (diam)."""
+        d = angle_diff(curr_deg, prev_deg)
+        if abs(d) <= eps_deg:
+            return 0
+        return 1 if d > 0 else -1
+
+    def calculateShortestPath(self, current_deg: float, target_deg: float) -> dict:
+        """
+        Hitung lintasan AZ terbaik dengan mempertimbangkan batas 280°.
+        Return direction + distance + status boleh/tidak.
+        """
+        c = self._norm360(current_deg)
+        t = self._norm360(target_deg)
+        cw_dist = (t - c) % 360.0
+        ccw_dist = (c - t) % 360.0
+        cw_cross = self._crosses_limit(c, t, +1)
+        ccw_cross = self._crosses_limit(c, t, -1)
+
+        options = []
+        if not cw_cross:
+            options.append((cw_dist, +1))
+        if not ccw_cross:
+            options.append((ccw_dist, -1))
+        options.sort(key=lambda item: item[0])
+        if options:
+            dist, direction = options[0]
+            return {
+                "allowed": True,
+                "direction": direction,
+                "distance_deg": dist,
+                "cw_distance_deg": cw_dist,
+                "ccw_distance_deg": ccw_dist,
+                "cw_cross_limit": cw_cross,
+                "ccw_cross_limit": ccw_cross,
+                "reason": "shortest_allowed_path",
+            }
+        return {
+            "allowed": False,
+            "direction": 0,
+            "distance_deg": 0.0,
+            "cw_distance_deg": cw_dist,
+            "ccw_distance_deg": ccw_dist,
+            "cw_cross_limit": cw_cross,
+            "ccw_cross_limit": ccw_cross,
+            "reason": "both_paths_cross_limit",
+        }
+
+    @staticmethod
+    def reverseDirection(current_direction: int) -> int:
+        """Paksa arah berlawanan saat mencapai batas."""
+        if current_direction > 0:
+            return -1
+        if current_direction < 0:
+            return 1
+        return 0
+
+    def validateMovement(self, current_deg: float, target_deg: float, current_direction: int = 0) -> dict:
+        """
+        Validasi request gerak AZ:
+        - tentukan lintasan terpendek yang diperbolehkan
+        - jika arah aktif menabrak limit, paksa reverse
+        """
+        decision = self.calculateShortestPath(current_deg, target_deg)
+        if decision["allowed"]:
+            decision["reverse_required"] = bool(
+                current_direction != 0 and decision["direction"] != current_direction
+            )
+            return decision
+        reverse_dir = self.reverseDirection(current_direction)
+        decision["reverse_required"] = reverse_dir != 0
+        decision["forced_direction"] = reverse_dir
+        return decision
+
+
+class ELLimitSwitch:
+    """Validasi software limit switch EL dalam rentang 0..90 derajat."""
+
+    def __init__(self, min_deg: float = EL_MIN_DEG, max_deg: float = EL_MAX_DEG):
+        self.min_deg = float(min_deg)
+        self.max_deg = float(max_deg)
+
+    def validateElevation(self, target_el_deg: float, current_el_deg: float | None = None) -> dict:
+        """
+        Validasi command EL sebelum dieksekusi.
+        - target harus di [0, 90]
+        - soft stop jika posisi sudah di batas dan command mendorong keluar batas
+        """
+        target = float(target_el_deg)
+        if target < self.min_deg or target > self.max_deg:
+            return {
+                "allowed": False,
+                "clamped_target_deg": max(self.min_deg, min(self.max_deg, target)),
+                "reason": "target_out_of_range",
+            }
+
+        if current_el_deg is None:
+            return {"allowed": True, "clamped_target_deg": target, "reason": "ok"}
+
+        curr = float(current_el_deg)
+        if curr <= self.min_deg + TRACKING_EPS_DEG and target < curr:
+            return {"allowed": False, "clamped_target_deg": self.min_deg, "reason": "soft_stop_lower"}
+        if curr >= self.max_deg - TRACKING_EPS_DEG and target > curr:
+            return {"allowed": False, "clamped_target_deg": self.max_deg, "reason": "soft_stop_upper"}
+        return {"allowed": True, "clamped_target_deg": target, "reason": "ok"}
 
 
 class WT901AxisReader:
@@ -629,6 +763,9 @@ class ClosedLoopAzElController:
         self.wt = wt
         self.logger = logger
         self.corrections: list[dict] = []
+        self.az_limit = AZLimitSwitch(AZ_SOFT_LIMIT_DEG)
+        self.el_limit = ELLimitSwitch(EL_MIN_DEG, EL_MAX_DEG)
+        self._last_cmd_az_dir = 0
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -706,8 +843,24 @@ class ClosedLoopAzElController:
             self.motor_az.set_position_deg(curr_az)
             self.motor_el.set_position_deg(curr_el)
 
-            err_az = angle_diff(target_az_deg, curr_az)
-            err_el = target_el_deg - curr_el
+            az_decision = self.az_limit.validateMovement(curr_az, target_az_deg, self._last_cmd_az_dir)
+            el_decision = self.el_limit.validateElevation(target_el_deg, curr_el)
+            effective_target_el = float(el_decision["clamped_target_deg"])
+
+            if not az_decision["allowed"] and az_decision.get("forced_direction", 0) == 0:
+                self.logger.error("AZ movement blocked by software limit: %s", az_decision["reason"])
+                self.motor_az.stop_smooth()
+                self.motor_el.stop_smooth()
+                break
+
+            if az_decision["allowed"]:
+                az_dir = int(az_decision["direction"])
+                err_az = float(az_decision["distance_deg"]) * float(az_dir)
+            else:
+                az_dir = int(az_decision.get("forced_direction", 0))
+                err_az = float(az_dir) * 5.0
+
+            err_el = effective_target_el - curr_el
 
             in_tol = abs(err_az) <= tolerance_deg and abs(err_el) <= tolerance_deg
             if in_tol:
@@ -718,8 +871,12 @@ class ClosedLoopAzElController:
                 stable_hits = 0
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
+                if not el_decision["allowed"]:
+                    cmd_el = 0.0
+                    self.logger.warning("EL limited by software stop: %s", el_decision["reason"])
                 self.motor_az.set_target_speed(cmd_az)
                 self.motor_el.set_target_speed(cmd_el)
+                self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
 
                 corr = {
                     "t": round(time.time() - t0, 3),
@@ -727,6 +884,9 @@ class ClosedLoopAzElController:
                     "curr_el": round(curr_el, 3),
                     "err_az": round(err_az, 3),
                     "err_el": round(err_el, 3),
+                    "az_dir": az_dir,
+                    "az_reason": az_decision["reason"],
+                    "el_reason": el_decision["reason"],
                     "cmd_az_sps": round(cmd_az, 3),
                     "cmd_el_sps": round(cmd_el, 3),
                 }
@@ -794,6 +954,9 @@ class RealtimeAzElController:
         self._curr_az = 0.0
         self._curr_el = 0.0
         self._has_position = False
+        self._last_cmd_az_dir = 0
+        self.az_limit = AZLimitSwitch(AZ_SOFT_LIMIT_DEG)
+        self.el_limit = ELLimitSwitch(EL_MIN_DEG, EL_MAX_DEG)
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -834,11 +997,15 @@ class RealtimeAzElController:
         self.motor_az.stop_smooth()
         self.motor_el.stop_smooth()
 
-    def set_target(self, az_deg: float, el_deg: float):
+    def set_target(self, az_deg: float, el_deg: float) -> tuple[bool, str]:
+        el_decision = self.el_limit.validateElevation(float(el_deg), self._curr_el)
+        if not el_decision["allowed"] and el_decision["reason"] == "target_out_of_range":
+            return False, "target_el_out_of_range"
         with self._lock:
             self._target_az = float(az_deg) % 360.0
-            self._target_el = max(0.0, min(180.0, float(el_deg)))
+            self._target_el = float(el_decision["clamped_target_deg"])
         self.logger.info("Target updated | az=%.2f el=%.2f", self._target_az, self._target_el)
+        return True, "ok"
 
     def stop_motion(self):
         with self._lock:
@@ -892,8 +1059,25 @@ class RealtimeAzElController:
             self.motor_az.set_position_deg(curr_az)
             self.motor_el.set_position_deg(curr_el)
 
-            err_az = angle_diff(target_az, curr_az)
-            err_el = target_el - curr_el
+            az_decision = self.az_limit.validateMovement(curr_az, target_az, self._last_cmd_az_dir)
+            el_decision = self.el_limit.validateElevation(target_el, curr_el)
+            effective_target_el = float(el_decision["clamped_target_deg"])
+
+            if not az_decision["allowed"] and az_decision.get("forced_direction", 0) == 0:
+                self.motor_az.stop_smooth()
+                self.motor_el.stop_smooth()
+                self.logger.error("AZ blocked in realtime loop: %s", az_decision["reason"])
+                time.sleep(CONTROL_INTERVAL_S)
+                continue
+
+            if az_decision["allowed"]:
+                az_dir = int(az_decision["direction"])
+                err_az = float(az_decision["distance_deg"]) * float(az_dir)
+            else:
+                az_dir = int(az_decision.get("forced_direction", 0))
+                err_az = float(az_dir) * 5.0
+
+            err_el = effective_target_el - curr_el
             in_tol = abs(err_az) <= POSITION_TOL_DEG and abs(err_el) <= POSITION_TOL_DEG
             if in_tol:
                 self.motor_az.stop_smooth()
@@ -901,8 +1085,12 @@ class RealtimeAzElController:
             else:
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
+                if not el_decision["allowed"]:
+                    cmd_el = 0.0
+                    self.logger.warning("EL limited in realtime loop: %s", el_decision["reason"])
                 self.motor_az.set_target_speed(cmd_az)
                 self.motor_el.set_target_speed(cmd_el)
+                self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
 
             now = time.time()
             if now - last_log_t >= 1.0:
@@ -912,7 +1100,7 @@ class RealtimeAzElController:
                     curr_az,
                     curr_el,
                     target_az,
-                    target_el,
+                    effective_target_el,
                     err_az,
                     err_el,
                 )
@@ -999,10 +1187,13 @@ class RotctlServer:
                 return "RPRT -1\n", False
             try:
                 az = float(parts[1]) % 360.0
-                el = max(0.0, min(180.0, float(parts[2])))
+                el = float(parts[2])
             except ValueError:
                 return "RPRT -1\n", False
-            self.controller.set_target(az, el)
+            ok, reason = self.controller.set_target(az, el)
+            if not ok:
+                self.logger.warning("Reject set_pos az=%.2f el=%.2f: %s", az, el, reason)
+                return "RPRT -1\n", False
             return "RPRT 0\n", False
 
         if cmd in ("S", "\\stop"):
@@ -1041,8 +1232,8 @@ def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
         microstep=8,
         max_speed_sps=2200.0,
         accel_sps2=3000.0,
-        soft_limit_min_deg=0.0,
-        soft_limit_max_deg=180.0,
+        soft_limit_min_deg=EL_MIN_DEG,
+        soft_limit_max_deg=EL_MAX_DEG,
     )
     return TB6600Stepper(cfg_m1), TB6600Stepper(cfg_m2)
 
@@ -1111,7 +1302,7 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     target_az_deg = float(args.az) % 360.0
-    target_el_deg = max(0.0, min(180.0, float(args.el)))
+    target_el_deg = max(EL_MIN_DEG, min(EL_MAX_DEG, float(args.el)))
 
     logger = setup_logger()
     logger.info("=== AZ/EL CLOSED-LOOP CONTROL START ===")
