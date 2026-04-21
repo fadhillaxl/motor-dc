@@ -551,6 +551,15 @@ class WT901AxisReader:
             print(f"[ERR][{self.label}] {exc}")
             return None
 
+    def read_with_retry(self, attempts: int = 30, delay_s: float = 0.05) -> dict | None:
+        """Retry wrapper for unstable serial startup/first reads."""
+        for _ in range(max(1, int(attempts))):
+            pkt = self.read()
+            if pkt is not None:
+                return pkt
+            time.sleep(max(0.0, float(delay_s)))
+        return None
+
 
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("az_el_closed_loop")
@@ -576,14 +585,12 @@ class ClosedLoopAzElController:
         self,
         motor_az: TB6600Stepper,
         motor_el: TB6600Stepper,
-        wt_az: WT901AxisReader,
-        wt_el: WT901AxisReader,
+        wt: WT901AxisReader,
         logger: logging.Logger,
     ):
         self.motor_az = motor_az
         self.motor_el = motor_el
-        self.wt_az = wt_az
-        self.wt_el = wt_el
+        self.wt = wt
         self.logger = logger
         self.corrections: list[dict] = []
 
@@ -595,11 +602,11 @@ class ClosedLoopAzElController:
         return max(-max_sps, min(max_sps, cmd))
 
     def _read_azel(self) -> tuple[float, float, dict, dict] | None:
-        az_data = self.wt_az.read()
-        el_data = self.wt_el.read()
-        if az_data is None or el_data is None:
+        # Use one WT901 packet for both AZ and EL to avoid multi-access on serial port.
+        data = self.wt.read_with_retry(attempts=8, delay_s=0.03)
+        if data is None:
             return None
-        return az_data["az"], el_data["el"], az_data, el_data
+        return data["az"], data["el"], data, data
 
     def drive_to_target(
         self,
@@ -794,29 +801,23 @@ def main():
 
     motor_az = None
     motor_el = None
-    wt_az = None
-    wt_el = None
+    wt = None
 
     try:
         motor_az, motor_el = build_default_motors()
 
-        # Separate WT901 device addresses for AZ and EL axis.
-        wt_az = WT901AxisReader(label="AZ", addr=0x50, az_offset_deg=0.0, el_offset_deg=0.0)
-        wt_el = WT901AxisReader(label="EL", addr=0x51, az_offset_deg=0.0, el_offset_deg=0.0)
-
-        wt_az.open()
-        wt_el.open()
-        logger.info("WT901 connected for AZ and EL.")
+        # Single WT901 reader for both AZ and EL from one sensor packet.
+        wt = WT901AxisReader(label="AZEL", addr=0x50, az_offset_deg=0.0, el_offset_deg=0.0)
+        wt.open()
+        logger.info("WT901 connected.")
 
         # Calibration routine replicated from fix-compas.py flow.
-        wt_az.reset_zero_point()
-        wt_el.reset_zero_point()
+        wt.reset_zero_point()
 
         controller = ClosedLoopAzElController(
             motor_az=motor_az,
             motor_el=motor_el,
-            wt_az=wt_az,
-            wt_el=wt_el,
+            wt=wt,
             logger=logger,
         )
         ok = validate_target_move(controller, logger)
@@ -838,11 +839,12 @@ def main():
             motor_az.close()
         if motor_el is not None:
             motor_el.close()
-        if wt_az is not None:
-            wt_az.close()
-        if wt_el is not None:
-            wt_el.close()
-        GPIO.cleanup()
+        if wt is not None:
+            wt.close()
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
         logger.info("GPIO cleanup done.")
 
 
