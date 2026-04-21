@@ -153,5 +153,37 @@ class TestELLimitSwitch(unittest.TestCase):
             self.assertEqual(lower["reason"], "soft_stop_lower")
 
 
+class TestLimitRecoveryManager(unittest.TestCase):
+    def test_az_recovery_generates_escape_direction(self):
+        for mod in MODULES_UNDER_TEST:
+            events = []
+
+            def notifier(event, message, payload):
+                events.append((event, message, payload))
+
+            azls = mod.AZLimitSwitch(280.0)
+            ells = mod.ELLimitSwitch(0.0, 90.0)
+            logger = azel_mod.logging.getLogger("test-recovery")
+            mgr = mod.LimitRecoveryManager(azls, ells, logger, notifier=notifier)
+            decision = {"allowed": False, "reason": "both_paths_cross_limit", "forced_direction": 0}
+            rec = mgr.recover_az(280.0, 350.0, 0, decision)
+            self.assertTrue(rec["recovered"])
+            self.assertIn(rec["az_dir"], (-1, 1))
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0][0], "AZ_RECOVERY")
+
+    def test_el_recovery_clamps_and_blocks_motion(self):
+        for mod in MODULES_UNDER_TEST:
+            azls = mod.AZLimitSwitch(280.0)
+            ells = mod.ELLimitSwitch(0.0, 90.0)
+            logger = azel_mod.logging.getLogger("test-recovery-el")
+            mgr = mod.LimitRecoveryManager(azls, ells, logger)
+            decision = ells.validateElevation(95.0, current_el_deg=89.8)
+            rec = mgr.recover_el(95.0, 89.8, decision)
+            self.assertTrue(rec["recovered"])
+            self.assertFalse(rec["allow_motion"])
+            self.assertEqual(rec["target_el"], 90.0)
+
+
 if __name__ == "__main__":
     unittest.main()

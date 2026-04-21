@@ -527,6 +527,130 @@ class ELLimitSwitch:
         return {"allowed": True, "clamped_target_deg": target, "reason": "ok"}
 
 
+class LimitRecoveryManager:
+    """
+    Manajer recovery limit:
+    - Tidak langsung menghentikan task saat limit tercapai
+    - Menentukan strategi koreksi (reverse escape, re-route, clamp target)
+    - Menyesuaikan parameter (speed scale) saat limit berulang
+    - Menyediakan notifikasi untuk monitoring
+    """
+
+    def __init__(
+        self,
+        az_limit: AZLimitSwitch,
+        el_limit: ELLimitSwitch,
+        logger: logging.Logger,
+        notifier=None,
+    ):
+        self.az_limit = az_limit
+        self.el_limit = el_limit
+        self.logger = logger
+        self.notifier = notifier
+        self.az_limit_hits = 0
+        self.el_limit_hits = 0
+        self.az_recovery_target = None
+
+    def _notify(self, event: str, message: str, payload: dict):
+        self.logger.warning("[LIMIT:%s] %s | %s", event, message, json.dumps(payload, separators=(",", ":")))
+        if callable(self.notifier):
+            try:
+                self.notifier(event, message, payload)
+            except Exception as exc:
+                self.logger.warning("Notifier failed: %s", exc)
+
+    def on_cycle_ok(self):
+        self.az_limit_hits = max(0, self.az_limit_hits - 1)
+        self.el_limit_hits = max(0, self.el_limit_hits - 1)
+        if self.az_limit_hits == 0:
+            self.az_recovery_target = None
+
+    def az_speed_scale(self) -> float:
+        # Adaptive speed downscale saat limit berulang.
+        if self.az_limit_hits >= 6:
+            return 0.4
+        if self.az_limit_hits >= 3:
+            return 0.6
+        return 1.0
+
+    def recover_az(self, current_az: float, target_az: float, current_direction: int, az_decision: dict) -> dict:
+        """
+        Recovery AZ saat movement tidak valid:
+        - Jika forced_direction tersedia -> gunakan
+        - Jika tidak, pilih arah escape dari posisi saat ini
+        - Set temporary recovery target agar sistem keluar dari zona kritis
+        """
+        if az_decision["allowed"]:
+            return {
+                "recovered": False,
+                "target_az": target_az,
+                "az_dir": int(az_decision["direction"]),
+                "err_az": float(az_decision["distance_deg"]) * float(az_decision["direction"]),
+                "reason": az_decision["reason"],
+            }
+
+        forced_dir = int(az_decision.get("forced_direction", 0))
+        if forced_dir == 0:
+            # fallback heuristic: tentukan arah berdasarkan posisi terhadap boundary.
+            rel = (float(current_az) - self.az_limit.limit_deg + 360.0) % 360.0
+            forced_dir = 1 if rel < 180.0 else -1
+            if current_direction != 0:
+                forced_dir = AZLimitSwitch.reverseDirection(current_direction)
+
+        recovery_target = (float(current_az) + (forced_dir * 8.0)) % 360.0
+        self.az_recovery_target = recovery_target
+        self.az_limit_hits += 1
+
+        payload = {
+            "current_az": round(float(current_az), 3),
+            "requested_target_az": round(float(target_az), 3),
+            "recovery_target_az": round(float(recovery_target), 3),
+            "forced_direction": forced_dir,
+            "hit_count": self.az_limit_hits,
+            "reason": az_decision.get("reason", "unknown"),
+        }
+        self._notify("AZ_RECOVERY", "AZ limit tercapai, alihkan ke jalur alternatif.", payload)
+
+        return {
+            "recovered": True,
+            "target_az": recovery_target,
+            "az_dir": forced_dir,
+            "err_az": float(forced_dir) * 8.0,
+            "reason": "recovery_reverse_escape",
+        }
+
+    def recover_el(self, target_el: float, current_el: float, el_decision: dict) -> dict:
+        """
+        Recovery EL:
+        - Clamp target ke range 0..90
+        - Soft-stop command jika mendorong keluar batas
+        """
+        effective_target = float(el_decision["clamped_target_deg"])
+        if el_decision["allowed"]:
+            return {
+                "recovered": False,
+                "target_el": effective_target,
+                "allow_motion": True,
+                "reason": "ok",
+            }
+
+        self.el_limit_hits += 1
+        payload = {
+            "current_el": round(float(current_el), 3),
+            "requested_target_el": round(float(target_el), 3),
+            "effective_target_el": round(effective_target, 3),
+            "hit_count": self.el_limit_hits,
+            "reason": el_decision.get("reason", "unknown"),
+        }
+        self._notify("EL_RECOVERY", "EL limit aktif, lakukan soft-stop / clamp target.", payload)
+        return {
+            "recovered": True,
+            "target_el": effective_target,
+            "allow_motion": False,
+            "reason": el_decision.get("reason", "unknown"),
+        }
+
+
 class WT901AxisReader:
     """WT901 reader that mirrors the acquisition flow from fix-compas.py."""
 
@@ -757,6 +881,7 @@ class ClosedLoopAzElController:
         motor_el: TB6600Stepper,
         wt: WT901AxisReader,
         logger: logging.Logger,
+        notifier=None,
     ):
         self.motor_az = motor_az
         self.motor_el = motor_el
@@ -765,6 +890,7 @@ class ClosedLoopAzElController:
         self.corrections: list[dict] = []
         self.az_limit = AZLimitSwitch(AZ_SOFT_LIMIT_DEG)
         self.el_limit = ELLimitSwitch(EL_MIN_DEG, EL_MAX_DEG)
+        self.recovery = LimitRecoveryManager(self.az_limit, self.el_limit, logger, notifier=notifier)
         self._last_cmd_az_dir = 0
 
     @staticmethod
@@ -847,33 +973,26 @@ class ClosedLoopAzElController:
             el_decision = self.el_limit.validateElevation(target_el_deg, curr_el)
             effective_target_el = float(el_decision["clamped_target_deg"])
 
-            if not az_decision["allowed"] and az_decision.get("forced_direction", 0) == 0:
-                self.logger.error("AZ movement blocked by software limit: %s", az_decision["reason"])
-                self.motor_az.stop_smooth()
-                self.motor_el.stop_smooth()
-                break
-
-            if az_decision["allowed"]:
-                az_dir = int(az_decision["direction"])
-                err_az = float(az_decision["distance_deg"]) * float(az_dir)
-            else:
-                az_dir = int(az_decision.get("forced_direction", 0))
-                err_az = float(az_dir) * 5.0
-
-            err_el = effective_target_el - curr_el
+            az_recovery = self.recovery.recover_az(curr_az, target_az_deg, self._last_cmd_az_dir, az_decision)
+            el_recovery = self.recovery.recover_el(target_el_deg, curr_el, el_decision)
+            az_dir = int(az_recovery["az_dir"])
+            err_az = float(az_recovery["err_az"])
+            err_el = float(el_recovery["target_el"]) - curr_el
 
             in_tol = abs(err_az) <= tolerance_deg and abs(err_el) <= tolerance_deg
             if in_tol:
                 stable_hits += 1
                 self.motor_az.stop_smooth()
                 self.motor_el.stop_smooth()
+                self.recovery.on_cycle_ok()
             else:
                 stable_hits = 0
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
+                cmd_az *= self.recovery.az_speed_scale()
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
-                if not el_decision["allowed"]:
+                if not el_recovery["allow_motion"]:
                     cmd_el = 0.0
-                    self.logger.warning("EL limited by software stop: %s", el_decision["reason"])
+                    self.logger.warning("EL limited by software stop: %s", el_recovery["reason"])
                 self.motor_az.set_target_speed(cmd_az)
                 self.motor_el.set_target_speed(cmd_el)
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
@@ -885,8 +1004,8 @@ class ClosedLoopAzElController:
                     "err_az": round(err_az, 3),
                     "err_el": round(err_el, 3),
                     "az_dir": az_dir,
-                    "az_reason": az_decision["reason"],
-                    "el_reason": el_decision["reason"],
+                    "az_reason": az_recovery["reason"],
+                    "el_reason": el_recovery["reason"],
                     "cmd_az_sps": round(cmd_az, 3),
                     "cmd_el_sps": round(cmd_el, 3),
                 }
@@ -939,6 +1058,7 @@ class RealtimeAzElController:
         motor_el: TB6600Stepper,
         wt: WT901AxisReader,
         logger: logging.Logger,
+        notifier=None,
     ):
         self.motor_az = motor_az
         self.motor_el = motor_el
@@ -957,6 +1077,7 @@ class RealtimeAzElController:
         self._last_cmd_az_dir = 0
         self.az_limit = AZLimitSwitch(AZ_SOFT_LIMIT_DEG)
         self.el_limit = ELLimitSwitch(EL_MIN_DEG, EL_MAX_DEG)
+        self.recovery = LimitRecoveryManager(self.az_limit, self.el_limit, logger, notifier=notifier)
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -1061,33 +1182,23 @@ class RealtimeAzElController:
 
             az_decision = self.az_limit.validateMovement(curr_az, target_az, self._last_cmd_az_dir)
             el_decision = self.el_limit.validateElevation(target_el, curr_el)
-            effective_target_el = float(el_decision["clamped_target_deg"])
-
-            if not az_decision["allowed"] and az_decision.get("forced_direction", 0) == 0:
-                self.motor_az.stop_smooth()
-                self.motor_el.stop_smooth()
-                self.logger.error("AZ blocked in realtime loop: %s", az_decision["reason"])
-                time.sleep(CONTROL_INTERVAL_S)
-                continue
-
-            if az_decision["allowed"]:
-                az_dir = int(az_decision["direction"])
-                err_az = float(az_decision["distance_deg"]) * float(az_dir)
-            else:
-                az_dir = int(az_decision.get("forced_direction", 0))
-                err_az = float(az_dir) * 5.0
-
+            az_recovery = self.recovery.recover_az(curr_az, target_az, self._last_cmd_az_dir, az_decision)
+            el_recovery = self.recovery.recover_el(target_el, curr_el, el_decision)
+            err_az = float(az_recovery["err_az"])
+            effective_target_el = float(el_recovery["target_el"])
             err_el = effective_target_el - curr_el
             in_tol = abs(err_az) <= POSITION_TOL_DEG and abs(err_el) <= POSITION_TOL_DEG
             if in_tol:
                 self.motor_az.stop_smooth()
                 self.motor_el.stop_smooth()
+                self.recovery.on_cycle_ok()
             else:
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
+                cmd_az *= self.recovery.az_speed_scale()
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
-                if not el_decision["allowed"]:
+                if not el_recovery["allow_motion"]:
                     cmd_el = 0.0
-                    self.logger.warning("EL limited in realtime loop: %s", el_decision["reason"])
+                    self.logger.warning("EL limited in realtime loop: %s", el_recovery["reason"])
                 self.motor_az.set_target_speed(cmd_az)
                 self.motor_el.set_target_speed(cmd_el)
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
