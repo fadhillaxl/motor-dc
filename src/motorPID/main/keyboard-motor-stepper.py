@@ -61,6 +61,7 @@ TARGET_AZ_DEG = 20.0
 TARGET_EL_DEG = 94.0
 KNOWN_START_AZ_DEG = 0.0
 KNOWN_START_EL_DEG = 90.0
+EL_ZERO_REF_DEG = 90.0
 POSITION_TOL_DEG = 0.5
 CONTROL_INTERVAL_S = 0.05
 CONTROL_TIMEOUT_S = 120.0
@@ -419,7 +420,20 @@ class WT901AxisReader:
 
     def close(self):
         try:
-            self.device.closeDevice()
+            # SDK thread closes cleaner if we drop isOpen before closing the file descriptor.
+            if hasattr(self.device, "isOpen"):
+                self.device.isOpen = False
+            time.sleep(0.1)
+            sp = getattr(self.device, "serialPort", None)
+            if sp is not None:
+                try:
+                    sp.close()
+                except Exception:
+                    pass
+                try:
+                    self.device.serialPort = None
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -533,8 +547,9 @@ class WT901AxisReader:
             az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
 
-            # EL from pitch tilt, with wrap-safe normalization
-            el = (pitch_tilt + self.el_offset_deg) % 360.0
+            # EL mapping: pitch_tilt (-90..+90) -> elevation (0..180), where level is ~90 deg.
+            el = pitch_tilt + self.el_offset_deg + EL_ZERO_REF_DEG
+            el = max(0.0, min(180.0, el))
 
             return {
                 "roll": roll,
