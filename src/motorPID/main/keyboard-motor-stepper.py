@@ -23,6 +23,7 @@ import platform
 import sys
 import threading
 import time
+import argparse
 from dataclasses import dataclass
 
 try:
@@ -57,10 +58,10 @@ except Exception as exc:
 # =============================
 # GLOBAL TARGETS / LIMITS
 # =============================
-TARGET_AZ_DEG = 20.0
-TARGET_EL_DEG = 94.0
-KNOWN_START_AZ_DEG = 0.0
-KNOWN_START_EL_DEG = 90.0
+DEFAULT_TARGET_AZ_DEG = 20.0
+DEFAULT_TARGET_EL_DEG = 94.0
+DEFAULT_KNOWN_START_AZ_DEG = 0.0
+DEFAULT_KNOWN_START_EL_DEG = 90.0
 POSITION_TOL_DEG = 0.5
 CONTROL_INTERVAL_S = 0.05
 CONTROL_TIMEOUT_S = 120.0
@@ -778,16 +779,20 @@ def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
 def validate_target_move(
     controller: ClosedLoopAzElController,
     logger: logging.Logger,
+    target_az_deg: float,
+    target_el_deg: float,
+    known_start_az_deg: float,
+    known_start_el_deg: float,
 ) -> bool:
     logger.info("Validation run start.")
     logger.info(
         "Phase-1 move to known start az=%.2f el=%.2f",
-        KNOWN_START_AZ_DEG,
-        KNOWN_START_EL_DEG,
+        known_start_az_deg,
+        known_start_el_deg,
     )
     ok_start, report_start = controller.drive_to_target(
-        KNOWN_START_AZ_DEG,
-        KNOWN_START_EL_DEG,
+        known_start_az_deg,
+        known_start_el_deg,
         tolerance_deg=1.0,
     )
     if not ok_start:
@@ -796,12 +801,12 @@ def validate_target_move(
 
     logger.info(
         "Phase-2 move to target az=%.2f el=%.2f",
-        TARGET_AZ_DEG,
-        TARGET_EL_DEG,
+        target_az_deg,
+        target_el_deg,
     )
     ok_target, report_target = controller.drive_to_target(
-        TARGET_AZ_DEG,
-        TARGET_EL_DEG,
+        target_az_deg,
+        target_el_deg,
         tolerance_deg=POSITION_TOL_DEG,
     )
     if not ok_target:
@@ -815,9 +820,53 @@ def validate_target_move(
     return True
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Closed-loop AZ/EL target move with WT901 feedback.",
+    )
+    parser.add_argument(
+        "--az",
+        type=float,
+        default=DEFAULT_TARGET_AZ_DEG,
+        help=f"Target azimuth in degree (default: {DEFAULT_TARGET_AZ_DEG}).",
+    )
+    parser.add_argument(
+        "--el",
+        type=float,
+        default=DEFAULT_TARGET_EL_DEG,
+        help=f"Target elevation in degree (default: {DEFAULT_TARGET_EL_DEG}).",
+    )
+    parser.add_argument(
+        "--known-az",
+        type=float,
+        default=DEFAULT_KNOWN_START_AZ_DEG,
+        help=f"Known-start azimuth in degree (default: {DEFAULT_KNOWN_START_AZ_DEG}).",
+    )
+    parser.add_argument(
+        "--known-el",
+        type=float,
+        default=DEFAULT_KNOWN_START_EL_DEG,
+        help=f"Known-start elevation in degree (default: {DEFAULT_KNOWN_START_EL_DEG}).",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    target_az_deg = float(args.az) % 360.0
+    target_el_deg = max(0.0, min(180.0, float(args.el)))
+    known_start_az_deg = float(args.known_az) % 360.0
+    known_start_el_deg = max(0.0, min(180.0, float(args.known_el)))
+
     logger = setup_logger()
     logger.info("=== AZ/EL CLOSED-LOOP CONTROL START ===")
+    logger.info(
+        "Targets | known-start az=%.2f el=%.2f | final az=%.2f el=%.2f",
+        known_start_az_deg,
+        known_start_el_deg,
+        target_az_deg,
+        target_el_deg,
+    )
 
     motor_az = None
     motor_el = None
@@ -852,7 +901,14 @@ def main():
             wt=wt,
             logger=logger,
         )
-        ok = validate_target_move(controller, logger)
+        ok = validate_target_move(
+            controller,
+            logger,
+            target_az_deg=target_az_deg,
+            target_el_deg=target_el_deg,
+            known_start_az_deg=known_start_az_deg,
+            known_start_el_deg=known_start_el_deg,
+        )
         if not ok:
             logger.error("Validation FAILED.")
             sys.exit(2)
