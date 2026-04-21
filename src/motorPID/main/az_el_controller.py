@@ -1306,13 +1306,8 @@ class RotctlServer:
         cmd = parts[0]
         cmd_l = cmd.lower()
 
-        # Hamlib style aliases
-        if cmd_l in ("p", "\\get_pos"):
-            az, el = self.controller.get_position()
-            # Hamlib rotctl expects two-line numeric payload.
-            return f"{az:.6f}\n{el:.6f}\n", False
-
-        if cmd_l in ("p", "\\set_pos") and len(parts) >= 3:
+        # Handle SET first: "P <az> <el>" or "\set_pos <az> <el>"
+        if (cmd == "P" and len(parts) >= 3) or (cmd_l == "\\set_pos" and len(parts) >= 3):
             if len(parts) < 3:
                 return "RPRT -1\n", False
             try:
@@ -1326,6 +1321,12 @@ class RotctlServer:
                 self.logger.warning("Reject set_pos az=%.2f el=%.2f: %s", az, el, reason)
                 return "RPRT -1\n", False
             return "RPRT 0\n", False
+
+        # Hamlib style aliases: GET position
+        if cmd_l in ("p", "\\get_pos"):
+            az, el = self.controller.get_position()
+            # Hamlib rotctl expects two-line numeric payload.
+            return f"{az:.6f}\n{el:.6f}\n", False
 
         if cmd_l in ("s", "\\stop"):
             self.controller.stop_motion()
