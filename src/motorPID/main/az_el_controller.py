@@ -1284,6 +1284,7 @@ class RotctlServer:
                     req = line.decode("utf-8", errors="ignore").strip()
                     if not req:
                         continue
+                    self.logger.info("rotctl RX %s: %s", addr, req)
                     resp, should_close = self._process_command(req)
                     if resp:
                         file_obj.write(resp.encode("utf-8"))
@@ -1296,14 +1297,18 @@ class RotctlServer:
 
     def _process_command(self, req: str) -> tuple[str, bool]:
         parts = req.split()
+        if not parts:
+            return "", False
         cmd = parts[0]
+        cmd_l = cmd.lower()
 
         # Hamlib style aliases
-        if cmd in ("p", "\\get_pos"):
+        if cmd_l in ("p", "\\get_pos"):
             az, el = self.controller.get_position()
-            return f"{az:.2f}\n{el:.2f}\n", False
+            # Hamlib rotctl expects two-line numeric payload.
+            return f"{az:.6f}\n{el:.6f}\n", False
 
-        if cmd in ("P", "\\set_pos"):
+        if cmd_l in ("p", "\\set_pos") and len(parts) >= 3:
             if len(parts) < 3:
                 return "RPRT -1\n", False
             try:
@@ -1317,17 +1322,22 @@ class RotctlServer:
                 return "RPRT -1\n", False
             return "RPRT 0\n", False
 
-        if cmd in ("S", "\\stop"):
+        if cmd_l in ("s", "\\stop"):
             self.controller.stop_motion()
             return "RPRT 0\n", False
 
-        if cmd in ("q", "\\quit"):
+        if cmd_l in ("r", "\\reset"):
+            # Keep compatibility with clients that issue reset command.
+            return "RPRT 0\n", False
+
+        if cmd_l in ("q", "\\quit"):
             return "RPRT 0\n", True
 
-        if cmd in ("_", "\\get_info"):
+        if cmd_l in ("_", "\\get_info"):
             return "AZ/EL WT901 TB6600 rotctl bridge\n", False
 
-        return "RPRT -11\n", False
+        # Some clients probe unsupported commands; return generic command-rejected.
+        return "RPRT -8\n", False
 
 
 def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
