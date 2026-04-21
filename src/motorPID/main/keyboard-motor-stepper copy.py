@@ -66,6 +66,7 @@ CONTROL_TIMEOUT_S = 120.0
 CONTROL_KP_AZ = 18.0
 CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 80.0
+CONTROL_MAX_SPS_EL = 300.0
 LOG_FILE = os.path.join(BASE_DIR, "az_el_closed_loop.log")
 
 
@@ -379,6 +380,16 @@ def angle_lerp(new: float, old: float | None, alpha: float) -> float:
     return (old + alpha * d) % 360.0
 
 
+def map_roll_to_el(roll_deg: float, el_offset_deg: float = 0.0) -> float:
+    """
+    Map roll to elevation with user convention:
+    - roll ~= 90  -> EL = 0 (front)
+    - roll ~= 180 -> EL = 90 (up)
+    """
+    el = (float(roll_deg) - 90.0) + float(el_offset_deg)
+    return max(0.0, min(180.0, el))
+
+
 class WT901AxisReader:
     """WT901 reader that mirrors the acquisition flow from fix-compas.py."""
 
@@ -554,9 +565,8 @@ class WT901AxisReader:
             az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
 
-            # EL pakai ROLL (sesuai request user), AZ tetap pakai tilt-compensation fix-compas.
-            el = roll + self.el_offset_deg
-            el = max(0.0, min(180.0, el))
+            # EL pakai mapping ROLL -> EL: depan=0, atas=90.
+            el = map_roll_to_el(roll, self.el_offset_deg)
 
             return {
                 "roll": roll,
@@ -662,7 +672,7 @@ class ClosedLoopAzElController:
         stable_hits = 0
         t0 = time.time()
         max_speed_az = float(self.motor_az.cfg.max_speed_sps)
-        max_speed_el = float(self.motor_el.cfg.max_speed_sps)
+        max_speed_el = min(float(self.motor_el.cfg.max_speed_sps), CONTROL_MAX_SPS_EL)
         sensor_fail_count = 0
 
         while True:
@@ -688,6 +698,11 @@ class ClosedLoopAzElController:
             sensor_fail_count = 0
 
             curr_az, curr_el, _, _ = pkt
+            # Keep internal motor position estimate aligned with absolute sensor feedback.
+            # This prevents false soft-limit trips when step->deg model differs from mechanics.
+            self.motor_az.set_position_deg(curr_az)
+            self.motor_el.set_position_deg(curr_el)
+
             err_az = angle_diff(target_az_deg, curr_az)
             err_el = target_el_deg - curr_el
 
