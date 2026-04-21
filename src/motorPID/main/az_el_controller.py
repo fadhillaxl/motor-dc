@@ -59,8 +59,6 @@ except Exception as exc:
 # =============================
 # GLOBAL TARGETS / LIMITS
 # =============================
-DEFAULT_TARGET_AZ_DEG = 20.0
-DEFAULT_TARGET_EL_DEG = 70.0
 POSITION_TOL_DEG = 0.5
 CONTROL_INTERVAL_S = 0.05
 CONTROL_TIMEOUT_S = 120.0
@@ -1392,14 +1390,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--az",
         type=float,
-        default=DEFAULT_TARGET_AZ_DEG,
-        help=f"Target azimuth in degree (default: {DEFAULT_TARGET_AZ_DEG}).",
+        default=20.0,
+        help="Target azimuth in degree (default: 20.0).",
     )
     parser.add_argument(
         "--el",
         type=float,
-        default=DEFAULT_TARGET_EL_DEG,
-        help=f"Target elevation in degree (default: {DEFAULT_TARGET_EL_DEG}).",
+        default=70.0,
+        help="Target elevation in degree (default: 70.0).",
     )
     parser.add_argument(
         "--mode",
