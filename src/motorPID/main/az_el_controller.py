@@ -68,6 +68,8 @@ CONTROL_MIN_SPS = 80.0
 CONTROL_MAX_SPS_EL = 300.0
 AZ_DEADZONE_DEG = 0.5
 AZ_SOFT_ZONE_DEG = 5.0
+AZ_STICTION_ERR_DEG = 0.9
+AZ_SOFT_MIN_SPS = 35.0
 AZ_SOFT_LIMIT_DEG = 280.0
 EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
@@ -929,7 +931,12 @@ class ClosedLoopAzElController:
             ratio = (abs_err - AZ_DEADZONE_DEG) / zone_span
             ratio = max(0.0, min(1.0, ratio))
             gain = 0.70 + (0.30 * ratio)
-            cmd = sign * min(max_sps, abs(raw_cmd) * gain)
+            cmd_mag = min(max_sps, abs(raw_cmd) * gain)
+            # Anti-stiction near target: if error is still meaningful but command is too small,
+            # apply a gentle floor so AZ can keep moving toward deadzone.
+            if abs_err >= AZ_STICTION_ERR_DEG and cmd_mag < AZ_SOFT_MIN_SPS:
+                cmd_mag = AZ_SOFT_MIN_SPS
+            cmd = sign * cmd_mag
             return cmd
 
         # Far from target: keep minimum-speed floor to overcome stiction.
@@ -1141,7 +1148,12 @@ class RealtimeAzElController:
             ratio = (abs_err - AZ_DEADZONE_DEG) / zone_span
             ratio = max(0.0, min(1.0, ratio))
             gain = 0.70 + (0.30 * ratio)
-            cmd = sign * min(max_sps, abs(raw_cmd) * gain)
+            cmd_mag = min(max_sps, abs(raw_cmd) * gain)
+            # Anti-stiction near target: if error is still meaningful but command is too small,
+            # apply a gentle floor so AZ can keep moving toward deadzone.
+            if abs_err >= AZ_STICTION_ERR_DEG and cmd_mag < AZ_SOFT_MIN_SPS:
+                cmd_mag = AZ_SOFT_MIN_SPS
+            cmd = sign * cmd_mag
             return cmd
 
         # Far from target: keep minimum-speed floor to overcome stiction.
