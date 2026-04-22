@@ -66,7 +66,7 @@ CONTROL_KP_AZ = 18.0
 CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 80.0
 CONTROL_MAX_SPS_EL = 300.0
-AZ_DEADZONE_DEG = 1.0
+AZ_DEADZONE_DEG = 0.5
 AZ_SOFT_ZONE_DEG = 5.0
 AZ_SOFT_LIMIT_DEG = 280.0
 EL_MIN_DEG = 0.0
@@ -924,10 +924,12 @@ class ClosedLoopAzElController:
 
         if abs_err < AZ_SOFT_ZONE_DEG:
             # Soft zone: smooth taper near target, without minimum-speed forcing.
+            # Keep it responsive by preserving most of raw PID command.
             zone_span = max(1e-6, AZ_SOFT_ZONE_DEG - AZ_DEADZONE_DEG)
             ratio = (abs_err - AZ_DEADZONE_DEG) / zone_span
             ratio = max(0.0, min(1.0, ratio))
-            cmd = sign * min(max_sps, abs(raw_cmd) * ratio)
+            gain = 0.70 + (0.30 * ratio)
+            cmd = sign * min(max_sps, abs(raw_cmd) * gain)
             return cmd
 
         # Far from target: keep minimum-speed floor to overcome stiction.
@@ -1134,10 +1136,12 @@ class RealtimeAzElController:
 
         if abs_err < AZ_SOFT_ZONE_DEG:
             # Soft zone: smooth taper near target, without minimum-speed forcing.
+            # Keep it responsive by preserving most of raw PID command.
             zone_span = max(1e-6, AZ_SOFT_ZONE_DEG - AZ_DEADZONE_DEG)
             ratio = (abs_err - AZ_DEADZONE_DEG) / zone_span
             ratio = max(0.0, min(1.0, ratio))
-            cmd = sign * min(max_sps, abs(raw_cmd) * ratio)
+            gain = 0.70 + (0.30 * ratio)
+            cmd = sign * min(max_sps, abs(raw_cmd) * gain)
             return cmd
 
         # Far from target: keep minimum-speed floor to overcome stiction.
