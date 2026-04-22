@@ -66,6 +66,8 @@ CONTROL_KP_AZ = 18.0
 CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 80.0
 CONTROL_MAX_SPS_EL = 300.0
+AZ_DEADZONE_DEG = 1.0
+AZ_SOFT_ZONE_DEG = 5.0
 AZ_SOFT_LIMIT_DEG = 280.0
 EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
@@ -910,6 +912,30 @@ class ClosedLoopAzElController:
             cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
         return max(-max_sps, min(max_sps, cmd))
 
+    @staticmethod
+    def _speed_from_error_az(err_deg: float, kp: float, max_sps: float) -> float:
+        abs_err = abs(err_deg)
+        if abs_err <= AZ_DEADZONE_DEG:
+            # Deadzone: near target, force stop to avoid hunting/oscilation.
+            return 0.0
+
+        raw_cmd = kp * err_deg
+        sign = 1.0 if raw_cmd >= 0 else -1.0
+
+        if abs_err < AZ_SOFT_ZONE_DEG:
+            # Soft zone: smooth taper near target, without minimum-speed forcing.
+            zone_span = max(1e-6, AZ_SOFT_ZONE_DEG - AZ_DEADZONE_DEG)
+            ratio = (abs_err - AZ_DEADZONE_DEG) / zone_span
+            ratio = max(0.0, min(1.0, ratio))
+            cmd = sign * min(max_sps, abs(raw_cmd) * ratio)
+            return cmd
+
+        # Far from target: keep minimum-speed floor to overcome stiction.
+        cmd = raw_cmd
+        if abs(cmd) < CONTROL_MIN_SPS:
+            cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
+        return max(-max_sps, min(max_sps, cmd))
+
     def _read_azel(self) -> tuple[float, float, dict, dict] | None:
         # Use one WT901 packet for both AZ and EL to avoid multi-access on serial port.
         data = self.wt.read_with_retry(attempts=8, delay_s=0.03)
@@ -997,7 +1023,7 @@ class ClosedLoopAzElController:
                 self.recovery.on_cycle_ok()
             else:
                 stable_hits = 0
-                cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
+                cmd_az = self._speed_from_error_az(err_az, CONTROL_KP_AZ, max_speed_az)
                 cmd_az *= self.recovery.az_speed_scale()
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
                 if not el_recovery["allow_motion"]:
@@ -1093,6 +1119,30 @@ class RealtimeAzElController:
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
         cmd = kp * err_deg
         if abs(cmd) < CONTROL_MIN_SPS and abs(err_deg) > 0.05:
+            cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
+        return max(-max_sps, min(max_sps, cmd))
+
+    @staticmethod
+    def _speed_from_error_az(err_deg: float, kp: float, max_sps: float) -> float:
+        abs_err = abs(err_deg)
+        if abs_err <= AZ_DEADZONE_DEG:
+            # Deadzone: near target, force stop to avoid hunting/oscilation.
+            return 0.0
+
+        raw_cmd = kp * err_deg
+        sign = 1.0 if raw_cmd >= 0 else -1.0
+
+        if abs_err < AZ_SOFT_ZONE_DEG:
+            # Soft zone: smooth taper near target, without minimum-speed forcing.
+            zone_span = max(1e-6, AZ_SOFT_ZONE_DEG - AZ_DEADZONE_DEG)
+            ratio = (abs_err - AZ_DEADZONE_DEG) / zone_span
+            ratio = max(0.0, min(1.0, ratio))
+            cmd = sign * min(max_sps, abs(raw_cmd) * ratio)
+            return cmd
+
+        # Far from target: keep minimum-speed floor to overcome stiction.
+        cmd = raw_cmd
+        if abs(cmd) < CONTROL_MIN_SPS:
             cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
         return max(-max_sps, min(max_sps, cmd))
 
@@ -1203,7 +1253,7 @@ class RealtimeAzElController:
                 self.motor_el.stop_smooth()
                 self.recovery.on_cycle_ok()
             else:
-                cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
+                cmd_az = self._speed_from_error_az(err_az, CONTROL_KP_AZ, max_speed_az)
                 cmd_az *= self.recovery.az_speed_scale()
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
                 if not el_recovery["allow_motion"]:
