@@ -1,0 +1,20 @@
+[Unit]
+Description=AZ/EL rotctl bridge for Gpredict
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=raspi5
+Group=raspi5
+WorkingDirectory=/home/raspi5/motor-dc/src/motorPID/main
+Environment=LISTEN_HOST=0.0.0.0
+Environment=LISTEN_PORT=4533
+ExecStart=/home/raspi5/motor-dc/src/motorPID/main/start_rotctl_gpredict.sh
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
