@@ -1,0 +1,1 @@
+(venv) raspi5@raspi5:~/motor-dc/src/motorPID/main $ journalctl -u rotctl-gpredict.service -f
