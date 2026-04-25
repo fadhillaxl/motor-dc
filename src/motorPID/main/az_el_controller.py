@@ -72,6 +72,9 @@ AZ_APPROACH_ZONE_DEG = 0.5
 AZ_APPROACH_MAX_SPS = 22.0
 AZ_STICTION_ERR_DEG = 0.9
 AZ_SOFT_MIN_SPS = 35.0
+AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
+AZ_WRONG_DIR_MIN_DELTA_DEG = 0.01
+AZ_WRONG_DIR_CONFIRM_CYCLES = 6
 AZ_SOFT_LIMIT_DEG = 280.0
 EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
@@ -908,6 +911,9 @@ class ClosedLoopAzElController:
         self.el_limit = ELLimitSwitch(EL_MIN_DEG, EL_MAX_DEG)
         self.recovery = LimitRecoveryManager(self.az_limit, self.el_limit, logger, notifier=notifier)
         self._last_cmd_az_dir = 0
+        self._az_cmd_sign = 1.0
+        self._prev_az = None
+        self._wrong_dir_hits = 0
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -1017,6 +1023,10 @@ class ClosedLoopAzElController:
             sensor_fail_count = 0
 
             curr_az, curr_el, _, _ = pkt
+            if self._prev_az is None:
+                self._prev_az = curr_az
+            az_delta = angle_diff(curr_az, self._prev_az)
+            self._prev_az = curr_az
             # Keep internal motor position estimate aligned with absolute sensor feedback.
             # This prevents false soft-limit trips when step->deg model differs from mechanics.
             self.motor_az.set_position_deg(curr_az)
@@ -1042,6 +1052,7 @@ class ClosedLoopAzElController:
                 stable_hits = 0
                 cmd_az = self._speed_from_error_az(err_az, CONTROL_KP_AZ, max_speed_az)
                 cmd_az *= self.recovery.az_speed_scale()
+                cmd_az *= self._az_cmd_sign
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
                 if not el_recovery["allow_motion"]:
                     cmd_el = 0.0
@@ -1049,6 +1060,22 @@ class ClosedLoopAzElController:
                 self.motor_az.set_target_speed(cmd_az)
                 self.motor_el.set_target_speed(cmd_el)
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
+                if (
+                    abs(cmd_az) >= AZ_WRONG_DIR_MIN_CMD_SPS
+                    and abs(az_delta) >= AZ_WRONG_DIR_MIN_DELTA_DEG
+                    and (cmd_az * az_delta) < 0.0
+                ):
+                    self._wrong_dir_hits += 1
+                else:
+                    self._wrong_dir_hits = 0
+                if self._wrong_dir_hits >= AZ_WRONG_DIR_CONFIRM_CYCLES:
+                    self._az_cmd_sign *= -1.0
+                    self._wrong_dir_hits = 0
+                    self.logger.warning(
+                        "AZ auto-reverse activated: feedback opposite direction (delta=%.4f). New sign=%.0f",
+                        az_delta,
+                        self._az_cmd_sign,
+                    )
 
                 corr = {
                     "t": round(time.time() - t0, 3),
@@ -1131,6 +1158,9 @@ class RealtimeAzElController:
         self.az_limit = AZLimitSwitch(AZ_SOFT_LIMIT_DEG)
         self.el_limit = ELLimitSwitch(EL_MIN_DEG, EL_MAX_DEG)
         self.recovery = LimitRecoveryManager(self.az_limit, self.el_limit, logger, notifier=notifier)
+        self._az_cmd_sign = 1.0
+        self._prev_az = None
+        self._wrong_dir_hits = 0
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -1260,6 +1290,10 @@ class RealtimeAzElController:
             sensor_fail_count = 0
 
             curr_az, curr_el = pkt
+            if self._prev_az is None:
+                self._prev_az = curr_az
+            az_delta = angle_diff(curr_az, self._prev_az)
+            self._prev_az = curr_az
             with self._lock:
                 self._curr_az = curr_az
                 self._curr_el = curr_el
@@ -1285,6 +1319,7 @@ class RealtimeAzElController:
             else:
                 cmd_az = self._speed_from_error_az(err_az, CONTROL_KP_AZ, max_speed_az)
                 cmd_az *= self.recovery.az_speed_scale()
+                cmd_az *= self._az_cmd_sign
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
                 if not el_recovery["allow_motion"]:
                     cmd_el = 0.0
@@ -1292,6 +1327,22 @@ class RealtimeAzElController:
                 self.motor_az.set_target_speed(cmd_az)
                 self.motor_el.set_target_speed(cmd_el)
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
+                if (
+                    abs(cmd_az) >= AZ_WRONG_DIR_MIN_CMD_SPS
+                    and abs(az_delta) >= AZ_WRONG_DIR_MIN_DELTA_DEG
+                    and (cmd_az * az_delta) < 0.0
+                ):
+                    self._wrong_dir_hits += 1
+                else:
+                    self._wrong_dir_hits = 0
+                if self._wrong_dir_hits >= AZ_WRONG_DIR_CONFIRM_CYCLES:
+                    self._az_cmd_sign *= -1.0
+                    self._wrong_dir_hits = 0
+                    self.logger.warning(
+                        "AZ auto-reverse activated: feedback opposite direction (delta=%.4f). New sign=%.0f",
+                        az_delta,
+                        self._az_cmd_sign,
+                    )
 
             now = time.time()
             if now - last_log_t >= 1.0:
