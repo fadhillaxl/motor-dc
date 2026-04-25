@@ -68,6 +68,8 @@ CONTROL_MIN_SPS = 80.0
 CONTROL_MAX_SPS_EL = 300.0
 AZ_DEADZONE_DEG = 0.5
 AZ_SOFT_ZONE_DEG = 5.0
+AZ_APPROACH_ZONE_DEG = 2.0
+AZ_APPROACH_MAX_SPS = 22.0
 AZ_STICTION_ERR_DEG = 0.9
 AZ_SOFT_MIN_SPS = 35.0
 AZ_SOFT_LIMIT_DEG = 280.0
@@ -932,9 +934,15 @@ class ClosedLoopAzElController:
             ratio = max(0.0, min(1.0, ratio))
             gain = 0.70 + (0.30 * ratio)
             cmd_mag = min(max_sps, abs(raw_cmd) * gain)
+            if abs_err <= AZ_APPROACH_ZONE_DEG:
+                # Final approach (<2 deg): apply stricter cap for smoother landing.
+                app_span = max(1e-6, AZ_APPROACH_ZONE_DEG - AZ_DEADZONE_DEG)
+                app_ratio = (abs_err - AZ_DEADZONE_DEG) / app_span
+                app_ratio = max(0.0, min(1.0, app_ratio))
+                cmd_mag = min(cmd_mag, AZ_APPROACH_MAX_SPS * app_ratio)
             # Anti-stiction near target: if error is still meaningful but command is too small,
             # apply a gentle floor so AZ can keep moving toward deadzone.
-            if abs_err >= AZ_STICTION_ERR_DEG and cmd_mag < AZ_SOFT_MIN_SPS:
+            if abs_err > AZ_APPROACH_ZONE_DEG and abs_err >= AZ_STICTION_ERR_DEG and cmd_mag < AZ_SOFT_MIN_SPS:
                 cmd_mag = AZ_SOFT_MIN_SPS
             cmd = sign * cmd_mag
             return cmd
@@ -1149,9 +1157,15 @@ class RealtimeAzElController:
             ratio = max(0.0, min(1.0, ratio))
             gain = 0.70 + (0.30 * ratio)
             cmd_mag = min(max_sps, abs(raw_cmd) * gain)
+            if abs_err <= AZ_APPROACH_ZONE_DEG:
+                # Final approach (<2 deg): apply stricter cap for smoother landing.
+                app_span = max(1e-6, AZ_APPROACH_ZONE_DEG - AZ_DEADZONE_DEG)
+                app_ratio = (abs_err - AZ_DEADZONE_DEG) / app_span
+                app_ratio = max(0.0, min(1.0, app_ratio))
+                cmd_mag = min(cmd_mag, AZ_APPROACH_MAX_SPS * app_ratio)
             # Anti-stiction near target: if error is still meaningful but command is too small,
             # apply a gentle floor so AZ can keep moving toward deadzone.
-            if abs_err >= AZ_STICTION_ERR_DEG and cmd_mag < AZ_SOFT_MIN_SPS:
+            if abs_err > AZ_APPROACH_ZONE_DEG and abs_err >= AZ_STICTION_ERR_DEG and cmd_mag < AZ_SOFT_MIN_SPS:
                 cmd_mag = AZ_SOFT_MIN_SPS
             cmd = sign * cmd_mag
             return cmd
