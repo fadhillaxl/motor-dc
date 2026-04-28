@@ -1151,6 +1151,7 @@ class RealtimeAzElController:
         self._curr_az = 0.0
         self._curr_el = 0.0
         self._has_position = False
+        self._hold_follow = True
         self._last_cmd_az_dir = 0
         self.az_limit = AZLimitSwitch(AZ_SOFT_LIMIT_DEG)
         self.el_limit = ELLimitSwitch(EL_MIN_DEG, EL_MAX_DEG)
@@ -1224,6 +1225,7 @@ class RealtimeAzElController:
         with self._lock:
             self._target_az = float(az_deg) % 360.0
             self._target_el = float(el_decision["clamped_target_deg"])
+            self._hold_follow = False
         self.logger.info("Target updated | az=%.2f el=%.2f", self._target_az, self._target_el)
         return True, "ok"
 
@@ -1231,6 +1233,7 @@ class RealtimeAzElController:
         with self._lock:
             self._target_az = self._curr_az
             self._target_el = self._curr_el
+            self._hold_follow = True
         self.motor_az.stop_smooth()
         self.motor_el.stop_smooth()
         self.logger.info("Stop motion requested.")
@@ -1278,10 +1281,22 @@ class RealtimeAzElController:
                 self._curr_el = curr_el
                 target_az = self._target_az
                 target_el = self._target_el
+                hold_follow = self._hold_follow
                 self._has_position = True
 
             self.motor_az.set_position_deg(curr_az)
             self.motor_el.set_position_deg(curr_el)
+
+            if hold_follow:
+                # STOP mode: keep target following sensor so controller stays idle
+                # until next explicit set_target command from rotctl.
+                with self._lock:
+                    self._target_az = curr_az
+                    self._target_el = curr_el
+                self.motor_az.stop_smooth()
+                self.motor_el.stop_smooth()
+                time.sleep(CONTROL_INTERVAL_S)
+                continue
 
             az_decision = self.az_limit.validateMovement(curr_az, target_az, self._last_cmd_az_dir)
             el_decision = self.el_limit.validateElevation(target_el, curr_el)
