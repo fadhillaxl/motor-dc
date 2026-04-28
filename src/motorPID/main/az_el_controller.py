@@ -66,6 +66,8 @@ CONTROL_KP_AZ = 18.0
 CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 100.0
 CONTROL_MAX_SPS_EL = 300.0
+CONTROL_DEADZONE_DEG = 0.35
+CONTROL_SOFT_ZONE_DEG = 2.0
 AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
 AZ_WRONG_DIR_MIN_DELTA_DEG = 0.01
 AZ_WRONG_DIR_CONFIRM_CYCLES = 6
@@ -911,8 +913,25 @@ class ClosedLoopAzElController:
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
-        cmd = kp * err_deg
-        if abs(cmd) < CONTROL_MIN_SPS and abs(err_deg) > 0.05:
+        abs_err = abs(err_deg)
+        if abs_err <= CONTROL_DEADZONE_DEG:
+            # Stop when close enough to avoid oscillation around target.
+            return 0.0
+
+        raw_cmd = kp * err_deg
+        sign = 1.0 if raw_cmd >= 0 else -1.0
+
+        if abs_err < CONTROL_SOFT_ZONE_DEG:
+            # Near target: taper speed smoothly and do NOT force minimum speed.
+            span = max(1e-6, CONTROL_SOFT_ZONE_DEG - CONTROL_DEADZONE_DEG)
+            ratio = (abs_err - CONTROL_DEADZONE_DEG) / span
+            ratio = max(0.0, min(1.0, ratio))
+            cmd_mag = min(max_sps, abs(raw_cmd) * ratio)
+            return sign * cmd_mag
+
+        # Far from target: keep minimum speed floor for stiction.
+        cmd = raw_cmd
+        if abs(cmd) < CONTROL_MIN_SPS:
             cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
         return max(-max_sps, min(max_sps, cmd))
 
@@ -1121,8 +1140,25 @@ class RealtimeAzElController:
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
-        cmd = kp * err_deg
-        if abs(cmd) < CONTROL_MIN_SPS and abs(err_deg) > 0.05:
+        abs_err = abs(err_deg)
+        if abs_err <= CONTROL_DEADZONE_DEG:
+            # Stop when close enough to avoid oscillation around target.
+            return 0.0
+
+        raw_cmd = kp * err_deg
+        sign = 1.0 if raw_cmd >= 0 else -1.0
+
+        if abs_err < CONTROL_SOFT_ZONE_DEG:
+            # Near target: taper speed smoothly and do NOT force minimum speed.
+            span = max(1e-6, CONTROL_SOFT_ZONE_DEG - CONTROL_DEADZONE_DEG)
+            ratio = (abs_err - CONTROL_DEADZONE_DEG) / span
+            ratio = max(0.0, min(1.0, ratio))
+            cmd_mag = min(max_sps, abs(raw_cmd) * ratio)
+            return sign * cmd_mag
+
+        # Far from target: keep minimum speed floor for stiction.
+        cmd = raw_cmd
+        if abs(cmd) < CONTROL_MIN_SPS:
             cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
         return max(-max_sps, min(max_sps, cmd))
 
