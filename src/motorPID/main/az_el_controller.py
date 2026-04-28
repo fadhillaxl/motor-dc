@@ -59,7 +59,7 @@ except Exception as exc:
 # =============================
 # GLOBAL TARGETS / LIMITS
 # =============================
-POSITION_TOL_DEG = 0.2
+POSITION_TOL_DEG = 0.5
 CONTROL_INTERVAL_S = 0.05
 CONTROL_TIMEOUT_S = 120.0
 CONTROL_KP_AZ = 18.0
