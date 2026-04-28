@@ -67,10 +67,11 @@ CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 100.0
 CONTROL_MAX_SPS_EL = 300.0
 CONTROL_DEADZONE_DEG = 0.35
-CONTROL_SOFT_ZONE_DEG = 2.0
+CONTROL_SOFT_ZONE_DEG = 5.0
 AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
-AZ_WRONG_DIR_MIN_DELTA_DEG = 0.01
-AZ_WRONG_DIR_CONFIRM_CYCLES = 6
+AZ_WRONG_DIR_MIN_DELTA_DEG = 0.20
+AZ_WRONG_DIR_CONFIRM_CYCLES = 12
+AZ_WRONG_DIR_MIN_ERR_DEG = 5.0
 AZ_SOFT_LIMIT_DEG = 280.0
 EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
@@ -1037,6 +1038,7 @@ class ClosedLoopAzElController:
                 self.motor_el.set_target_speed(cmd_el)
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
                 if (
+                    abs(err_az) >= AZ_WRONG_DIR_MIN_ERR_DEG
                     abs(cmd_az) >= AZ_WRONG_DIR_MIN_CMD_SPS
                     and abs(az_delta) >= AZ_WRONG_DIR_MIN_DELTA_DEG
                     and (cmd_az * az_delta) < 0.0
@@ -1284,6 +1286,7 @@ class RealtimeAzElController:
                 self.motor_el.set_target_speed(cmd_el)
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
                 if (
+                    abs(err_az) >= AZ_WRONG_DIR_MIN_ERR_DEG
                     abs(cmd_az) >= AZ_WRONG_DIR_MIN_CMD_SPS
                     and abs(az_delta) >= AZ_WRONG_DIR_MIN_DELTA_DEG
                     and (cmd_az * az_delta) < 0.0
