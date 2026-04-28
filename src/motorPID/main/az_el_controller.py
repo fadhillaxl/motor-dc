@@ -1039,6 +1039,7 @@ class ClosedLoopAzElController:
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
                 if (
                     abs(err_az) >= AZ_WRONG_DIR_MIN_ERR_DEG
+                    and
                     abs(cmd_az) >= AZ_WRONG_DIR_MIN_CMD_SPS
                     and abs(az_delta) >= AZ_WRONG_DIR_MIN_DELTA_DEG
                     and (cmd_az * az_delta) < 0.0
@@ -1287,6 +1288,7 @@ class RealtimeAzElController:
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
                 if (
                     abs(err_az) >= AZ_WRONG_DIR_MIN_ERR_DEG
+                    and
                     abs(cmd_az) >= AZ_WRONG_DIR_MIN_CMD_SPS
                     and abs(az_delta) >= AZ_WRONG_DIR_MIN_DELTA_DEG
                     and (cmd_az * az_delta) < 0.0
