@@ -66,8 +66,11 @@ CONTROL_KP_AZ = 18.0
 CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 500.0
 CONTROL_MAX_SPS_EL = 300.0
-CONTROL_DEADZONE_DEG = 0.35
-CONTROL_SOFT_ZONE_DEG = 2.5
+CONTROL_DEADZONE_DEG = 0.5
+CONTROL_SOFT_ZONE_DEG = 1.2
+CONTROL_SOFT_MIN_ERR_DEG = 0.8
+CONTROL_SOFT_MIN_SPS = 60.0
+CONTROL_LOCK_HITS = 2
 AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
 AZ_WRONG_DIR_MIN_DELTA_DEG = 0.20
 AZ_WRONG_DIR_CONFIRM_CYCLES = 12
@@ -928,6 +931,8 @@ class ClosedLoopAzElController:
             ratio = (abs_err - CONTROL_DEADZONE_DEG) / span
             ratio = max(0.0, min(1.0, ratio))
             cmd_mag = min(max_sps, abs(raw_cmd) * ratio)
+            if abs_err >= CONTROL_SOFT_MIN_ERR_DEG and cmd_mag < CONTROL_SOFT_MIN_SPS:
+                cmd_mag = CONTROL_SOFT_MIN_SPS
             return sign * cmd_mag
 
         # Far from target: keep minimum speed floor for stiction.
@@ -1071,7 +1076,7 @@ class ClosedLoopAzElController:
                 self.corrections.append(corr)
                 self.logger.info("CORR %s", json.dumps(corr, separators=(",", ":")))
 
-            if stable_hits >= 5:
+            if stable_hits >= CONTROL_LOCK_HITS:
                 self.logger.info("Stable target lock reached.")
                 break
             if (time.time() - t0) > timeout_s:
@@ -1157,6 +1162,8 @@ class RealtimeAzElController:
             ratio = (abs_err - CONTROL_DEADZONE_DEG) / span
             ratio = max(0.0, min(1.0, ratio))
             cmd_mag = min(max_sps, abs(raw_cmd) * ratio)
+            if abs_err >= CONTROL_SOFT_MIN_ERR_DEG and cmd_mag < CONTROL_SOFT_MIN_SPS:
+                cmd_mag = CONTROL_SOFT_MIN_SPS
             return sign * cmd_mag
 
         # Far from target: keep minimum speed floor for stiction.
