@@ -66,12 +66,6 @@ CONTROL_KP_AZ = 18.0
 CONTROL_KP_EL = 18.0
 CONTROL_MIN_SPS = 100.0
 CONTROL_MAX_SPS_EL = 300.0
-AZ_DEADZONE_DEG = 0.5
-AZ_SOFT_ZONE_DEG = 5.0
-AZ_APPROACH_ZONE_DEG = 0.5
-AZ_APPROACH_MAX_SPS = 22.0
-AZ_STICTION_ERR_DEG = 0.9
-AZ_SOFT_MIN_SPS = 35.0
 AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
 AZ_WRONG_DIR_MIN_DELTA_DEG = 0.01
 AZ_WRONG_DIR_CONFIRM_CYCLES = 6
@@ -922,43 +916,6 @@ class ClosedLoopAzElController:
             cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
         return max(-max_sps, min(max_sps, cmd))
 
-    @staticmethod
-    def _speed_from_error_az(err_deg: float, kp: float, max_sps: float) -> float:
-        abs_err = abs(err_deg)
-        if abs_err <= AZ_DEADZONE_DEG:
-            # Deadzone: near target, force stop to avoid hunting/oscilation.
-            return 0.0
-
-        raw_cmd = kp * err_deg
-        sign = 1.0 if raw_cmd >= 0 else -1.0
-
-        if abs_err < AZ_SOFT_ZONE_DEG:
-            # Soft zone: smooth taper near target, without minimum-speed forcing.
-            # Keep it responsive by preserving most of raw PID command.
-            zone_span = max(1e-6, AZ_SOFT_ZONE_DEG - AZ_DEADZONE_DEG)
-            ratio = (abs_err - AZ_DEADZONE_DEG) / zone_span
-            ratio = max(0.0, min(1.0, ratio))
-            gain = 0.70 + (0.30 * ratio)
-            cmd_mag = min(max_sps, abs(raw_cmd) * gain)
-            if abs_err <= AZ_APPROACH_ZONE_DEG:
-                # Final approach (<2 deg): apply stricter cap for smoother landing.
-                app_span = max(1e-6, AZ_APPROACH_ZONE_DEG - AZ_DEADZONE_DEG)
-                app_ratio = (abs_err - AZ_DEADZONE_DEG) / app_span
-                app_ratio = max(0.0, min(1.0, app_ratio))
-                cmd_mag = min(cmd_mag, AZ_APPROACH_MAX_SPS * app_ratio)
-            # Anti-stiction near target: if error is still meaningful but command is too small,
-            # apply a gentle floor so AZ can keep moving toward deadzone.
-            if abs_err > AZ_APPROACH_ZONE_DEG and abs_err >= AZ_STICTION_ERR_DEG and cmd_mag < AZ_SOFT_MIN_SPS:
-                cmd_mag = AZ_SOFT_MIN_SPS
-            cmd = sign * cmd_mag
-            return cmd
-
-        # Far from target: keep minimum-speed floor to overcome stiction.
-        cmd = raw_cmd
-        if abs(cmd) < CONTROL_MIN_SPS:
-            cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
-        return max(-max_sps, min(max_sps, cmd))
-
     def _read_azel(self) -> tuple[float, float, dict, dict] | None:
         # Use one WT901 packet for both AZ and EL to avoid multi-access on serial port.
         data = self.wt.read_with_retry(attempts=8, delay_s=0.03)
@@ -1050,7 +1007,7 @@ class ClosedLoopAzElController:
                 self.recovery.on_cycle_ok()
             else:
                 stable_hits = 0
-                cmd_az = self._speed_from_error_az(err_az, CONTROL_KP_AZ, max_speed_az)
+                cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
                 cmd_az *= self.recovery.az_speed_scale()
                 cmd_az *= self._az_cmd_sign
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
@@ -1169,43 +1126,6 @@ class RealtimeAzElController:
             cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
         return max(-max_sps, min(max_sps, cmd))
 
-    @staticmethod
-    def _speed_from_error_az(err_deg: float, kp: float, max_sps: float) -> float:
-        abs_err = abs(err_deg)
-        if abs_err <= AZ_DEADZONE_DEG:
-            # Deadzone: near target, force stop to avoid hunting/oscilation.
-            return 0.0
-
-        raw_cmd = kp * err_deg
-        sign = 1.0 if raw_cmd >= 0 else -1.0
-
-        if abs_err < AZ_SOFT_ZONE_DEG:
-            # Soft zone: smooth taper near target, without minimum-speed forcing.
-            # Keep it responsive by preserving most of raw PID command.
-            zone_span = max(1e-6, AZ_SOFT_ZONE_DEG - AZ_DEADZONE_DEG)
-            ratio = (abs_err - AZ_DEADZONE_DEG) / zone_span
-            ratio = max(0.0, min(1.0, ratio))
-            gain = 0.70 + (0.30 * ratio)
-            cmd_mag = min(max_sps, abs(raw_cmd) * gain)
-            if abs_err <= AZ_APPROACH_ZONE_DEG:
-                # Final approach (<2 deg): apply stricter cap for smoother landing.
-                app_span = max(1e-6, AZ_APPROACH_ZONE_DEG - AZ_DEADZONE_DEG)
-                app_ratio = (abs_err - AZ_DEADZONE_DEG) / app_span
-                app_ratio = max(0.0, min(1.0, app_ratio))
-                cmd_mag = min(cmd_mag, AZ_APPROACH_MAX_SPS * app_ratio)
-            # Anti-stiction near target: if error is still meaningful but command is too small,
-            # apply a gentle floor so AZ can keep moving toward deadzone.
-            if abs_err > AZ_APPROACH_ZONE_DEG and abs_err >= AZ_STICTION_ERR_DEG and cmd_mag < AZ_SOFT_MIN_SPS:
-                cmd_mag = AZ_SOFT_MIN_SPS
-            cmd = sign * cmd_mag
-            return cmd
-
-        # Far from target: keep minimum-speed floor to overcome stiction.
-        cmd = raw_cmd
-        if abs(cmd) < CONTROL_MIN_SPS:
-            cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
-        return max(-max_sps, min(max_sps, cmd))
-
     def _read_azel(self) -> tuple[float, float] | None:
         data = self.wt.read_with_retry(attempts=8, delay_s=0.03)
         if data is None:
@@ -1317,7 +1237,7 @@ class RealtimeAzElController:
                 self.motor_el.stop_smooth()
                 self.recovery.on_cycle_ok()
             else:
-                cmd_az = self._speed_from_error_az(err_az, CONTROL_KP_AZ, max_speed_az)
+                cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
                 cmd_az *= self.recovery.az_speed_scale()
                 cmd_az *= self._az_cmd_sign
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
