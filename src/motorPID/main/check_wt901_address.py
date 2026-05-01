@@ -58,25 +58,32 @@ def build_device():
 def read_one_packet(device, addr: int):
     device.ADDR = int(addr)
 
-    # Trigger register read from sensor.
-    if hasattr(device, "readReg"):
-        device.readReg(0x30, 41)
-    time.sleep(0.03)
-
-    # Read back one angle field as validity check.
-    if hasattr(device, "get"):
-        angle_z = device.get("AngleZ")
-    else:
-        angle_z = device.getDeviceData("angleZ")
-    return angle_z
+    # Trigger register read from sensor and use direct response payload.
+    # This avoids stale cache false-positive from getDeviceData/get().
+    if not hasattr(device, "readReg"):
+        return None
+    values = device.readReg(0x30, 41)
+    if not values:
+        return None
+    return values
 
 
 def probe_addr(device, addr: int, tries: int) -> tuple[bool, float | None]:
+    def _to_signed16(v: int) -> int:
+        v = int(v) & 0xFFFF
+        return v - 0x10000 if v & 0x8000 else v
+
     for _ in range(max(1, tries)):
         try:
-            val = read_one_packet(device, addr)
-            if val is not None:
-                return True, float(val)
+            vals = read_one_packet(device, addr)
+            if vals:
+                # angleZ register is 0x3F, scanned from 0x30 -> index 15.
+                if len(vals) > 15:
+                    raw = _to_signed16(vals[15])
+                    angle_z = raw / 32768.0 * 180.0
+                    return True, float(angle_z)
+                # If payload exists but angle index unavailable, still count as found.
+                return True, None
         except Exception:
             # ignore per-address read errors while scanning
             pass
@@ -122,7 +129,10 @@ def main():
             ok, angle_z = probe_addr(device, addr, args.tries)
             if ok:
                 found.append((addr, angle_z))
-                print(f"[FOUND] addr=0x{addr:02X} angleZ={angle_z:.2f}")
+                if angle_z is None:
+                    print(f"[FOUND] addr=0x{addr:02X}")
+                else:
+                    print(f"[FOUND] addr=0x{addr:02X} angleZ={angle_z:.2f}")
             else:
                 print(f"[---- ] addr=0x{addr:02X}")
 
@@ -133,7 +143,12 @@ def main():
         sys.exit(1)
     finally:
         try:
-            device.closeDevice()
+            # Avoid noisy SDK thread shutdown errors.
+            device.isOpen = False
+            time.sleep(0.05)
+            if getattr(device, "serialPort", None) is not None:
+                device.serialPort.close()
+            device.serialPort = None
         except Exception:
             pass
 
