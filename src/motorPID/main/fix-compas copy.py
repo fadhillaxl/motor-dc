@@ -32,6 +32,7 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 # =============================
 INTERVAL = 0.1
 AZ_OFFSET_DEG = 0.0
+EL_OFFSET_DEG = 0.0
 
 alpha = 0.15
 last_az = None
@@ -49,6 +50,16 @@ def angle_lerp(new, old):
         return new
     d = angle_diff(new, old)
     return (old + alpha * d) % 360
+
+
+def map_roll_to_el(roll_deg, el_offset_deg=0.0):
+    """
+    Mapping EL dari roll:
+    - roll ~= 90  -> EL = 0 (depan datar)
+    - roll ~= 180 -> EL = 90 (menghadap atas)
+    """
+    el = (float(roll_deg) - 90.0) + float(el_offset_deg)
+    return max(0.0, min(180.0, el))
 
 # =============================
 # DEVICE
@@ -142,7 +153,7 @@ def baca_sudut(device):
             magZ = device.getDeviceData("magZ")
 
         if None in (roll, pitch, yaw):
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
 
         roll = float(roll)
         pitch = float(pitch)
@@ -205,12 +216,13 @@ def baca_sudut(device):
         # =============================
         az = angle_lerp(az, last_az)
         last_az = az
+        el = map_roll_to_el(roll, EL_OFFSET_DEG)
 
-        return roll, pitch, yaw_cw, compass_cw, az, src
+        return roll, pitch, yaw_cw, compass_cw, az, el, src
 
     except Exception as e:
         print("[ERR]", e)
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
 # =============================
 # MAIN
@@ -236,8 +248,8 @@ def main():
 
     reset_zero_point(device)
 
-    print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}".format(
-        "TIME", "ROLL", "PITCH", "YAW", "COMPASS", "AZ", "SRC"
+    print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>8} {:>10}".format(
+        "TIME", "ROLL", "PITCH", "YAW", "COMPASS", "AZ", "EL", "SRC"
     ))
     print("-"*80)
 
@@ -246,16 +258,17 @@ def main():
             data = baca_sudut(device)
 
             if data[0] is not None:
-                roll, pitch, yaw, comp, az, src = data
+                roll, pitch, yaw, comp, az, el, src = data
                 now = time.strftime("%H:%M:%S")
 
-                print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>10}".format(
+                print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>8.2f} {:>10}".format(
                     now,
                     roll,
                     pitch,
                     yaw,
                     f"{comp:.2f}" if comp else "-",
                     az,
+                    el,
                     src
                 ))
 
