@@ -43,7 +43,7 @@ ADDR_AZ         = 0x51         # Sensor azimuth / kompas
 # Deklinasi magnetik kota Anda (cek: https://www.magnetic-declination.com/)
 # Yogyakarta, Indonesia ≈ +0.97° (positif = timur)
 DECLINATION_DEG = 0.97
-AZ_OFFSET_DEG = 157.00   # Offset azimuth manual (+/- derajat) untuk fine-tuning arah
+AZ_OFFSET_DEG = -203.00   # Offset azimuth manual (+/- derajat) untuk fine-tuning arah
 
 # File penyimpanan kalibrasi (persistent lintas sesi)
 CALIB_FILE = os.path.join(BASE_DIR, "compass_calibration.json")
