@@ -1534,11 +1534,11 @@ class RotctlServer:
 
 
 def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
-    # Motor 1 (AZ)
+    # Motor 1 (AZ) - switched to driver port set that was previously EL
     cfg_m1 = StepperConfig(
-        step_pin=17,  # PUL+
-        dir_pin=27,   # DIR+
-        en_pin=22,    # EN+
+        step_pin=23,  # PUL+
+        dir_pin=24,   # DIR+
+        en_pin=25,    # EN+
         steps_per_rev=200,
         microstep=8,
         max_speed_sps=1500.0,
@@ -1547,11 +1547,11 @@ def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
         soft_limit_max_deg=None,
         circular_axis=True,
     )
-    # Motor 2 (EL)
+    # Motor 2 (EL) - switched to driver port set that was previously AZ
     cfg_m2 = StepperConfig(
-        step_pin=23,  # PUL+
-        dir_pin=24,   # DIR+
-        en_pin=25,    # EN+
+        step_pin=17,  # PUL+
+        dir_pin=27,   # DIR+
+        en_pin=22,    # EN+
         steps_per_rev=200,
         microstep=8,
         max_speed_sps=2200.0,
