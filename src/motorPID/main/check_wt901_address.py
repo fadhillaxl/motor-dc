@@ -45,10 +45,10 @@ def _raw_to_angle(raw):
     return raw / 32768.0 * 180.0
 
 
-def _map_el_0_90_to_90_0(el_deg):
-    """Balik skala elevasi: 0..90 menjadi 90..0."""
-    el_clamped = max(0.0, min(90.0, float(el_deg)))
-    return 90.0 - el_clamped
+def _map_el_roll_to_90_0(el_roll_deg):
+    """Map EL dari roll: |roll| 0..90 menjadi EL 90..0."""
+    roll_abs_clamped = max(0.0, min(90.0, abs(float(el_roll_deg))))
+    return 90.0 - roll_abs_clamped
 
 
 def _normalize_azimuth_0_360(yaw_deg):
@@ -112,7 +112,7 @@ def tampilkan_header():
     print()
     print("Tekan Ctrl+C untuk berhenti.")
     print("-" * 60)
-    print(f"{'Waktu':<10} {'EL_PITCH(°)':>12} {'AZ_YAW(°)':>10} {'EL_ROLL(°)':>11} {'AZ_ROLL(°)':>11}")
+    print(f"{'Waktu':<10} {'EL_FROM_ROLL(°)':>15} {'AZ_YAW(°)':>10} {'EL_ROLL(°)':>11} {'AZ_ROLL(°)':>11}")
     print("-" * 60)
 
 
@@ -158,18 +158,18 @@ def main():
                 print("[WARN] Gagal membaca data dari salah satu sensor, mencoba lagi...")
             else:
                 waktu = time.strftime("%H:%M:%S")
-                el_pitch_mapped = _map_el_0_90_to_90_0(el_pitch)
+                el_from_roll = _map_el_roll_to_90_0(el_roll)
                 az_yaw_360 = _normalize_azimuth_0_360(az_yaw)
 
-                if abs(el_pitch_mapped) < 5:
+                if el_from_roll < 5:
+                    status_el = "TEGAK"
+                elif el_from_roll > 85:
                     status_el = "DATAR"
-                elif el_pitch_mapped > 0:
-                    status_el = f"MIRING DEPAN {el_pitch_mapped:.1f}°"
                 else:
-                    status_el = f"MIRING BELAKANG {abs(el_pitch_mapped):.1f}°"
+                    status_el = f"EL {el_from_roll:.1f}°"
 
                 print(
-                    f"{waktu:<10} {el_pitch_mapped:>12.2f} {az_yaw_360:>10.2f} "
+                    f"{waktu:<10} {el_from_roll:>15.2f} {az_yaw_360:>10.2f} "
                     f"{el_roll:>11.2f} {az_roll:>11.2f}   [EL:{status_el}]"
                 )
 
