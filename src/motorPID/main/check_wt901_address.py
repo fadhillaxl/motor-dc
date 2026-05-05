@@ -1,236 +1,169 @@
-#!/usr/bin/env python3
-# coding: utf-8
 """
-Scan/check WT901 RS485 addresses on one bus.
+Baca Elevasi Absolut Terhadap Gravitasi - WT901C485
+=====================================================
+Script ini membaca sudut EL (Elevation/Pitch) dari sensor WT901C485
+menggunakan referensi gravitasi bumi (sudut absolut).
 
-Contoh:
-  python check_wt901_address.py
-  python check_wt901_address.py --start 0x50 --end 0x5F
-  python check_wt901_address.py --start 0x00 --end 0xFF --tries 2
+Cara penggunaan:
+1. Pastikan library WITMOTION sudah di-download dari:
+   https://github.com/WITMOTION/WitStandardModbus_WT901C485/tree/main/Python/Python-SDK-WT901C485/chs
+2. Letakkan file ini di folder yang SAMA dengan file SDK (device.py, dll)
+3. Jalankan: python baca_elevasi_absolut.py
+
+Dependensi:
+    pip install pyserial
 """
 
-import argparse
-import math
 import os
-import platform
 import sys
 import time
+import platform
 
-# =============================
-# PATH SDK
-# =============================
+# PYTHON PATH -> folder chs lokal project
+# =====================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs"))
+SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "Python-SDK-WT901C485", "chs"))
 sys.path.insert(0, SDK_CHS)
 
-# =============================
-# IMPORT SDK
-# =============================
+# ─── Import dari SDK WITMOTION ─────────────────────────────────────────────
 try:
     import lib.device_model as deviceModel
     from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
     from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
-except Exception as exc:
-    print(f"ERROR import SDK: {exc}")
-    print(f"Pastikan path SDK valid: {SDK_CHS}")
+except ImportError as e:
+    print(f"[ERROR] Library WITMOTION tidak ditemukan: {e}")
+    print("Pastikan struktur folder SDK sudah benar:")
+    print(f"  {SDK_CHS}/lib/device_model.py")
+    print(f"  {SDK_CHS}/lib/data_processor/roles/jy901s_dataProcessor.py")
+    print(f"  {SDK_CHS}/lib/protocol_resolver/roles/protocol_485_resolver.py")
     sys.exit(1)
 
+# ─── Konfigurasi ──────────────────────────────────────────────────────────
+INTERVAL  = 0.5          # Interval baca dalam detik
 
-def parse_int_auto(value: str) -> int:
-    return int(str(value).strip(), 0)
+# ─── Konstanta Reset Zero-Point ───────────────────────────────────────────
+REG_KEY   = 0x69          # Register kunci untuk operasi tulis
 
-
-def build_device():
+def reset_zero_point(device):
+    """
+    Menghapus zero-point yang tersimpan di sensor.
+    Ini memastikan EL selalu mengacu pada gravitasi (sudut absolut),
+    bukan posisi saat dinyalakan.
+    """
+    print("[INFO] Mereset zero-point ke default (sudut absolut)...")
     try:
-        return deviceModel.DeviceModel(
-            "WT901C485",
-            Protocol485Resolver(),
-            JY901SDataProcessor(),
-        )
-    except TypeError:
-        return deviceModel.DeviceModel(
-            "WT901C485",
-            Protocol485Resolver(),
-            JY901SDataProcessor(),
-            "ADDR_SCANNER",
-        )
+        # Unlock register untuk penulisan
+        device.write_register(device.ADDR, REG_KEY, 0xB588)
+        time.sleep(0.1)
+        device.write_register(device.ADDR, 0x01, 0x0000)
+        time.sleep(0.3)
+
+        print("[OK] Zero-point berhasil direset. Sensor sekarang menggunakan gravitasi sebagai referensi.\n")
+    except Exception as e:
+        print(f"[WARN] Gagal reset zero-point: {e}")
+        print("[WARN] Melanjutkan tanpa reset (sudut mungkin memiliki offset).\n")
 
 
-def read_one_packet(device, addr: int):
-    device.ADDR = int(addr)
-
-    # Trigger register read from sensor and use direct response payload.
-    # This avoids stale cache false-positive from getDeviceData/get().
-    if not hasattr(device, "readReg"):
-        return None
-    values = device.readReg(0x30, 41)
-    if not values:
-        return None
-    return values
-
-
-def _get_field(device, new_name: str, old_name: str):
+def baca_sudut(device):
+    """
+    Membaca sudut Roll, Pitch (EL), dan Yaw dari sensor.
+    Mengembalikan tuple (roll, pitch, yaw) dalam derajat.
+    Menggunakan get() dari deviceModel yang sudah di-parse oleh JY901SDataProcessor.
+    """
     try:
-        if hasattr(device, "get"):
-            return device.get(new_name)
-        return device.getDeviceData(old_name)
+        roll  = device.get("AngleX")   # Roll  (kemiringan kiri-kanan)
+        pitch = device.get("AngleY")   # Pitch (elevasi depan-belakang)
+        yaw   = device.get("AngleZ")   # Yaw   (rotasi horizontal)
+
+        if roll is None or pitch is None or yaw is None:
+            return None, None, None
+
+        return float(roll), float(pitch), float(yaw)
     except Exception:
-        return None
+        return None, None, None
 
 
-def _tilt_compass(mx: float, my: float, mz: float, roll: float, pitch: float) -> float:
-    roll_rad = math.radians(roll)
-    pitch_rad = math.radians(pitch)
-    xh = mx * math.cos(pitch_rad) + mz * math.sin(pitch_rad)
-    yh = (
-        mx * math.sin(roll_rad) * math.sin(pitch_rad)
-        + my * math.cos(roll_rad)
-        - mz * math.sin(roll_rad) * math.cos(pitch_rad)
-    )
-    heading = math.degrees(math.atan2(yh, xh))
-    return (heading + 360.0) % 360.0
-
-
-def _compute_compass_az_cw(device) -> float | None:
-    roll = _get_field(device, "AngleX", "angleX")
-    pitch = _get_field(device, "AngleY", "angleY")
-    yaw = _get_field(device, "AngleZ", "angleZ")
-    accX = _get_field(device, "accX", "accX")
-    accY = _get_field(device, "accY", "accY")
-    accZ = _get_field(device, "accZ", "accZ")
-    magX = _get_field(device, "magX", "magX")
-    magY = _get_field(device, "magY", "magY")
-    magZ = _get_field(device, "magZ", "magZ")
-
-    if None in (roll, pitch, yaw):
-        return None
-
-    roll_tilt = float(roll)
-    pitch_tilt = float(pitch)
-    if None not in (accX, accY, accZ):
-        ax = float(accX)
-        ay = float(accY)
-        az = float(accZ)
-        if abs(ay) + abs(az) > 1e-6:
-            roll_tilt = math.degrees(math.atan2(ay, az))
-        if abs(ax) + abs(az) > 1e-6:
-            pitch_tilt = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
-
-    if None not in (magX, magY, magZ):
-        compass = _tilt_compass(float(magX), float(magY), float(magZ), roll_tilt, pitch_tilt)
-        return (360.0 - compass) % 360.0
-
-    # Fallback: use yaw in CW convention if compass unavailable.
-    return (360.0 - (float(yaw) % 360.0)) % 360.0
-
-
-def _compute_gravity_tilt_deg(device) -> float | None:
-    accX = _get_field(device, "accX", "accX")
-    accY = _get_field(device, "accY", "accY")
-    accZ = _get_field(device, "accZ", "accZ")
-    if None in (accX, accY, accZ):
-        return None
-    ax = float(accX)
-    ay = float(accY)
-    az = float(accZ)
-    # Absolute angle against gravity vector (0..180):
-    # 0   = aligned with +Z gravity reference
-    # 90  = perpendicular to gravity
-    # 180 = opposite direction
-    tilt = math.degrees(math.atan2(math.sqrt(ax * ax + ay * ay), az))
-    return max(0.0, min(180.0, tilt))
-
-
-def probe_addr(device, addr: int, tries: int) -> tuple[bool, dict | None]:
-
-    for _ in range(max(1, tries)):
-        try:
-            vals = read_one_packet(device, addr)
-            if vals:
-                az_compass = _compute_compass_az_cw(device)
-                tilt_gravity_deg = _compute_gravity_tilt_deg(device)
-                return True, {
-                    "az_compass": az_compass,
-                    "tilt_gravity_deg": tilt_gravity_deg,
-                }
-        except Exception:
-            # ignore per-address read errors while scanning
-            pass
-        time.sleep(0.02)
-    return False, None
+def tampilkan_header():
+    print("=" * 60)
+    print("  WT901C485 - Elevasi Absolut Terhadap Gravitasi")
+    print("=" * 60)
+    print("Penjelasan sudut:")
+    print("  ROLL  (X) : Kemiringan kiri-kanan")
+    print("  PITCH (Y) : Kemiringan depan-belakang [ELEVASI/EL]")
+    print("  YAW   (Z) : Rotasi horizontal (kompas)")
+    print()
+    print("Referensi: GRAVITASI BUMI (sudut absolut)")
+    print("  0°   = Sensor sejajar dengan tanah (datar)")
+    print("  90°  = Sensor berdiri tegak")
+    print("  -90° = Sensor terbalik tegak")
+    print()
+    print("Tekan Ctrl+C untuk berhenti.")
+    print("-" * 60)
+    print(f"{'Waktu':<12} {'ROLL (°)':>10} {'PITCH/EL (°)':>14} {'YAW (°)':>10}")
+    print("-" * 60)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scan WT901 RS485 address")
-    parser.add_argument("--port", default=None, help="Serial port (default auto)")
-    parser.add_argument("--baud", type=int, default=9600, help="Baudrate (default: 9600)")
-    parser.add_argument("--start", type=parse_int_auto, default=0x50, help="Address start (default: 0x50)")
-    parser.add_argument("--end", type=parse_int_auto, default=0x5F, help="Address end (default: 0x5F)")
-    parser.add_argument("--tries", type=int, default=3, help="Read attempts per address (default: 3)")
-    args = parser.parse_args()
+    tampilkan_header()
 
-    start = int(args.start)
-    end = int(args.end)
-    if not (0 <= start <= 0xFF and 0 <= end <= 0xFF and start <= end):
-        raise SystemExit("Range address invalid. Gunakan 0..255 dan start <= end.")
-
-    port = args.port
-    if not port:
-        port = "/dev/ttyUSB0" if platform.system().lower() == "linux" else "/dev/tty.usbserial-1330"
-
-    print("=" * 72)
-    print(" WT901 RS485 ADDRESS CHECKER")
-    print("=" * 72)
-    print(f"[INFO] Port={port} Baud={args.baud} Scan=0x{start:02X}..0x{end:02X} tries={args.tries}")
-
-    device = build_device()
-    device.serialConfig.portName = port
-    device.serialConfig.baud = int(args.baud)
-    # Initial address doesn't matter for scan; will be overwritten each probe.
-    device.ADDR = start
-
-    found = []
+    # Inisialisasi koneksi ke sensor
     try:
+        device = deviceModel.DeviceModel(
+            "WT901C485",
+            Protocol485Resolver(),
+            JY901SDataProcessor()
+        )
+        device.ADDR = 0x50
+        if platform.system().lower() == "linux":
+            device.serialConfig.portName = "/dev/ttyUSB0"
+        else:
+            device.serialConfig.portName = "/dev/tty.usbserial-1330"
+        device.serialConfig.baud = 9600
         device.openDevice()
-        time.sleep(0.5)
+        print(f"[OK] Terhubung ke {device.serialConfig.portName} @ {device.serialConfig.baud} baud\n")
+    except Exception as e:
+        print(f"[ERROR] Tidak bisa membuka port: {e}")
+        print("Pastikan:")
+        print("  1. Sensor terhubung ke komputer")
+        print("  2. Port sudah benar (Linux: /dev/ttyUSB0 | Mac: /dev/tty.usbserial-xxxx)")
+        print("  3. Tidak ada aplikasi lain yang menggunakan port ini")
+        sys.exit(1)
 
-        for addr in range(start, end + 1):
-            ok, data = probe_addr(device, addr, args.tries)
-            if ok:
-                found.append((addr, data))
-                if data is None:
-                    print(f"[FOUND] addr=0x{addr:02X}")
-                else:
-                    az_compass = data.get("az_compass")
-                    tilt = data.get("tilt_gravity_deg")
-                    az_txt = "-" if az_compass is None else f"{az_compass:.2f}"
-                    tilt_txt = "-" if tilt is None else f"{tilt:.2f}"
-                    print(f"[FOUND] addr=0x{addr:02X} az_compass={az_txt} tilt_gravity={tilt_txt}")
+    # Reset zero-point untuk memastikan sudut absolut
+    reset_zero_point(device)
+
+    # Loop pembacaan data
+    try:
+        while True:
+            roll, pitch, yaw = baca_sudut(device)
+
+            if pitch is None:
+                print(f"[WARN] Gagal membaca data, mencoba lagi...")
             else:
-                print(f"[---- ] addr=0x{addr:02X}")
+                waktu = time.strftime("%H:%M:%S")
+
+                # Interpretasi elevasi
+                if abs(pitch) < 5:
+                    status = "DATAR"
+                elif pitch > 0:
+                    status = f"MIRING DEPAN {pitch:.1f}°"
+                else:
+                    status = f"MIRING BELAKANG {abs(pitch):.1f}°"
+
+                print(f"{waktu:<12} {roll:>10.2f} {pitch:>14.2f} {yaw:>10.2f}   [{status}]")
+
+            time.sleep(INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n[STOP] scan dibatalkan user.")
-    except Exception as exc:
-        print(f"[ERR] scan gagal: {exc}")
-        sys.exit(1)
+        print("\n" + "-" * 60)
+        print("[INFO] Program dihentikan oleh pengguna.")
+
     finally:
         try:
-            # Avoid noisy SDK thread shutdown errors.
-            device.isOpen = False
-            time.sleep(0.05)
-            if getattr(device, "serialPort", None) is not None:
-                device.serialPort.close()
-            device.serialPort = None
+            device.close()
+            print("[INFO] Koneksi serial ditutup.")
         except Exception:
             pass
-
-    print("-" * 72)
-    if found:
-        addrs = ", ".join(f"0x{a:02X}" for a, _ in found)
-        print(f"[OK] Address terdeteksi: {addrs}")
-    else:
-        print("[WARN] Tidak ada sensor terdeteksi pada range tersebut.")
 
 
 if __name__ == "__main__":
