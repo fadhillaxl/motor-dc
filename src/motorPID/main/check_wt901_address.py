@@ -2,182 +2,418 @@
 Baca 2 sensor WT901C485 pada satu bus RS485.
 
 - 0x50: sensor EL (elevasi/pitch)
-- 0x51: sensor AZ (compass/yaw)
+- 0x51: sensor AZ (compass/yaw) — dengan kalibrasi hard-iron + tilt compensation
+
+Fitur:
+  ✓ Hard-iron calibration (offset X/Y/Z) — disimpan ke file, persistent mati/nyala
+  ✓ Soft-iron calibration (skala X/Y/Z) — kompensasi elips jadi lingkaran
+  ✓ Tilt compensation — heading tetap benar meski sensor miring (seperti kompas HP)
+  ✓ Magnetic declination — koreksi deklinasi lokasi
+  ✓ Mode kalibrasi interaktif — putar sensor 360° lalu simpan otomatis
 """
 
 import os
 import sys
 import time
-import platform
 import math
+import json
+import platform
+import threading
+import select
 
-# PYTHON PATH -> folder chs lokal project
-# =====================================================
+# ─── PATH SETUP ────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SDK_CHS = os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs")
 sys.path.insert(0, SDK_CHS)
 
-# ─── Import dari SDK WITMOTION ─────────────────────────────────────────────
+# ─── Import SDK WITMOTION ──────────────────────────────────────────────────
 try:
     import lib.device_model as deviceModel
     from lib.data_processor.roles.jy901s_dataProcessor import JY901SDataProcessor
     from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolver
 except ImportError as e:
     print(f"[ERROR] Library WITMOTION tidak ditemukan: {e}")
-    print("Pastikan struktur folder SDK sudah benar:")
-    print(f"  {SDK_CHS}/lib/device_model.py")
-    print(f"  {SDK_CHS}/lib/data_processor/roles/jy901s_dataProcessor.py")
-    print(f"  {SDK_CHS}/lib/protocol_resolver/roles/protocol_485_resolver.py")
     sys.exit(1)
 
 # ─── Konfigurasi ──────────────────────────────────────────────────────────
-INTERVAL = 0.5  # Interval baca dalam detik
-ADDR_EL = 0x50
-ADDR_AZ = 0x51
+INTERVAL        = 0.5          # Interval baca (detik)
+ADDR_EL         = 0x50         # Sensor elevasi
+ADDR_AZ         = 0x51         # Sensor azimuth / kompas
 
-# ─── Konstanta Register ───────────────────────────────────────────────────
-REG_KEY = 0x69        # Register kunci untuk operasi tulis
-REG_ANGLE = 0x3D      # AngleX, AngleY, AngleZ (3 register)
-REG_MAG = 0x3A        # MagX, MagY, MagZ (3 register)
+# Deklinasi magnetik kota Anda (cek: https://www.magnetic-declination.com/)
+# Yogyakarta, Indonesia ≈ +0.97° (positif = timur)
+DECLINATION_DEG = 0.97
 
-# ─── Kompas / Heading AZ ──────────────────────────────────────────────────
-# Sesuaikan jika hasil heading terbalik/bergeser karena orientasi pemasangan sensor.
-DECLINATION_DEG = 0.0   # Koreksi deklinasi magnetik lokasi (opsional)
-AZ_OFFSET_DEG = 0.0     # Offset heading manual setelah kalibrasi lapangan
-MAG_SWAP_XY = False     # True jika sumbu X/Y tertukar
-MAG_INV_X = False       # True jika sumbu X terbalik
-MAG_INV_Y = False       # True jika sumbu Y terbalik
+# File penyimpanan kalibrasi (persistent lintas sesi)
+CALIB_FILE = os.path.join(BASE_DIR, "compass_calibration.json")
 
-def _raw_to_angle(raw):
-    """Konversi register 16-bit ke derajat (-180..180)."""
-    if raw > 32767:
-        raw -= 65536
-    return raw / 32768.0 * 180.0
+# ─── Register ─────────────────────────────────────────────────────────────
+REG_KEY   = 0x69
+REG_ANGLE = 0x3D    # Roll, Pitch, Yaw
+REG_MAG   = 0x3A    # MagX, MagY, MagZ
+REG_ACC   = 0x34    # AccX, AccY, AccZ (opsional, tidak dipakai di sini)
 
+# ═══════════════════════════════════════════════════════════════════════════
+#   KALIBRASI — Hard-iron + Soft-iron
+# ═══════════════════════════════════════════════════════════════════════════
 
-def _map_el_roll_to_90_0(el_roll_deg):
-    """Map EL dari roll: |roll| 0..90 menjadi EL 90..0."""
-    roll_abs_clamped = max(0.0, min(90.0, abs(float(el_roll_deg))))
-    return 90.0 - roll_abs_clamped
-
-
-def _normalize_azimuth_0_360(yaw_deg):
-    """Normalisasi azimuth ke rentang 0..360."""
-    return float(yaw_deg) % 360.0
+DEFAULT_CALIB = {
+    # Offset hard-iron (bias magnet internal): geser pusat elips ke 0,0,0
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "offset_z": 0.0,
+    # Skala soft-iron: normalkan jari-jari elips jadi lingkaran
+    "scale_x": 1.0,
+    "scale_y": 1.0,
+    "scale_z": 1.0,
+}
 
 
-def _raw_to_signed16(raw):
-    """Konversi register uint16 ke int16."""
+def load_calibration() -> dict:
+    """Muat kalibrasi dari file. Jika tidak ada, pakai default."""
+    if os.path.exists(CALIB_FILE):
+        try:
+            with open(CALIB_FILE, "r") as f:
+                data = json.load(f)
+            # Validasi key lengkap
+            for k in DEFAULT_CALIB:
+                if k not in data:
+                    data[k] = DEFAULT_CALIB[k]
+            print(f"[OK] Kalibrasi dimuat dari {CALIB_FILE}")
+            print(f"     offset=({data['offset_x']:.1f}, {data['offset_y']:.1f}, {data['offset_z']:.1f})")
+            print(f"     scale=({data['scale_x']:.4f}, {data['scale_y']:.4f}, {data['scale_z']:.4f})")
+            return data
+        except Exception as e:
+            print(f"[WARN] Gagal membaca kalibrasi: {e} — pakai default")
+    else:
+        print(f"[WARN] File kalibrasi tidak ditemukan ({CALIB_FILE})")
+        print("       Jalankan mode kalibrasi dengan argumen: python script.py --calibrate")
+    return dict(DEFAULT_CALIB)
+
+
+def save_calibration(calib: dict):
+    """Simpan kalibrasi ke file JSON."""
+    with open(CALIB_FILE, "w") as f:
+        json.dump(calib, f, indent=2)
+    print(f"[OK] Kalibrasi disimpan ke {CALIB_FILE}")
+
+
+def compute_calibration_from_samples(samples: list) -> dict:
+    """
+    Hitung parameter kalibrasi dari kumpulan sampel (mx, my, mz).
+
+    Hard-iron offset  = (max + min) / 2  per sumbu
+    Soft-iron scale   = avg_radius / radius_sumbu  (normalisasi)
+    """
+    xs = [s[0] for s in samples]
+    ys = [s[1] for s in samples]
+    zs = [s[2] for s in samples]
+
+    offset_x = (max(xs) + min(xs)) / 2.0
+    offset_y = (max(ys) + min(ys)) / 2.0
+    offset_z = (max(zs) + min(zs)) / 2.0
+
+    # Jari-jari tiap sumbu setelah dikurangi offset
+    r_x = (max(xs) - min(xs)) / 2.0
+    r_y = (max(ys) - min(ys)) / 2.0
+    r_z = (max(zs) - min(zs)) / 2.0
+
+    avg_r = (r_x + r_y + r_z) / 3.0
+
+    scale_x = avg_r / r_x if r_x > 0 else 1.0
+    scale_y = avg_r / r_y if r_y > 0 else 1.0
+    scale_z = avg_r / r_z if r_z > 0 else 1.0
+
+    return {
+        "offset_x": offset_x,
+        "offset_y": offset_y,
+        "offset_z": offset_z,
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        "scale_z": scale_z,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   KONVERSI DATA RAW
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _raw_to_angle(raw) -> float:
+    """Register 16-bit → derajat (-180 .. +180)."""
+    val = int(raw)
+    if val > 32767:
+        val -= 65536
+    return val / 32768.0 * 180.0
+
+
+def _raw_to_signed16(raw) -> int:
+    """uint16 → int16."""
     val = int(raw) & 0xFFFF
     if val >= 0x8000:
         val -= 0x10000
     return val
 
 
-def _heading_from_magnetometer(mag_x, mag_y):
-    """
-    Hitung heading kompas dari magnetometer (sumbu horizontal), hasil 0..360 derajat.
-    """
-    x = float(mag_x)
-    y = float(mag_y)
-    if MAG_SWAP_XY:
-        x, y = y, x
-    if MAG_INV_X:
-        x = -x
-    if MAG_INV_Y:
-        y = -y
-
-    heading = math.degrees(math.atan2(y, x))
-    heading += DECLINATION_DEG + AZ_OFFSET_DEG
-    return _normalize_azimuth_0_360(heading)
+def _normalize_0_360(deg: float) -> float:
+    return float(deg) % 360.0
 
 
-def reset_zero_point(device, addr):
-    """
-    Menghapus zero-point yang tersimpan di sensor.
-    Ini memastikan EL selalu mengacu pada gravitasi (sudut absolut),
-    bukan posisi saat dinyalakan.
-    """
-    print("[INFO] Mereset zero-point ke default (sudut absolut)...")
-    try:
-        device.ADDR = addr
-        # Unlock register untuk penulisan
-        device.writeReg(REG_KEY, 0xB588)
-        time.sleep(0.1)
-        device.writeReg(0x01, 0x0000)
-        time.sleep(0.3)
+def _map_el_roll_to_90_0(roll_deg: float) -> float:
+    """Roll absolut 0–90° → EL 90–0°."""
+    return 90.0 - max(0.0, min(90.0, abs(float(roll_deg))))
 
-        print("[OK] Zero-point berhasil direset. Sensor sekarang menggunakan gravitasi sebagai referensi.\n")
-    except Exception as e:
-        print(f"[WARN] Gagal reset zero-point: {e}")
-        print("[WARN] Melanjutkan tanpa reset (sudut mungkin memiliki offset).\n")
 
+# ═══════════════════════════════════════════════════════════════════════════
+#   PEMBACAAN SENSOR
+# ═══════════════════════════════════════════════════════════════════════════
 
 def baca_sudut(device, addr):
     """
-    Membaca sudut Roll, Pitch (EL), dan Yaw dari sensor.
-    Mengembalikan tuple (roll, pitch, yaw) dalam derajat.
-    Data diambil dari readReg(0x3D, 3) lalu dikonversi ke derajat.
+    Baca Roll, Pitch, Yaw dari sensor.
+    Return: (roll, pitch, yaw) dalam derajat, atau (None, None, None) jika gagal.
     """
     try:
         device.ADDR = addr
         vals = device.readReg(REG_ANGLE, 3)
         if not vals or len(vals) < 3:
             return None, None, None
-        roll = _raw_to_angle(vals[0])
-        pitch = _raw_to_angle(vals[1])
-        yaw = _raw_to_angle(vals[2])
-        return float(roll), float(pitch), float(yaw)
+        return (
+            float(_raw_to_angle(vals[0])),
+            float(_raw_to_angle(vals[1])),
+            float(_raw_to_angle(vals[2])),
+        )
     except Exception:
         return None, None, None
 
 
-def baca_azimuth_kompas(device, addr):
+def baca_magnetometer(device, addr):
     """
-    Baca heading kompas dari register magnetometer AZ (0x3A..0x3C).
+    Baca MagX, MagY, MagZ (raw int16) dari sensor.
+    Return: (mx, my, mz) atau (None, None, None) jika gagal.
     """
     try:
         device.ADDR = addr
         vals = device.readReg(REG_MAG, 3)
-        if not vals or len(vals) < 2:
-            return None
-        mag_x = _raw_to_signed16(vals[0])
-        mag_y = _raw_to_signed16(vals[1])
-        return _heading_from_magnetometer(mag_x, mag_y)
+        if not vals or len(vals) < 3:
+            return None, None, None
+        return (
+            _raw_to_signed16(vals[0]),
+            _raw_to_signed16(vals[1]),
+            _raw_to_signed16(vals[2]),
+        )
     except Exception:
-        return None
+        return None, None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   ALGORITMA HEADING — Tilt-Compensated + Hard/Soft-Iron Correction
+# ═══════════════════════════════════════════════════════════════════════════
+
+def heading_tilt_compensated(
+    mx_raw, my_raw, mz_raw,
+    roll_deg, pitch_deg,
+    calib: dict,
+) -> float:
+    """
+    Hitung heading kompas dengan kompensasi kemiringan sensor (seperti kompas HP).
+
+    Langkah:
+      1. Koreksi hard-iron (geser ke pusat) + soft-iron (normalisasi elips)
+      2. Tilt compensation menggunakan roll & pitch dari IMU
+      3. atan2 → heading 0..360° + deklinasi magnetik
+
+    Args:
+        mx_raw, my_raw, mz_raw : nilai magnetometer mentah (int16)
+        roll_deg, pitch_deg    : kemiringan sensor dari IMU (derajat)
+        calib                  : dict kalibrasi (offset + scale)
+
+    Returns:
+        Heading 0..360 derajat terhadap Utara Magnetik
+    """
+    # ── 1. Koreksi Hard-iron & Soft-iron ────────────────────────────────
+    mx = (float(mx_raw) - calib["offset_x"]) * calib["scale_x"]
+    my = (float(my_raw) - calib["offset_y"]) * calib["scale_y"]
+    mz = (float(mz_raw) - calib["offset_z"]) * calib["scale_z"]
+
+    # ── 2. Tilt Compensation ─────────────────────────────────────────────
+    # Referensi: https://www.nxp.com/docs/en/application-note/AN4248.pdf
+    #
+    # Sistem koordinat WT901C:
+    #   Roll  = rotasi di sumbu X (kiri-kanan)
+    #   Pitch = rotasi di sumbu Y (depan-belakang)
+    #
+    # Tanpa kompensasi ini, heading berubah saat sensor miring → tidak akurat!
+    roll  = math.radians(roll_deg)
+    pitch = math.radians(pitch_deg)
+
+    # Proyeksi magnetometer ke bidang horizontal virtual
+    #   Xh = Mx·cos(pitch) + Mz·sin(pitch)
+    #   Yh = Mx·sin(roll)·sin(pitch) + My·cos(roll) − Mz·sin(roll)·cos(pitch)
+    cos_roll  = math.cos(roll)
+    sin_roll  = math.sin(roll)
+    cos_pitch = math.cos(pitch)
+    sin_pitch = math.sin(pitch)
+
+    xh = mx * cos_pitch + mz * sin_pitch
+    yh = mx * sin_roll * sin_pitch + my * cos_roll - mz * sin_roll * cos_pitch
+
+    # ── 3. Hitung Heading ─────────────────────────────────────────────────
+    #   atan2(Yh, Xh) → sudut dari Utara
+    #   Konvensi: Utara=0°, Timur=90°, Selatan=180°, Barat=270°
+    heading = math.degrees(math.atan2(yh, xh))
+
+    # ── 4. Koreksi Deklinasi Magnetik ─────────────────────────────────────
+    heading += DECLINATION_DEG
+
+    return _normalize_0_360(heading)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   RESET ZERO-POINT
+# ═══════════════════════════════════════════════════════════════════════════
+
+def reset_zero_point(device, addr):
+    """Reset zero-point sensor → sudut mengacu ke gravitasi (absolut)."""
+    print(f"[INFO] Reset zero-point sensor {hex(addr)}...")
+    try:
+        device.ADDR = addr
+        device.writeReg(REG_KEY, 0xB588)
+        time.sleep(0.1)
+        device.writeReg(0x01, 0x0000)
+        time.sleep(0.3)
+        print(f"[OK]   Zero-point {hex(addr)} direset.\n")
+    except Exception as e:
+        print(f"[WARN] Gagal reset zero-point {hex(addr)}: {e}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   MODE KALIBRASI INTERAKTIF
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_calibration_mode(device):
+    """
+    Mode kalibrasi hard-iron + soft-iron.
+
+    Pengguna diminta memutar sensor AZ (0x51) perlahan ke semua arah
+    selama ±30 detik (pola angka 8 / figure-8).
+    Program mengumpulkan sampel min/max lalu menghitung & menyimpan kalibrasi.
+    """
+    print()
+    print("=" * 60)
+    print("  MODE KALIBRASI KOMPAS")
+    print("=" * 60)
+    print("""
+Instruksi:
+  1. Pegang sensor AZ (0x51) di tangan.
+  2. Putar perlahan membentuk ANGKA 8 di udara (figure-8),
+     miring ke kiri, kanan, atas, bawah — semua arah.
+  3. Lakukan selama ~30 detik hingga hitungan mundur selesai.
+  4. Kalibrasi akan disimpan otomatis ke file JSON.
+
+Tekan ENTER untuk mulai...
+""")
+    input()
+
+    try:
+        device.ADDR = ADDR_AZ
+    except Exception:
+        pass
+
+    DURASI = 30   # detik
+    samples = []
+
+    print(f"[▶] Mulai kalibrasi — putar sensor sekarang! ({DURASI} detik)")
+    t_start = time.time()
+    counter = 0
+
+    while True:
+        elapsed = time.time() - t_start
+        sisa = DURASI - elapsed
+        if sisa <= 0:
+            break
+
+        mx, my, mz = baca_magnetometer(device, ADDR_AZ)
+        if mx is not None:
+            samples.append((mx, my, mz))
+            counter += 1
+
+        # Tampilkan progress
+        bar = "█" * int((elapsed / DURASI) * 30)
+        print(f"\r  [{bar:<30}] {sisa:.0f}s tersisa  |  {counter} sampel", end="", flush=True)
+        time.sleep(0.1)
+
+    print(f"\n\n[OK] Selesai. Total sampel: {len(samples)}")
+
+    if len(samples) < 20:
+        print("[ERROR] Sampel terlalu sedikit. Coba lagi.")
+        return
+
+    calib = compute_calibration_from_samples(samples)
+
+    print(f"""
+Hasil Kalibrasi:
+  Hard-iron offset:
+    X = {calib['offset_x']:.2f}
+    Y = {calib['offset_y']:.2f}
+    Z = {calib['offset_z']:.2f}
+  Soft-iron scale:
+    X = {calib['scale_x']:.4f}
+    Y = {calib['scale_y']:.4f}
+    Z = {calib['scale_z']:.4f}
+""")
+
+    save_calibration(calib)
+    print("Kalibrasi selesai! Jalankan script tanpa argumen untuk mulai membaca.\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   TAMPILAN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def arah_mata_angin(heading: float) -> str:
+    """Konversi heading derajat → nama mata angin (N/NE/E/SE/S/SW/W/NW)."""
+    arah = ["U", "UL", "T", "TG", "S", "BD", "B", "UB"]
+    full = ["Utara", "Utara-Timur", "Timur", "Timur-Selatan",
+            "Selatan", "Barat-Selatan", "Barat", "Barat-Utara"]
+    idx = int((heading + 22.5) / 45.0) % 8
+    return f"{arah[idx]} ({full[idx]})"
 
 
 def tampilkan_header():
-    print("=" * 60)
-    print("  WT901C485 - Dual Sensor (EL 0x50 + AZ 0x51)")
-    print("=" * 60)
-    print("Penjelasan sudut:")
-    print("  ROLL  (X) : Kemiringan kiri-kanan")
-    print("  PITCH (Y) : Kemiringan depan-belakang [ELEVASI/EL]")
-    print("  AZ_YAW    : Heading kompas 0..360 derajat")
+    print("=" * 70)
+    print("  WT901C485 — Dual Sensor | Kompas Tilt-Compensated")
+    print(f"  Deklinasi: {DECLINATION_DEG:+.2f}°  |  Kalibrasi: {CALIB_FILE}")
+    print("=" * 70)
+    print(f"  EL sensor: {hex(ADDR_EL)}  |  AZ/Kompas sensor: {hex(ADDR_AZ)}")
     print()
-    print("Referensi: GRAVITASI BUMI (sudut absolut)")
-    print("  0°   = Sensor sejajar dengan tanah (datar)")
-    print("  90°  = Sensor berdiri tegak")
-    print("  -90° = Sensor terbalik tegak")
+    print("  EL_FROM_ROLL : Elevasi dari roll (0°=datar, 90°=tegak)")
+    print("  HEADING      : Arah kompas 0..360° (Utara=0°, Timur=90°)")
     print()
-    print("Tekan Ctrl+C untuk berhenti.")
-    print("-" * 60)
-    print(f"{'Waktu':<10} {'EL_FROM_ROLL(°)':>15} {'AZ_YAW(°)':>10} {'EL_ROLL(°)':>11} {'AZ_ROLL(°)':>11}")
-    print("-" * 60)
+    print("  Tekan Ctrl+C untuk berhenti.")
+    print("-" * 70)
+    print(
+        f"{'Waktu':<10} "
+        f"{'EL(°)':>8} "
+        f"{'HEADING(°)':>12} "
+        f"{'ARAH':>20} "
+        f"{'EL_ROLL(°)':>11} "
+        f"{'AZ_ROLL(°)':>11}"
+    )
+    print("-" * 70)
 
 
-def main():
-    tampilkan_header()
+# ═══════════════════════════════════════════════════════════════════════════
+#   MAIN
+# ═══════════════════════════════════════════════════════════════════════════
 
-    # Inisialisasi koneksi ke sensor
+def buka_device():
+    """Inisialisasi dan buka koneksi serial ke sensor."""
     try:
         device = deviceModel.DeviceModel(
             "WT901C485-DUAL",
             Protocol485Resolver(),
             JY901SDataProcessor(),
-            lambda *_: None
+            lambda *_: None,
         )
         device.ADDR = ADDR_EL
         if platform.system().lower() == "linux":
@@ -186,52 +422,94 @@ def main():
             device.serialConfig.portName = "/dev/tty.usbserial-1330"
         device.serialConfig.baud = 9600
         device.openDevice()
-        print(f"[OK] Terhubung ke {device.serialConfig.portName} @ {device.serialConfig.baud} baud")
-        print(f"[OK] Polling alamat sensor: EL={hex(ADDR_EL)}, AZ={hex(ADDR_AZ)}\n")
+        print(f"[OK] Terhubung ke {device.serialConfig.portName} @ {device.serialConfig.baud} baud\n")
+        return device
     except Exception as e:
         print(f"[ERROR] Tidak bisa membuka port: {e}")
-        print("Pastikan:")
-        print("  1. Sensor terhubung ke komputer")
-        print("  2. Port sudah benar (Linux: /dev/ttyUSB0 | Mac: /dev/tty.usbserial-xxxx)")
-        print("  3. Tidak ada aplikasi lain yang menggunakan port ini")
+        print("Pastikan sensor terhubung dan port benar.")
         sys.exit(1)
 
-    # Reset zero-point untuk masing-masing sensor
+
+def main():
+    # ── Cek mode kalibrasi ──────────────────────────────────────────────
+    if len(sys.argv) > 1 and sys.argv[1] == "--calibrate":
+        device = buka_device()
+        run_calibration_mode(device)
+        try:
+            device.closeDevice()
+        except Exception:
+            pass
+        return
+
+    # ── Muat kalibrasi dari file ────────────────────────────────────────
+    calib = load_calibration()
+    print()
+
+    # ── Buka device ────────────────────────────────────────────────────
+    device = buka_device()
+
+    # ── Reset zero-point kedua sensor ──────────────────────────────────
     reset_zero_point(device, ADDR_EL)
     reset_zero_point(device, ADDR_AZ)
 
-    # Loop pembacaan data
+    tampilkan_header()
+
+    # ── Loop pembacaan ─────────────────────────────────────────────────
     try:
         while True:
+            # Baca sensor EL
             el_roll, el_pitch, _ = baca_sudut(device, ADDR_EL)
-            az_roll, _, az_yaw_fused = baca_sudut(device, ADDR_AZ)
-            az_yaw_compass = baca_azimuth_kompas(device, ADDR_AZ)
 
-            if el_pitch is None or (az_yaw_compass is None and az_yaw_fused is None):
-                print("[WARN] Gagal membaca data dari salah satu sensor, mencoba lagi...")
-            else:
-                waktu = time.strftime("%H:%M:%S")
-                el_from_roll = _map_el_roll_to_90_0(el_roll)
-                az_yaw_360 = az_yaw_compass if az_yaw_compass is not None else _normalize_azimuth_0_360(az_yaw_fused)
+            # Baca sensor AZ: sudut + magnetometer
+            az_roll, az_pitch, az_yaw_raw = baca_sudut(device, ADDR_AZ)
+            mx, my, mz = baca_magnetometer(device, ADDR_AZ)
 
-                if el_from_roll < 5:
-                    status_el = "TEGAK"
-                elif el_from_roll > 85:
-                    status_el = "DATAR"
-                else:
-                    status_el = f"EL {el_from_roll:.1f}°"
+            if el_roll is None or az_roll is None:
+                print("[WARN] Gagal baca sensor, mencoba lagi...")
+                time.sleep(INTERVAL)
+                continue
 
-                print(
-                    f"{waktu:<10} {el_from_roll:>15.2f} {az_yaw_360:>10.2f} "
-                    f"{el_roll:>11.2f} {az_roll:>11.2f}   [EL:{status_el}]"
+            waktu = time.strftime("%H:%M:%S")
+
+            # EL dari roll sensor EL
+            el_from_roll = _map_el_roll_to_90_0(el_roll)
+
+            # Heading kompas tilt-compensated (prioritas) atau fallback ke yaw fusion
+            if mx is not None:
+                heading = heading_tilt_compensated(
+                    mx, my, mz,
+                    az_roll, az_pitch,   # gunakan roll/pitch sensor AZ untuk kompensasi
+                    calib,
                 )
+            else:
+                # Fallback: pakai yaw fused dari IMU (tidak ideal)
+                heading = _normalize_0_360(az_yaw_raw + DECLINATION_DEG)
+
+            arah = arah_mata_angin(heading)
+
+            # Status EL
+            if el_from_roll < 5:
+                status_el = "TEGAK"
+            elif el_from_roll > 85:
+                status_el = "DATAR"
+            else:
+                status_el = f"{el_from_roll:.1f}°"
+
+            print(
+                f"{waktu:<10} "
+                f"{el_from_roll:>8.2f} "
+                f"{heading:>12.2f} "
+                f"{arah:>20} "
+                f"{el_roll:>11.2f} "
+                f"{az_roll:>11.2f}"
+                f"  [EL:{status_el}]"
+            )
 
             time.sleep(INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n" + "-" * 60)
-        print("[INFO] Program dihentikan oleh pengguna.")
-
+        print("\n" + "-" * 70)
+        print("[INFO] Program dihentikan.")
     finally:
         try:
             device.closeDevice()
