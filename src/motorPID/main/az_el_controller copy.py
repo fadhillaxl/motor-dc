@@ -682,7 +682,6 @@ class WT901AxisReader:
         az_offset_deg: float = 0.0,
         el_offset_deg: float = 0.0,
         alpha: float = 0.15,
-        shared_device=None,
     ):
         self.label = label
         self.addr = addr
@@ -690,12 +689,7 @@ class WT901AxisReader:
         self.el_offset_deg = el_offset_deg
         self.alpha = alpha
         self.last_az = None
-        if shared_device is not None:
-            self.device = shared_device
-            self._owns_device = False
-        else:
-            self.device = self._buat_device_model()
-            self._owns_device = True
+        self.device = self._buat_device_model()
         self.device.ADDR = addr
 
         if platform.system().lower() == "linux":
@@ -721,13 +715,10 @@ class WT901AxisReader:
             )
 
     def open(self):
-        if self._owns_device:
-            self.device.openDevice()
-            time.sleep(1.0)
+        self.device.openDevice()
+        time.sleep(1.0)
 
     def close(self):
-        if not self._owns_device:
-            return
         try:
             # SDK thread closes cleaner if we drop isOpen before closing the file descriptor.
             if hasattr(self.device, "isOpen"):
@@ -783,7 +774,6 @@ class WT901AxisReader:
     def read(self) -> dict | None:
         # Replicated acquisition + error handling style from fix-compas.py
         try:
-            self.device.ADDR = self.addr
             if hasattr(self.device, "readReg"):
                 self.device.readReg(0x30, 41)
 
@@ -885,56 +875,6 @@ class WT901AxisReader:
             time.sleep(max(0.0, float(delay_s)))
         return None
 
-
-class WT901DualAddressReader:
-    """
-    Dual WT901 on one RS485 bus:
-    - 0x51 -> AZ (yaw/compass fusion)
-    - 0x50 -> EL (roll->elevation)
-    """
-
-    def __init__(self, az_addr: int = 0x51, el_addr: int = 0x50, az_offset_deg: float = 0.0, el_offset_deg: float = 0.0):
-        self.az_addr = int(az_addr)
-        self.el_addr = int(el_addr)
-        self.az_reader = WT901AxisReader(label="AZ", addr=self.az_addr, az_offset_deg=az_offset_deg, el_offset_deg=0.0)
-        # Share same serial device; only one master FD on the RS485 port.
-        self.el_reader = WT901AxisReader(
-            label="EL",
-            addr=self.el_addr,
-            az_offset_deg=0.0,
-            el_offset_deg=el_offset_deg,
-            shared_device=self.az_reader.device,
-        )
-
-    def open(self):
-        self.az_reader.open()
-
-    def close(self):
-        self.az_reader.close()
-
-    @staticmethod
-    def _merge_packets(az_pkt: dict, el_pkt: dict, az_addr: int, el_addr: int) -> dict:
-        out = dict(az_pkt)
-        out["el"] = float(el_pkt["el"])
-        out["el_roll"] = float(el_pkt["el_roll"])
-        out["el_addr"] = int(el_addr)
-        out["az_addr"] = int(az_addr)
-        return out
-
-    def read_az_with_retry(self, attempts: int = 30, delay_s: float = 0.05) -> dict | None:
-        return self.az_reader.read_with_retry(attempts=attempts, delay_s=delay_s)
-
-    def read_el_with_retry(self, attempts: int = 30, delay_s: float = 0.05) -> dict | None:
-        return self.el_reader.read_with_retry(attempts=attempts, delay_s=delay_s)
-
-    def read_with_retry(self, attempts: int = 30, delay_s: float = 0.05) -> dict | None:
-        for _ in range(max(1, int(attempts))):
-            az_pkt = self.az_reader.read()
-            el_pkt = self.el_reader.read()
-            if az_pkt is not None and el_pkt is not None:
-                return self._merge_packets(az_pkt, el_pkt, self.az_addr, self.el_addr)
-            time.sleep(max(0.0, float(delay_s)))
-        return None
 
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("az_el_closed_loop")
@@ -1643,20 +1583,13 @@ def main():
     try:
         motor_az, motor_el = build_default_motors()
 
-        # Dual WT901 on one RS485 bus:
-        # - 0x51 for AZ (compass/yaw fused azimuth)
-        # - 0x50 for EL (roll->elevation)
-        wt = WT901DualAddressReader(az_addr=0x51, el_addr=0x50, az_offset_deg=0.0, el_offset_deg=0.0)
+        # Single WT901 reader for both AZ and EL from one sensor packet.
+        wt = WT901AxisReader(label="AZEL", addr=0x50, az_offset_deg=0.0, el_offset_deg=0.0)
         wt.open()
-        logger.info("WT901 connected. AZ addr=0x51 | EL addr=0x50 | zero_reset=disabled")
+        logger.info("WT901 connected.")
 
-        # Fail-fast startup validation per-address.
-        az_boot = wt.read_az_with_retry(attempts=40, delay_s=0.05)
-        if az_boot is None:
-            raise RuntimeError("Gagal membaca sensor AZ pada address 0x51.")
-        el_boot = wt.read_el_with_retry(attempts=40, delay_s=0.05)
-        if el_boot is None:
-            raise RuntimeError("Gagal membaca sensor EL pada address 0x50.")
+        # Calibration routine replicated from fix-compas.py flow.
+        wt.reset_zero_point()
 
         # Sync internal motor positions from absolute sensor to avoid false soft-limit trips.
         boot_data = wt.read_with_retry(attempts=40, delay_s=0.05)

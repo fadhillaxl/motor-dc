@@ -31,6 +31,8 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 # CONFIG
 # =============================
 INTERVAL = 0.1
+AZ_ADDR = 0x51
+EL_ADDR = 0x50
 AZ_OFFSET_DEG = 0.0
 EL_OFFSET_DEG = 0.0
 
@@ -123,10 +125,11 @@ def tilt_compass(mx, my, mz, roll, pitch):
 # =============================
 # READ DATA
 # =============================
-def baca_sudut(device):
+def baca_sudut(device, addr, smooth_az=True):
     global last_az
 
     try:
+        device.ADDR = int(addr)
         if hasattr(device, "readReg"):
             device.readReg(0x30, 41)
 
@@ -214,8 +217,9 @@ def baca_sudut(device):
         # =============================
         # 🔥 FIX SMOOTH (NO JUMP)
         # =============================
-        az = angle_lerp(az, last_az)
-        last_az = az
+        if smooth_az:
+            az = angle_lerp(az, last_az)
+            last_az = az
         el = map_roll_to_el(roll, EL_OFFSET_DEG)
 
         return roll, pitch, yaw_cw, compass_cw, az, el, src
@@ -233,7 +237,7 @@ def main():
     print("="*80)
 
     device = buat_device_model()
-    device.ADDR = 0x50
+    device.ADDR = AZ_ADDR
 
     if platform.system().lower() == "linux":
         device.serialConfig.portName = "/dev/ttyUSB0"
@@ -246,7 +250,25 @@ def main():
     time.sleep(1)
     print("[OK] Connected\n")
 
-    reset_zero_point(device)
+    print(f"[INFO] Dual WT901 mode (no auto reset): AZ=0x{AZ_ADDR:02X}, EL=0x{EL_ADDR:02X}")
+
+    # Fail fast startup validation
+    az_boot = None
+    el_boot = None
+    for _ in range(30):
+        az_boot = baca_sudut(device, AZ_ADDR, smooth_az=False)
+        if az_boot[0] is not None:
+            break
+        time.sleep(0.05)
+    for _ in range(30):
+        el_boot = baca_sudut(device, EL_ADDR, smooth_az=False)
+        if el_boot[0] is not None:
+            break
+        time.sleep(0.05)
+    if az_boot is None or az_boot[0] is None:
+        raise RuntimeError(f"Gagal membaca sensor AZ di address 0x{AZ_ADDR:02X}")
+    if el_boot is None or el_boot[0] is None:
+        raise RuntimeError(f"Gagal membaca sensor EL di address 0x{EL_ADDR:02X}")
 
     print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>8} {:>10}".format(
         "TIME", "ROLL", "PITCH", "YAW", "COMPASS", "AZ", "EL", "SRC"
@@ -255,22 +277,26 @@ def main():
 
     try:
         while True:
-            data = baca_sudut(device)
+            az_data = baca_sudut(device, AZ_ADDR, smooth_az=True)
+            el_data = baca_sudut(device, EL_ADDR, smooth_az=False)
 
-            if data[0] is not None:
-                roll, pitch, yaw, comp, az, el, src = data
+            if az_data[0] is not None and el_data[0] is not None:
+                az_roll, az_pitch, yaw, comp, az, _, src = az_data
+                el_roll, _, _, _, _, el, _ = el_data
                 now = time.strftime("%H:%M:%S")
 
                 print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>8.2f} {:>10}".format(
                     now,
-                    roll,
-                    pitch,
+                    az_roll,
+                    az_pitch,
                     yaw,
                     f"{comp:.2f}" if comp else "-",
                     az,
                     el,
                     src
                 ))
+            else:
+                print("[WARN] Read failed on AZ/EL address")
 
             time.sleep(INTERVAL)
 
