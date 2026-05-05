@@ -124,14 +124,35 @@ def _compute_compass_az_cw(device) -> float | None:
     return (360.0 - (float(yaw) % 360.0)) % 360.0
 
 
-def probe_addr(device, addr: int, tries: int) -> tuple[bool, float | None]:
+def _compute_gravity_tilt_deg(device) -> float | None:
+    accX = _get_field(device, "accX", "accX")
+    accY = _get_field(device, "accY", "accY")
+    accZ = _get_field(device, "accZ", "accZ")
+    if None in (accX, accY, accZ):
+        return None
+    ax = float(accX)
+    ay = float(accY)
+    az = float(accZ)
+    # Absolute angle against gravity vector (0..180):
+    # 0   = aligned with +Z gravity reference
+    # 90  = perpendicular to gravity
+    # 180 = opposite direction
+    tilt = math.degrees(math.atan2(math.sqrt(ax * ax + ay * ay), az))
+    return max(0.0, min(180.0, tilt))
+
+
+def probe_addr(device, addr: int, tries: int) -> tuple[bool, dict | None]:
 
     for _ in range(max(1, tries)):
         try:
             vals = read_one_packet(device, addr)
             if vals:
                 az_compass = _compute_compass_az_cw(device)
-                return True, az_compass
+                tilt_gravity_deg = _compute_gravity_tilt_deg(device)
+                return True, {
+                    "az_compass": az_compass,
+                    "tilt_gravity_deg": tilt_gravity_deg,
+                }
         except Exception:
             # ignore per-address read errors while scanning
             pass
@@ -174,13 +195,17 @@ def main():
         time.sleep(0.5)
 
         for addr in range(start, end + 1):
-            ok, angle_z = probe_addr(device, addr, args.tries)
+            ok, data = probe_addr(device, addr, args.tries)
             if ok:
-                found.append((addr, angle_z))
-                if angle_z is None:
+                found.append((addr, data))
+                if data is None:
                     print(f"[FOUND] addr=0x{addr:02X}")
                 else:
-                    print(f"[FOUND] addr=0x{addr:02X} az_compass={angle_z:.2f}")
+                    az_compass = data.get("az_compass")
+                    tilt = data.get("tilt_gravity_deg")
+                    az_txt = "-" if az_compass is None else f"{az_compass:.2f}"
+                    tilt_txt = "-" if tilt is None else f"{tilt:.2f}"
+                    print(f"[FOUND] addr=0x{addr:02X} az_compass={az_txt} tilt_gravity={tilt_txt}")
             else:
                 print(f"[---- ] addr=0x{addr:02X}")
 
