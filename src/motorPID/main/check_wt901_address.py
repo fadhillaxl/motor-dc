@@ -36,7 +36,7 @@ except ImportError as e:
     sys.exit(1)
 
 # ─── Konfigurasi ──────────────────────────────────────────────────────────
-INTERVAL        = 0.5          # Interval baca (detik)
+INTERVAL        = 0.1          # Interval baca (detik)
 ADDR_EL         = 0x50         # Sensor elevasi
 ADDR_AZ         = 0x51         # Sensor azimuth / kompas
 
