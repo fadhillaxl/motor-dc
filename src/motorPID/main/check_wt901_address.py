@@ -47,6 +47,12 @@ DECLINATION_DEG = 0.97
 # File penyimpanan kalibrasi (persistent lintas sesi)
 CALIB_FILE = os.path.join(BASE_DIR, "compass_calibration.json")
 
+# Konfigurasi stabilisasi heading (compass-only)
+HEADING_MAX_STEP_DEG = 5.0
+HEADING_OUTLIER_DEG = 35.0
+HEADING_EMA_ALPHA = 0.20
+HEADING_WARMUP_SAMPLES = 5
+
 # ─── Register ─────────────────────────────────────────────────────────────
 REG_KEY   = 0x69
 REG_ANGLE = 0x3D    # Roll, Pitch, Yaw
@@ -87,6 +93,7 @@ def load_calibration() -> dict:
             print(f"[WARN] Gagal membaca kalibrasi: {e} — pakai default")
     else:
         print(f"[WARN] File kalibrasi tidak ditemukan ({CALIB_FILE})")
+        print("       Heading tetap berjalan, tapi bisa drift/noisy tanpa kalibrasi.")
         print("       Jalankan mode kalibrasi dengan argumen: python script.py --calibrate")
     return dict(DEFAULT_CALIB)
 
@@ -158,9 +165,67 @@ def _normalize_0_360(deg: float) -> float:
     return float(deg) % 360.0
 
 
+def _angle_diff_deg(a: float, b: float) -> float:
+    """Selisih sudut terpendek a-b dalam derajat (-180..180)."""
+    return (float(a) - float(b) + 180.0) % 360.0 - 180.0
+
+
+def _angle_ema_deg(new_deg: float, old_deg: float, alpha: float) -> float:
+    """EMA sudut yang aman di wrap 0/360."""
+    if old_deg is None:
+        return _normalize_0_360(new_deg)
+    d = _angle_diff_deg(new_deg, old_deg)
+    return _normalize_0_360(float(old_deg) + float(alpha) * d)
+
+
+def _clamp(val: float, lo: float, hi: float) -> float:
+    return max(float(lo), min(float(hi), float(val)))
+
+
 def _map_el_roll_to_90_0(roll_deg: float) -> float:
     """Roll absolut 0–90° → EL 90–0°."""
     return 90.0 - max(0.0, min(90.0, abs(float(roll_deg))))
+
+
+class CompassHeadingFilter:
+    """Filter heading compass-only: outlier reject + step limiter + EMA circular."""
+
+    def __init__(self, max_step_deg: float, outlier_deg: float, ema_alpha: float, warmup_samples: int):
+        self.max_step_deg = float(max_step_deg)
+        self.outlier_deg = float(outlier_deg)
+        self.ema_alpha = float(ema_alpha)
+        self.warmup_samples = int(warmup_samples)
+        self.last_output = None
+        self.last_raw = None
+        self.warmup_count = 0
+
+    def hold(self):
+        """Kembalikan heading terakhir saat input invalid."""
+        if self.last_output is None:
+            return None
+        return float(self.last_output)
+
+    def update(self, raw_heading: float) -> float:
+        raw = _normalize_0_360(raw_heading)
+        self.last_raw = raw
+
+        if self.last_output is None:
+            self.last_output = raw
+            self.warmup_count = 1
+            return self.last_output
+
+        if self.warmup_count < self.warmup_samples:
+            self.last_output = raw
+            self.warmup_count += 1
+            return self.last_output
+
+        delta = _angle_diff_deg(raw, self.last_output)
+        if abs(delta) > self.outlier_deg:
+            return self.last_output
+
+        limited = _normalize_0_360(self.last_output + _clamp(delta, -self.max_step_deg, self.max_step_deg))
+        self.last_output = _angle_ema_deg(limited, self.last_output, self.ema_alpha)
+        return self.last_output
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -396,6 +461,8 @@ def tampilkan_header():
         f"{'EL(°)':>8} "
         f"{'HEADING(°)':>12} "
         f"{'ARAH':>20} "
+        f"{'SRC':>6} "
+        f"{'ΔHDG':>8} "
         f"{'EL_ROLL(°)':>11} "
         f"{'AZ_ROLL(°)':>11}"
     )
@@ -453,6 +520,13 @@ def main():
     reset_zero_point(device, ADDR_AZ)
 
     tampilkan_header()
+    heading_filter = CompassHeadingFilter(
+        max_step_deg=HEADING_MAX_STEP_DEG,
+        outlier_deg=HEADING_OUTLIER_DEG,
+        ema_alpha=HEADING_EMA_ALPHA,
+        warmup_samples=HEADING_WARMUP_SAMPLES,
+    )
+    prev_heading = None
 
     # ── Loop pembacaan ─────────────────────────────────────────────────
     try:
@@ -474,16 +548,25 @@ def main():
             # EL dari roll sensor EL
             el_from_roll = _map_el_roll_to_90_0(el_roll)
 
-            # Heading kompas tilt-compensated (prioritas) atau fallback ke yaw fusion
+            # Heading compass-only + filter anti-jump
             if mx is not None:
-                heading = heading_tilt_compensated(
+                heading_raw = heading_tilt_compensated(
                     mx, my, mz,
                     az_roll, az_pitch,   # gunakan roll/pitch sensor AZ untuk kompensasi
                     calib,
                 )
+                heading = heading_filter.update(heading_raw)
+                src_heading = "CMP"
             else:
-                # Fallback: pakai yaw fused dari IMU (tidak ideal)
-                heading = _normalize_0_360(az_yaw_raw + DECLINATION_DEG)
+                heading = heading_filter.hold()
+                if heading is None:
+                    print("[WARN] Magnetometer belum valid, menunggu data pertama...")
+                    time.sleep(INTERVAL)
+                    continue
+                src_heading = "HOLD"
+
+            delta_hdg = 0.0 if prev_heading is None else abs(_angle_diff_deg(heading, prev_heading))
+            prev_heading = heading
 
             arah = arah_mata_angin(heading)
 
@@ -500,6 +583,8 @@ def main():
                 f"{el_from_roll:>8.2f} "
                 f"{heading:>12.2f} "
                 f"{arah:>20} "
+                f"{src_heading:>6} "
+                f"{delta_hdg:>8.2f} "
                 f"{el_roll:>11.2f} "
                 f"{az_roll:>11.2f}"
                 f"  [EL:{status_el}]"
