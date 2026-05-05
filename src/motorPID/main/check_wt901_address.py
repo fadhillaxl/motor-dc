@@ -45,6 +45,17 @@ def _raw_to_angle(raw):
     return raw / 32768.0 * 180.0
 
 
+def _map_el_0_90_to_90_0(el_deg):
+    """Balik skala elevasi: 0..90 menjadi 90..0."""
+    el_clamped = max(0.0, min(90.0, float(el_deg)))
+    return 90.0 - el_clamped
+
+
+def _normalize_azimuth_0_360(yaw_deg):
+    """Normalisasi azimuth ke rentang 0..360."""
+    return float(yaw_deg) % 360.0
+
+
 def reset_zero_point(device, addr):
     """
     Menghapus zero-point yang tersimpan di sensor.
@@ -147,15 +158,18 @@ def main():
                 print("[WARN] Gagal membaca data dari salah satu sensor, mencoba lagi...")
             else:
                 waktu = time.strftime("%H:%M:%S")
-                if abs(el_pitch) < 5:
+                el_pitch_mapped = _map_el_0_90_to_90_0(el_pitch)
+                az_yaw_360 = _normalize_azimuth_0_360(az_yaw)
+
+                if abs(el_pitch_mapped) < 5:
                     status_el = "DATAR"
-                elif el_pitch > 0:
-                    status_el = f"MIRING DEPAN {el_pitch:.1f}°"
+                elif el_pitch_mapped > 0:
+                    status_el = f"MIRING DEPAN {el_pitch_mapped:.1f}°"
                 else:
-                    status_el = f"MIRING BELAKANG {abs(el_pitch):.1f}°"
+                    status_el = f"MIRING BELAKANG {abs(el_pitch_mapped):.1f}°"
 
                 print(
-                    f"{waktu:<10} {el_pitch:>12.2f} {az_yaw:>10.2f} "
+                    f"{waktu:<10} {el_pitch_mapped:>12.2f} {az_yaw_360:>10.2f} "
                     f"{el_roll:>11.2f} {az_roll:>11.2f}   [EL:{status_el}]"
                 )
 
