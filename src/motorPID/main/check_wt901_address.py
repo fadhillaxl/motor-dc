@@ -44,6 +44,7 @@ ADDR_AZ         = 0x51         # Sensor azimuth / kompas
 # Yogyakarta, Indonesia ≈ +0.97° (positif = timur)
 DECLINATION_DEG = 0.97
 AZ_OFFSET_DEG = 193.00   # Offset azimuth manual (+/- derajat) untuk fine-tuning arah
+RESET_AZ_ON_START = False  # Sesuai request: jangan reset zero-point AZ saat startup
 
 # File penyimpanan kalibrasi (persistent lintas sesi)
 CALIB_FILE = os.path.join(BASE_DIR, "compass_calibration.json")
@@ -518,9 +519,10 @@ def main():
     # ── Buka device ────────────────────────────────────────────────────
     device = buka_device()
 
-    # ── Reset zero-point kedua sensor ──────────────────────────────────
+    # ── Reset zero-point startup ───────────────────────────────────────
     reset_zero_point(device, ADDR_EL)
-    reset_zero_point(device, ADDR_AZ)
+    if RESET_AZ_ON_START:
+        reset_zero_point(device, ADDR_AZ)
 
     tampilkan_header()
     heading_filter = CompassHeadingFilter(
