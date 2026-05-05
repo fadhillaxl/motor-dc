@@ -80,7 +80,8 @@ def probe_addr(device, addr: int, tries: int) -> tuple[bool, float | None]:
                 # angleZ register is 0x3F, scanned from 0x30 -> index 15.
                 if len(vals) > 15:
                     raw = _to_signed16(vals[15])
-                    angle_z = raw / 32768.0 * 180.0
+                    # SDK angleZ raw is signed (-180..180). Normalize to 0..360 for AZ use.
+                    angle_z = (raw / 32768.0 * 180.0) % 360.0
                     return True, float(angle_z)
                 # If payload exists but angle index unavailable, still count as found.
                 return True, None
