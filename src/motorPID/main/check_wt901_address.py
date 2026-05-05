@@ -43,6 +43,7 @@ ADDR_AZ         = 0x51         # Sensor azimuth / kompas
 # Deklinasi magnetik kota Anda (cek: https://www.magnetic-declination.com/)
 # Yogyakarta, Indonesia ≈ +0.97° (positif = timur)
 DECLINATION_DEG = 0.97
+AZ_OFFSET_DEG = 217.33   # Offset azimuth manual (+/- derajat) untuk fine-tuning arah
 
 # File penyimpanan kalibrasi (persistent lintas sesi)
 CALIB_FILE = os.path.join(BASE_DIR, "compass_calibration.json")
@@ -285,7 +286,7 @@ def heading_tilt_compensated(
     Langkah:
       1. Koreksi hard-iron (geser ke pusat) + soft-iron (normalisasi elips)
       2. Tilt compensation menggunakan roll & pitch dari IMU
-      3. atan2 → heading 0..360° + deklinasi magnetik
+      3. atan2 → heading 0..360° + deklinasi magnetik + offset AZ
 
     Args:
         mx_raw, my_raw, mz_raw : nilai magnetometer mentah (int16)
@@ -327,8 +328,9 @@ def heading_tilt_compensated(
     #   Konvensi: Utara=0°, Timur=90°, Selatan=180°, Barat=270°
     heading = math.degrees(math.atan2(yh, xh))
 
-    # ── 4. Koreksi Deklinasi Magnetik ─────────────────────────────────────
+    # ── 4. Koreksi Deklinasi + Offset AZ ──────────────────────────────────
     heading += DECLINATION_DEG
+    heading += AZ_OFFSET_DEG
 
     return _normalize_0_360(heading)
 
@@ -447,7 +449,8 @@ def arah_mata_angin(heading: float) -> str:
 def tampilkan_header():
     print("=" * 70)
     print("  WT901C485 — Dual Sensor | Kompas Tilt-Compensated")
-    print(f"  Deklinasi: {DECLINATION_DEG:+.2f}°  |  Kalibrasi: {CALIB_FILE}")
+    print(f"  Deklinasi: {DECLINATION_DEG:+.2f}°  |  AZ Offset: {AZ_OFFSET_DEG:+.2f}°")
+    print(f"  Kalibrasi: {CALIB_FILE}")
     print("=" * 70)
     print(f"  EL sensor: {hex(ADDR_EL)}  |  AZ/Kompas sensor: {hex(ADDR_AZ)}")
     print()
