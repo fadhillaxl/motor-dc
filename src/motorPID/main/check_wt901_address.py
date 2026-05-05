@@ -10,6 +10,7 @@ Contoh:
 """
 
 import argparse
+import math
 import os
 import platform
 import sys
@@ -68,23 +69,69 @@ def read_one_packet(device, addr: int):
     return values
 
 
+def _get_field(device, new_name: str, old_name: str):
+    try:
+        if hasattr(device, "get"):
+            return device.get(new_name)
+        return device.getDeviceData(old_name)
+    except Exception:
+        return None
+
+
+def _tilt_compass(mx: float, my: float, mz: float, roll: float, pitch: float) -> float:
+    roll_rad = math.radians(roll)
+    pitch_rad = math.radians(pitch)
+    xh = mx * math.cos(pitch_rad) + mz * math.sin(pitch_rad)
+    yh = (
+        mx * math.sin(roll_rad) * math.sin(pitch_rad)
+        + my * math.cos(roll_rad)
+        - mz * math.sin(roll_rad) * math.cos(pitch_rad)
+    )
+    heading = math.degrees(math.atan2(yh, xh))
+    return (heading + 360.0) % 360.0
+
+
+def _compute_compass_az_cw(device) -> float | None:
+    roll = _get_field(device, "AngleX", "angleX")
+    pitch = _get_field(device, "AngleY", "angleY")
+    yaw = _get_field(device, "AngleZ", "angleZ")
+    accX = _get_field(device, "accX", "accX")
+    accY = _get_field(device, "accY", "accY")
+    accZ = _get_field(device, "accZ", "accZ")
+    magX = _get_field(device, "magX", "magX")
+    magY = _get_field(device, "magY", "magY")
+    magZ = _get_field(device, "magZ", "magZ")
+
+    if None in (roll, pitch, yaw):
+        return None
+
+    roll_tilt = float(roll)
+    pitch_tilt = float(pitch)
+    if None not in (accX, accY, accZ):
+        ax = float(accX)
+        ay = float(accY)
+        az = float(accZ)
+        if abs(ay) + abs(az) > 1e-6:
+            roll_tilt = math.degrees(math.atan2(ay, az))
+        if abs(ax) + abs(az) > 1e-6:
+            pitch_tilt = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+
+    if None not in (magX, magY, magZ):
+        compass = _tilt_compass(float(magX), float(magY), float(magZ), roll_tilt, pitch_tilt)
+        return (360.0 - compass) % 360.0
+
+    # Fallback: use yaw in CW convention if compass unavailable.
+    return (360.0 - (float(yaw) % 360.0)) % 360.0
+
+
 def probe_addr(device, addr: int, tries: int) -> tuple[bool, float | None]:
-    def _to_signed16(v: int) -> int:
-        v = int(v) & 0xFFFF
-        return v - 0x10000 if v & 0x8000 else v
 
     for _ in range(max(1, tries)):
         try:
             vals = read_one_packet(device, addr)
             if vals:
-                # angleZ register is 0x3F, scanned from 0x30 -> index 15.
-                if len(vals) > 15:
-                    raw = _to_signed16(vals[15])
-                    # SDK angleZ raw is signed (-180..180). Normalize to 0..360 for AZ use.
-                    angle_z = (raw / 32768.0 * 180.0) % 360.0
-                    return True, float(angle_z)
-                # If payload exists but angle index unavailable, still count as found.
-                return True, None
+                az_compass = _compute_compass_az_cw(device)
+                return True, az_compass
         except Exception:
             # ignore per-address read errors while scanning
             pass
@@ -133,7 +180,7 @@ def main():
                 if angle_z is None:
                     print(f"[FOUND] addr=0x{addr:02X}")
                 else:
-                    print(f"[FOUND] addr=0x{addr:02X} angleZ={angle_z:.2f}")
+                    print(f"[FOUND] addr=0x{addr:02X} az_compass={angle_z:.2f}")
             else:
                 print(f"[---- ] addr=0x{addr:02X}")
 
