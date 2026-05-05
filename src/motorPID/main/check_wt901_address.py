@@ -22,7 +22,7 @@ import platform
 # PYTHON PATH -> folder chs lokal project
 # =====================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SDK_CHS = os.path.abspath(os.path.join(BASE_DIR, "..", "Python-SDK-WT901C485", "chs"))
+SDK_CHS = os.path.join(BASE_DIR, "..", "..", "Python-SDK-WT901C485", "chs")
 sys.path.insert(0, SDK_CHS)
 
 # ─── Import dari SDK WITMOTION ─────────────────────────────────────────────
