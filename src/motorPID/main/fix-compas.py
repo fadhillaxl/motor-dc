@@ -251,6 +251,7 @@ def main():
     print("[OK] Connected\n")
 
     print(f"[INFO] Dual WT901 mode (no auto reset): AZ=0x{AZ_ADDR:02X}, EL=0x{EL_ADDR:02X}")
+    print(f"[INFO] Source mapping: COMPASS/AZ <- 0x{AZ_ADDR:02X}, EL(roll) <- 0x{EL_ADDR:02X}")
 
     # Fail fast startup validation
     az_boot = None
@@ -270,8 +271,8 @@ def main():
     if el_boot is None or el_boot[0] is None:
         raise RuntimeError(f"Gagal membaca sensor EL di address 0x{EL_ADDR:02X}")
 
-    print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>8} {:>10}".format(
-        "TIME", "ROLL", "PITCH", "YAW", "COMPASS", "AZ", "EL", "SRC"
+    print("{:<10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>8} {:>8} {:>10} {:>6} {:>6}".format(
+        "TIME", "R_AZ", "P_AZ", "YAW", "COMPASS", "AZ", "R_EL", "EL", "SRC", "AZ@", "EL@"
     ))
     print("-"*80)
 
@@ -285,15 +286,18 @@ def main():
                 el_roll, _, _, _, _, el, _ = el_data
                 now = time.strftime("%H:%M:%S")
 
-                print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>8.2f} {:>10}".format(
+                print("{:<10} {:>8.2f} {:>8.2f} {:>8.2f} {:>10} {:>10.2f} {:>8.2f} {:>8.2f} {:>10} {:>6} {:>6}".format(
                     now,
                     az_roll,
                     az_pitch,
                     yaw,
                     f"{comp:.2f}" if comp else "-",
                     az,
+                    el_roll,
                     el,
-                    src
+                    src,
+                    f"0x{AZ_ADDR:02X}",
+                    f"0x{EL_ADDR:02X}",
                 ))
             else:
                 print("[WARN] Read failed on AZ/EL address")
