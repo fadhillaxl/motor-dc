@@ -48,9 +48,9 @@ DECLINATION_DEG = 0.97
 CALIB_FILE = os.path.join(BASE_DIR, "compass_calibration.json")
 
 # Konfigurasi stabilisasi heading (compass-only)
-HEADING_MAX_STEP_DEG = 5.0
+HEADING_MAX_STEP_DEG = 1.0
 HEADING_OUTLIER_DEG = 35.0
-HEADING_EMA_ALPHA = 0.20
+HEADING_EMA_ALPHA = 0.08
 HEADING_WARMUP_SAMPLES = 5
 
 # ─── Register ─────────────────────────────────────────────────────────────
