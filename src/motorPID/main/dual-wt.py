@@ -20,7 +20,7 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 INTERVAL   = 0.3
 AZ_OFFSET  = 0.0
 alpha      = 0.15
-last_az    = {0x01: None, 0x02: None}
+last_az    = {0x51: None, 0x50: None}
 
 # =============================
 # MATH HELPERS
