@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import platform
+import math
 
 # PYTHON PATH -> folder chs lokal project
 # =====================================================
@@ -37,6 +38,15 @@ ADDR_AZ = 0x51
 # ─── Konstanta Register ───────────────────────────────────────────────────
 REG_KEY = 0x69        # Register kunci untuk operasi tulis
 REG_ANGLE = 0x3D      # AngleX, AngleY, AngleZ (3 register)
+REG_MAG = 0x3A        # MagX, MagY, MagZ (3 register)
+
+# ─── Kompas / Heading AZ ──────────────────────────────────────────────────
+# Sesuaikan jika hasil heading terbalik/bergeser karena orientasi pemasangan sensor.
+DECLINATION_DEG = 0.0   # Koreksi deklinasi magnetik lokasi (opsional)
+AZ_OFFSET_DEG = 0.0     # Offset heading manual setelah kalibrasi lapangan
+MAG_SWAP_XY = False     # True jika sumbu X/Y tertukar
+MAG_INV_X = False       # True jika sumbu X terbalik
+MAG_INV_Y = False       # True jika sumbu Y terbalik
 
 def _raw_to_angle(raw):
     """Konversi register 16-bit ke derajat (-180..180)."""
@@ -54,6 +64,32 @@ def _map_el_roll_to_90_0(el_roll_deg):
 def _normalize_azimuth_0_360(yaw_deg):
     """Normalisasi azimuth ke rentang 0..360."""
     return float(yaw_deg) % 360.0
+
+
+def _raw_to_signed16(raw):
+    """Konversi register uint16 ke int16."""
+    val = int(raw) & 0xFFFF
+    if val >= 0x8000:
+        val -= 0x10000
+    return val
+
+
+def _heading_from_magnetometer(mag_x, mag_y):
+    """
+    Hitung heading kompas dari magnetometer (sumbu horizontal), hasil 0..360 derajat.
+    """
+    x = float(mag_x)
+    y = float(mag_y)
+    if MAG_SWAP_XY:
+        x, y = y, x
+    if MAG_INV_X:
+        x = -x
+    if MAG_INV_Y:
+        y = -y
+
+    heading = math.degrees(math.atan2(y, x))
+    heading += DECLINATION_DEG + AZ_OFFSET_DEG
+    return _normalize_azimuth_0_360(heading)
 
 
 def reset_zero_point(device, addr):
@@ -96,6 +132,22 @@ def baca_sudut(device, addr):
         return None, None, None
 
 
+def baca_azimuth_kompas(device, addr):
+    """
+    Baca heading kompas dari register magnetometer AZ (0x3A..0x3C).
+    """
+    try:
+        device.ADDR = addr
+        vals = device.readReg(REG_MAG, 3)
+        if not vals or len(vals) < 2:
+            return None
+        mag_x = _raw_to_signed16(vals[0])
+        mag_y = _raw_to_signed16(vals[1])
+        return _heading_from_magnetometer(mag_x, mag_y)
+    except Exception:
+        return None
+
+
 def tampilkan_header():
     print("=" * 60)
     print("  WT901C485 - Dual Sensor (EL 0x50 + AZ 0x51)")
@@ -103,7 +155,7 @@ def tampilkan_header():
     print("Penjelasan sudut:")
     print("  ROLL  (X) : Kemiringan kiri-kanan")
     print("  PITCH (Y) : Kemiringan depan-belakang [ELEVASI/EL]")
-    print("  YAW   (Z) : Rotasi horizontal (kompas)")
+    print("  AZ_YAW    : Heading kompas 0..360 derajat")
     print()
     print("Referensi: GRAVITASI BUMI (sudut absolut)")
     print("  0°   = Sensor sejajar dengan tanah (datar)")
@@ -152,14 +204,15 @@ def main():
     try:
         while True:
             el_roll, el_pitch, _ = baca_sudut(device, ADDR_EL)
-            az_roll, _, az_yaw = baca_sudut(device, ADDR_AZ)
+            az_roll, _, az_yaw_fused = baca_sudut(device, ADDR_AZ)
+            az_yaw_compass = baca_azimuth_kompas(device, ADDR_AZ)
 
-            if el_pitch is None or az_yaw is None:
+            if el_pitch is None or (az_yaw_compass is None and az_yaw_fused is None):
                 print("[WARN] Gagal membaca data dari salah satu sensor, mencoba lagi...")
             else:
                 waktu = time.strftime("%H:%M:%S")
                 el_from_roll = _map_el_roll_to_90_0(el_roll)
-                az_yaw_360 = _normalize_azimuth_0_360(az_yaw)
+                az_yaw_360 = az_yaw_compass if az_yaw_compass is not None else _normalize_azimuth_0_360(az_yaw_fused)
 
                 if el_from_roll < 5:
                     status_el = "TEGAK"
