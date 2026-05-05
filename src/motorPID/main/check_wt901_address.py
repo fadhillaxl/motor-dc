@@ -1,17 +1,8 @@
 """
-Baca Elevasi Absolut Terhadap Gravitasi - WT901C485
-=====================================================
-Script ini membaca sudut EL (Elevation/Pitch) dari sensor WT901C485
-menggunakan referensi gravitasi bumi (sudut absolut).
+Baca 2 sensor WT901C485 pada satu bus RS485.
 
-Cara penggunaan:
-1. Pastikan library WITMOTION sudah di-download dari:
-   https://github.com/WITMOTION/WitStandardModbus_WT901C485/tree/main/Python/Python-SDK-WT901C485/chs
-2. Letakkan file ini di folder yang SAMA dengan file SDK (device.py, dll)
-3. Jalankan: python baca_elevasi_absolut.py
-
-Dependensi:
-    pip install pyserial
+- 0x50: sensor EL (elevasi/pitch)
+- 0x51: sensor AZ (compass/yaw)
 """
 
 import os
@@ -39,12 +30,22 @@ except ImportError as e:
     sys.exit(1)
 
 # ─── Konfigurasi ──────────────────────────────────────────────────────────
-INTERVAL  = 0.5          # Interval baca dalam detik
+INTERVAL = 0.5  # Interval baca dalam detik
+ADDR_EL = 0x50
+ADDR_AZ = 0x51
 
-# ─── Konstanta Reset Zero-Point ───────────────────────────────────────────
-REG_KEY   = 0x69          # Register kunci untuk operasi tulis
+# ─── Konstanta Register ───────────────────────────────────────────────────
+REG_KEY = 0x69        # Register kunci untuk operasi tulis
+REG_ANGLE = 0x3D      # AngleX, AngleY, AngleZ (3 register)
 
-def reset_zero_point(device):
+def _raw_to_angle(raw):
+    """Konversi register 16-bit ke derajat (-180..180)."""
+    if raw > 32767:
+        raw -= 65536
+    return raw / 32768.0 * 180.0
+
+
+def reset_zero_point(device, addr):
     """
     Menghapus zero-point yang tersimpan di sensor.
     Ini memastikan EL selalu mengacu pada gravitasi (sudut absolut),
@@ -52,10 +53,11 @@ def reset_zero_point(device):
     """
     print("[INFO] Mereset zero-point ke default (sudut absolut)...")
     try:
+        device.ADDR = addr
         # Unlock register untuk penulisan
-        device.write_register(device.ADDR, REG_KEY, 0xB588)
+        device.writeReg(REG_KEY, 0xB588)
         time.sleep(0.1)
-        device.write_register(device.ADDR, 0x01, 0x0000)
+        device.writeReg(0x01, 0x0000)
         time.sleep(0.3)
 
         print("[OK] Zero-point berhasil direset. Sensor sekarang menggunakan gravitasi sebagai referensi.\n")
@@ -64,20 +66,20 @@ def reset_zero_point(device):
         print("[WARN] Melanjutkan tanpa reset (sudut mungkin memiliki offset).\n")
 
 
-def baca_sudut(device):
+def baca_sudut(device, addr):
     """
     Membaca sudut Roll, Pitch (EL), dan Yaw dari sensor.
     Mengembalikan tuple (roll, pitch, yaw) dalam derajat.
-    Menggunakan get() dari deviceModel yang sudah di-parse oleh JY901SDataProcessor.
+    Data diambil dari readReg(0x3D, 3) lalu dikonversi ke derajat.
     """
     try:
-        roll  = device.get("AngleX")   # Roll  (kemiringan kiri-kanan)
-        pitch = device.get("AngleY")   # Pitch (elevasi depan-belakang)
-        yaw   = device.get("AngleZ")   # Yaw   (rotasi horizontal)
-
-        if roll is None or pitch is None or yaw is None:
+        device.ADDR = addr
+        vals = device.readReg(REG_ANGLE, 3)
+        if not vals or len(vals) < 3:
             return None, None, None
-
+        roll = _raw_to_angle(vals[0])
+        pitch = _raw_to_angle(vals[1])
+        yaw = _raw_to_angle(vals[2])
         return float(roll), float(pitch), float(yaw)
     except Exception:
         return None, None, None
@@ -85,7 +87,7 @@ def baca_sudut(device):
 
 def tampilkan_header():
     print("=" * 60)
-    print("  WT901C485 - Elevasi Absolut Terhadap Gravitasi")
+    print("  WT901C485 - Dual Sensor (EL 0x50 + AZ 0x51)")
     print("=" * 60)
     print("Penjelasan sudut:")
     print("  ROLL  (X) : Kemiringan kiri-kanan")
@@ -99,7 +101,7 @@ def tampilkan_header():
     print()
     print("Tekan Ctrl+C untuk berhenti.")
     print("-" * 60)
-    print(f"{'Waktu':<12} {'ROLL (°)':>10} {'PITCH/EL (°)':>14} {'YAW (°)':>10}")
+    print(f"{'Waktu':<10} {'EL_PITCH(°)':>12} {'AZ_YAW(°)':>10} {'EL_ROLL(°)':>11} {'AZ_ROLL(°)':>11}")
     print("-" * 60)
 
 
@@ -109,18 +111,20 @@ def main():
     # Inisialisasi koneksi ke sensor
     try:
         device = deviceModel.DeviceModel(
-            "WT901C485",
+            "WT901C485-DUAL",
             Protocol485Resolver(),
-            JY901SDataProcessor()
+            JY901SDataProcessor(),
+            lambda *_: None
         )
-        device.ADDR = 0x50
+        device.ADDR = ADDR_EL
         if platform.system().lower() == "linux":
             device.serialConfig.portName = "/dev/ttyUSB0"
         else:
             device.serialConfig.portName = "/dev/tty.usbserial-1330"
         device.serialConfig.baud = 9600
         device.openDevice()
-        print(f"[OK] Terhubung ke {device.serialConfig.portName} @ {device.serialConfig.baud} baud\n")
+        print(f"[OK] Terhubung ke {device.serialConfig.portName} @ {device.serialConfig.baud} baud")
+        print(f"[OK] Polling alamat sensor: EL={hex(ADDR_EL)}, AZ={hex(ADDR_AZ)}\n")
     except Exception as e:
         print(f"[ERROR] Tidak bisa membuka port: {e}")
         print("Pastikan:")
@@ -129,28 +133,31 @@ def main():
         print("  3. Tidak ada aplikasi lain yang menggunakan port ini")
         sys.exit(1)
 
-    # Reset zero-point untuk memastikan sudut absolut
-    reset_zero_point(device)
+    # Reset zero-point untuk masing-masing sensor
+    reset_zero_point(device, ADDR_EL)
+    reset_zero_point(device, ADDR_AZ)
 
     # Loop pembacaan data
     try:
         while True:
-            roll, pitch, yaw = baca_sudut(device)
+            el_roll, el_pitch, _ = baca_sudut(device, ADDR_EL)
+            az_roll, _, az_yaw = baca_sudut(device, ADDR_AZ)
 
-            if pitch is None:
-                print(f"[WARN] Gagal membaca data, mencoba lagi...")
+            if el_pitch is None or az_yaw is None:
+                print("[WARN] Gagal membaca data dari salah satu sensor, mencoba lagi...")
             else:
                 waktu = time.strftime("%H:%M:%S")
-
-                # Interpretasi elevasi
-                if abs(pitch) < 5:
-                    status = "DATAR"
-                elif pitch > 0:
-                    status = f"MIRING DEPAN {pitch:.1f}°"
+                if abs(el_pitch) < 5:
+                    status_el = "DATAR"
+                elif el_pitch > 0:
+                    status_el = f"MIRING DEPAN {el_pitch:.1f}°"
                 else:
-                    status = f"MIRING BELAKANG {abs(pitch):.1f}°"
+                    status_el = f"MIRING BELAKANG {abs(el_pitch):.1f}°"
 
-                print(f"{waktu:<12} {roll:>10.2f} {pitch:>14.2f} {yaw:>10.2f}   [{status}]")
+                print(
+                    f"{waktu:<10} {el_pitch:>12.2f} {az_yaw:>10.2f} "
+                    f"{el_roll:>11.2f} {az_roll:>11.2f}   [EL:{status_el}]"
+                )
 
             time.sleep(INTERVAL)
 
@@ -160,7 +167,7 @@ def main():
 
     finally:
         try:
-            device.close()
+            device.closeDevice()
             print("[INFO] Koneksi serial ditutup.")
         except Exception:
             pass
