@@ -182,9 +182,9 @@ def _clamp(val: float, lo: float, hi: float) -> float:
     return max(float(lo), min(float(hi), float(val)))
 
 
-def _map_el_roll_to_90_0(roll_deg: float) -> float:
-    """Roll absolut 0–90° → EL 90–0°."""
-    return 90.0 - max(0.0, min(90.0, abs(float(roll_deg))))
+def _map_el_roll_90_180_to_0_90(roll_deg: float) -> float:
+    """Roll 90–180° → EL 0–90°."""
+    return _clamp(float(roll_deg) - 90.0, 0.0, 90.0)
 
 
 class CompassHeadingFilter:
@@ -546,7 +546,7 @@ def main():
             waktu = time.strftime("%H:%M:%S")
 
             # EL dari roll sensor EL
-            el_from_roll = _map_el_roll_to_90_0(el_roll)
+            el_from_roll = _map_el_roll_90_180_to_0_90(el_roll)
 
             # Heading compass-only + filter anti-jump
             if mx is not None:
@@ -572,9 +572,9 @@ def main():
 
             # Status EL
             if el_from_roll < 5:
-                status_el = "TEGAK"
-            elif el_from_roll > 85:
                 status_el = "DATAR"
+            elif el_from_roll > 85:
+                status_el = "TEGAK"
             else:
                 status_el = f"{el_from_roll:.1f}°"
 
