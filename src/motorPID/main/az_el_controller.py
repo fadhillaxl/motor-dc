@@ -1012,6 +1012,7 @@ class ClosedLoopAzElController:
         self._wrong_dir_hits = 0
         self._stale_az_hits = 0
         self._last_auto_reset_attempt_t = 0.0
+        self._last_auto_reset_attempt_t = 0.0
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -1439,7 +1440,8 @@ class RealtimeAzElController:
                 )
                 if AUTO_RESET_ON_STALE_FAULT and stale_fault:
                     now = time.time()
-                    if now - self._last_auto_reset_attempt_t >= AUTO_RESET_COOLDOWN_S:
+                    last_try_t = float(getattr(self, "_last_auto_reset_attempt_t", 0.0))
+                    if now - last_try_t >= AUTO_RESET_COOLDOWN_S:
                         self._last_auto_reset_attempt_t = now
                         ok, reason = self.reset_from_sensor(attempts=40, delay_s=0.05)
                         if ok:
