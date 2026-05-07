@@ -71,12 +71,13 @@ CONTROL_DEADZONE_DEG = 0.5
 CONTROL_SOFT_ZONE_DEG = 1.2
 CONTROL_SOFT_MIN_ERR_DEG = 0.8
 CONTROL_SOFT_MIN_SPS = 60.0
+AZ_CONTROL_MIN_SPS = 160.0
 CONTROL_LOCK_HITS = 4
 CONTROL_SETTLE_TIME_S = 0.25
 AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
-AZ_WRONG_DIR_MIN_DELTA_DEG = 0.20
-AZ_WRONG_DIR_CONFIRM_CYCLES = 12
-AZ_WRONG_DIR_MIN_ERR_DEG = 5.0
+AZ_WRONG_DIR_MIN_DELTA_DEG = 0.02
+AZ_WRONG_DIR_CONFIRM_CYCLES = 6
+AZ_WRONG_DIR_MIN_ERR_DEG = 0.8
 AZ_SOFT_LIMIT_DEG = 280.0
 EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
@@ -853,7 +854,8 @@ class WT901AxisReader:
             az = yaw_cw
             src = "YAW"
 
-            az = angle_lerp(az, self.last_az, self.alpha)
+            if self.alpha > 0.0:
+                az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
 
             # EL pakai mapping ROLL -> EL: depan=0, atas=90.
@@ -895,7 +897,14 @@ class WT901DualAddressReader:
     def __init__(self, az_addr: int = 0x51, el_addr: int = 0x50, az_offset_deg: float = 0.0, el_offset_deg: float = 0.0):
         self.az_addr = int(az_addr)
         self.el_addr = int(el_addr)
-        self.az_reader = WT901AxisReader(label="AZ", addr=self.az_addr, az_offset_deg=az_offset_deg, el_offset_deg=0.0)
+        # For control loop feedback, keep AZ as responsive as possible (no extra azimuth smoothing).
+        self.az_reader = WT901AxisReader(
+            label="AZ",
+            addr=self.az_addr,
+            az_offset_deg=az_offset_deg,
+            el_offset_deg=0.0,
+            alpha=0.0,
+        )
         # Share same serial device; only one master FD on the RS485 port.
         self.el_reader = WT901AxisReader(
             label="EL",
@@ -998,8 +1007,9 @@ class ClosedLoopAzElController:
 
         # Far from target: keep minimum speed floor for stiction.
         cmd = raw_cmd
-        if abs(cmd) < CONTROL_MIN_SPS:
-            cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
+        min_sps = CONTROL_MIN_SPS
+        if abs(cmd) < min_sps:
+            cmd = min_sps if cmd >= 0 else -min_sps
         return max(-max_sps, min(max_sps, cmd))
 
     def _read_azel(self) -> tuple[float, float, dict, dict] | None:
@@ -1094,6 +1104,8 @@ class ClosedLoopAzElController:
             else:
                 stable_hits = 0
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
+                if 0.0 < abs(cmd_az) < AZ_CONTROL_MIN_SPS:
+                    cmd_az = AZ_CONTROL_MIN_SPS if cmd_az > 0.0 else -AZ_CONTROL_MIN_SPS
                 cmd_az *= self.recovery.az_speed_scale()
                 cmd_az *= self._az_cmd_sign
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
@@ -1241,8 +1253,9 @@ class RealtimeAzElController:
 
         # Far from target: keep minimum speed floor for stiction.
         cmd = raw_cmd
-        if abs(cmd) < CONTROL_MIN_SPS:
-            cmd = CONTROL_MIN_SPS if cmd >= 0 else -CONTROL_MIN_SPS
+        min_sps = CONTROL_MIN_SPS
+        if abs(cmd) < min_sps:
+            cmd = min_sps if cmd >= 0 else -min_sps
         return max(-max_sps, min(max_sps, cmd))
 
     def _read_azel(self) -> tuple[float, float] | None:
@@ -1371,6 +1384,8 @@ class RealtimeAzElController:
                 self.recovery.on_cycle_ok()
             else:
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
+                if 0.0 < abs(cmd_az) < AZ_CONTROL_MIN_SPS:
+                    cmd_az = AZ_CONTROL_MIN_SPS if cmd_az > 0.0 else -AZ_CONTROL_MIN_SPS
                 cmd_az *= self.recovery.az_speed_scale()
                 cmd_az *= self._az_cmd_sign
                 cmd_el = self._speed_from_error(err_el, CONTROL_KP_EL, max_speed_el)
