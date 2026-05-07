@@ -77,6 +77,9 @@ AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
 AZ_WRONG_DIR_MIN_DELTA_DEG = 0.02
 AZ_WRONG_DIR_CONFIRM_CYCLES = 6
 AZ_WRONG_DIR_MIN_ERR_DEG = 0.8
+AZ_STALE_DELTA_DEG = 0.01
+AZ_STALE_MIN_CMD_SPS = 80.0
+AZ_STALE_CONFIRM_CYCLES = 6
 AZ_SOFT_LIMIT_DEG = 280.0
 EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
@@ -985,6 +988,7 @@ class ClosedLoopAzElController:
         self._az_cmd_sign = 1.0
         self._prev_az = None
         self._wrong_dir_hits = 0
+        self._stale_az_hits = 0
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -1119,6 +1123,20 @@ class ClosedLoopAzElController:
                 self.motor_az.set_target_speed(cmd_az)
                 self.motor_el.set_target_speed(cmd_el)
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
+                if abs(cmd_az) >= AZ_STALE_MIN_CMD_SPS and abs(az_delta) <= AZ_STALE_DELTA_DEG:
+                    self._stale_az_hits += 1
+                else:
+                    self._stale_az_hits = 0
+                if self._stale_az_hits >= AZ_STALE_CONFIRM_CYCLES:
+                    self.motor_az.emergency_stop("AZ feedback stale while AZ motor commanded")
+                    self.motor_el.emergency_stop("AZ feedback stale while AZ motor commanded")
+                    self.logger.error(
+                        "AZ STALE FEEDBACK detected: cmd_az=%.2f az_delta=%.4f hits=%d",
+                        cmd_az,
+                        az_delta,
+                        self._stale_az_hits,
+                    )
+                    break
                 if (
                     abs(err_az) >= AZ_WRONG_DIR_MIN_ERR_DEG
                     and
@@ -1234,6 +1252,7 @@ class RealtimeAzElController:
         self._az_cmd_sign = 1.0
         self._prev_az = None
         self._wrong_dir_hits = 0
+        self._stale_az_hits = 0
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -1402,6 +1421,21 @@ class RealtimeAzElController:
                 self.motor_az.set_target_speed(cmd_az)
                 self.motor_el.set_target_speed(cmd_el)
                 self._last_cmd_az_dir = 1 if cmd_az > 0 else (-1 if cmd_az < 0 else 0)
+                if abs(cmd_az) >= AZ_STALE_MIN_CMD_SPS and abs(az_delta) <= AZ_STALE_DELTA_DEG:
+                    self._stale_az_hits += 1
+                else:
+                    self._stale_az_hits = 0
+                if self._stale_az_hits >= AZ_STALE_CONFIRM_CYCLES:
+                    self.motor_az.emergency_stop("AZ feedback stale while AZ motor commanded")
+                    self.motor_el.emergency_stop("AZ feedback stale while AZ motor commanded")
+                    self.logger.error(
+                        "AZ STALE FEEDBACK detected (realtime): cmd_az=%.2f az_delta=%.4f hits=%d",
+                        cmd_az,
+                        az_delta,
+                        self._stale_az_hits,
+                    )
+                    time.sleep(CONTROL_INTERVAL_S)
+                    continue
                 if (
                     abs(err_az) >= AZ_WRONG_DIR_MIN_ERR_DEG
                     and
