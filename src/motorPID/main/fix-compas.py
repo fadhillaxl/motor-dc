@@ -1,8 +1,8 @@
 """
-WT901C485 - FINAL AZIMUTH STABLE (NO JUMP VERSION)
-=================================================
-✔ Tilt compensation (mag + acc)
-✔ Blending yaw + compass
+WT901C485 - AZIMUTH YAW ONLY (ABSOLUTE OFFSET)
+==============================================
+✔ AZ pakai YAW sensor AZ (0x51)
+✔ Offset AZ untuk sinkron heading absolut
 ✔ FIX angle wrap (0-360)
 ✔ Smooth azimuth (circular filter)
 """
@@ -202,17 +202,10 @@ def baca_sudut(device, addr, smooth_az=True):
         )
 
         # =============================
-        # BLENDING
+        # AZIMUTH: YAW ONLY (ABSOLUTE)
         # =============================
         az = yaw_cw
         src = "YAW"
-
-        if compass_cw is not None:
-            w = math.cos(math.radians(roll_tilt)) * math.cos(math.radians(pitch_tilt))
-            w = max(0, w)
-
-            az = (1 - w) * yaw_cw + w * compass_cw
-            src = f"BLEND({w:.2f})"
 
         # =============================
         # 🔥 FIX SMOOTH (NO JUMP)
@@ -233,7 +226,7 @@ def baca_sudut(device, addr, smooth_az=True):
 # =============================
 def main():
     print("="*80)
-    print(" WT901C485 - FINAL AZIMUTH NO JUMP")
+    print(" WT901C485 - AZIMUTH YAW ONLY (ABS OFFSET)")
     print("="*80)
 
     device = buat_device_model()
@@ -251,7 +244,7 @@ def main():
     print("[OK] Connected\n")
 
     print(f"[INFO] Dual WT901 mode (no auto reset): AZ=0x{AZ_ADDR:02X}, EL=0x{EL_ADDR:02X}")
-    print(f"[INFO] Source mapping: COMPASS/AZ <- 0x{AZ_ADDR:02X}, EL(roll) <- 0x{EL_ADDR:02X}")
+    print(f"[INFO] Source mapping: YAW/AZ <- 0x{AZ_ADDR:02X}, EL(roll) <- 0x{EL_ADDR:02X}")
 
     # Fail fast startup validation
     az_boot = None
@@ -291,7 +284,7 @@ def main():
                     az_roll,
                     az_pitch,
                     yaw,
-                    f"{comp:.2f}" if comp else "-",
+                    f"{comp:.2f}" if comp is not None else "-",
                     az,
                     el_roll,
                     el,
