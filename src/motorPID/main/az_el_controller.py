@@ -71,7 +71,6 @@ CONTROL_DEADZONE_DEG = 0.5
 CONTROL_SOFT_ZONE_DEG = 1.2
 CONTROL_SOFT_MIN_ERR_DEG = 0.8
 CONTROL_SOFT_MIN_SPS = 60.0
-AZ_CONTROL_MIN_SPS = 160.0
 CONTROL_LOCK_HITS = 4
 CONTROL_SETTLE_TIME_S = 0.25
 AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
@@ -85,8 +84,10 @@ TRACKING_EPS_DEG = 0.1
 LOG_FILE = os.path.join(BASE_DIR, "az_el_closed_loop.log")
 ROTCTL_DEFAULT_HOST = "127.0.0.1"
 ROTCTL_DEFAULT_PORT = 4533
-AZ_OFFSET_DEG = 140.0
+AZ_OFFSET_DEG = 149.0
 EL_OFFSET_DEG = 0.0
+AZ_CONTROL_MIN_SPS = 160.0
+AZ_CONTROL_MIN_ERR_DEG = 2.0
 
 
 @dataclass
@@ -1104,7 +1105,10 @@ class ClosedLoopAzElController:
             else:
                 stable_hits = 0
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
-                if 0.0 < abs(cmd_az) < AZ_CONTROL_MIN_SPS:
+                if (
+                    abs(err_az) >= AZ_CONTROL_MIN_ERR_DEG
+                    and 0.0 < abs(cmd_az) < AZ_CONTROL_MIN_SPS
+                ):
                     cmd_az = AZ_CONTROL_MIN_SPS if cmd_az > 0.0 else -AZ_CONTROL_MIN_SPS
                 cmd_az *= self.recovery.az_speed_scale()
                 cmd_az *= self._az_cmd_sign
@@ -1384,7 +1388,10 @@ class RealtimeAzElController:
                 self.recovery.on_cycle_ok()
             else:
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
-                if 0.0 < abs(cmd_az) < AZ_CONTROL_MIN_SPS:
+                if (
+                    abs(err_az) >= AZ_CONTROL_MIN_ERR_DEG
+                    and 0.0 < abs(cmd_az) < AZ_CONTROL_MIN_SPS
+                ):
                     cmd_az = AZ_CONTROL_MIN_SPS if cmd_az > 0.0 else -AZ_CONTROL_MIN_SPS
                 cmd_az *= self.recovery.az_speed_scale()
                 cmd_az *= self._az_cmd_sign
