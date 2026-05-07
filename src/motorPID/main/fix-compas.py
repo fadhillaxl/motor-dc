@@ -12,6 +12,7 @@ import sys
 import time
 import platform
 import math
+import json
 
 # =============================
 # PATH SDK
@@ -33,8 +34,27 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 INTERVAL = 0.05
 AZ_ADDR = 0x51
 EL_ADDR = 0x50
-AZ_OFFSET_DEG = 27.5
-EL_OFFSET_DEG = 0.0
+DEFAULT_AZ_OFFSET_DEG = 27.5
+DEFAULT_EL_OFFSET_DEG = 0.0
+OFFSET_FILE = os.path.join(BASE_DIR, "wt901_offsets.json")
+
+
+def load_offsets():
+    """Load shared AZ/EL offsets from JSON file with safe fallback."""
+    az = float(DEFAULT_AZ_OFFSET_DEG)
+    el = float(DEFAULT_EL_OFFSET_DEG)
+    try:
+        if os.path.exists(OFFSET_FILE):
+            with open(OFFSET_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            az = float(data.get("az_offset_deg", az))
+            el = float(data.get("el_offset_deg", el))
+    except Exception as e:
+        print(f"[WARN] Offset file read failed: {e}")
+    return az, el
+
+
+AZ_OFFSET_DEG, EL_OFFSET_DEG = load_offsets()
 
 alpha = 0.15
 last_az = None
@@ -244,6 +264,8 @@ def main():
     print("[OK] Connected\n")
 
     print(f"[INFO] Dual WT901 mode (no auto reset): AZ=0x{AZ_ADDR:02X}, EL=0x{EL_ADDR:02X}")
+    print(f"[INFO] Offset source: {OFFSET_FILE}")
+    print(f"[INFO] Active offsets: AZ_OFFSET_DEG={AZ_OFFSET_DEG:.2f}, EL_OFFSET_DEG={EL_OFFSET_DEG:.2f}")
     print(f"[INFO] Source mapping: YAW/AZ <- 0x{AZ_ADDR:02X}, EL(roll) <- 0x{EL_ADDR:02X}")
 
     # Fail fast startup validation
