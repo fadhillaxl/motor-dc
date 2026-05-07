@@ -27,7 +27,7 @@ class DeviceModel:
     deviceName = "我的设备"
 
     #设备ID
-    ADDR = 0x50
+    ADDR = 0x51
 
     # 设备数据字典
     deviceData = {}
