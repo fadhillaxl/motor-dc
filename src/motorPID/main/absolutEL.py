@@ -40,7 +40,7 @@ except ImportError as e:
     sys.exit(1)
 
 # ─── Konfigurasi ──────────────────────────────────────────────────────────
-INTERVAL  = 0.5          # Interval baca dalam detik
+INTERVAL  = 0.1          # Interval baca dalam detik
 TILT_THRESHOLD_DEG = 15.0  # Ambang tilt untuk beralih dari YAW ke COMPASS
 AZ_OFFSET_DEG = 81.6        # Offset heading manual (derajat), contoh: 28.7
 
