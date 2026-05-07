@@ -30,7 +30,7 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 # =============================
 # CONFIG
 # =============================
-INTERVAL = 0.1
+INTERVAL = 0.05
 AZ_ADDR = 0x51
 EL_ADDR = 0x50
 AZ_OFFSET_DEG = 140.0
