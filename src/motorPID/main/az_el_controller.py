@@ -1353,6 +1353,59 @@ class RealtimeAzElController:
         self.motor_el.stop_smooth()
         self.logger.info("Stop motion requested.")
 
+    def reset_from_sensor(self, attempts: int = 40, delay_s: float = 0.05) -> tuple[bool, str]:
+        """
+        Re-init sensor feedback path without issuing WT901 reset command.
+        Behavior:
+        - Re-read AZ/EL from sensor
+        - Sync motor internal position estimate
+        - Clear fault latch
+        - Continue with last target (do not force hold mode)
+        """
+        self.logger.info("Reset requested: re-read sensor from startup path.")
+        self.motor_az.stop_smooth()
+        self.motor_el.stop_smooth()
+
+        with self._lock:
+            target_az = self._target_az
+            target_el = self._target_el
+            hold_follow = self._hold_follow
+
+        data = self.wt.read_with_retry(attempts=max(1, int(attempts)), delay_s=max(0.0, float(delay_s)))
+        if data is None:
+            self.logger.error("Reset failed: unable to re-read AZ/EL sensor.")
+            return False, "sensor_reread_failed"
+
+        az = float(data["az"])
+        el = float(data["el"])
+
+        with self._lock:
+            self._curr_az = az
+            self._curr_el = el
+            self._target_az = target_az
+            self._target_el = target_el
+            self._hold_follow = hold_follow
+            self._has_position = True
+
+        self.motor_az.set_position_deg(az)
+        self.motor_el.set_position_deg(el)
+        self.motor_az.reset_fault()
+        self.motor_el.reset_fault()
+
+        self._stale_az_hits = 0
+        self._wrong_dir_hits = 0
+        self._prev_az = None
+        self._last_cmd_az_dir = 0
+
+        self.logger.info(
+            "Reset success: sensor synced az=%.3f el=%.3f | target=%.3f/%.3f",
+            az,
+            el,
+            target_az,
+            target_el,
+        )
+        return True, "ok"
+
     def get_position(self) -> tuple[float, float]:
         with self._lock:
             return self._curr_az, self._curr_el
@@ -1595,8 +1648,11 @@ class RotctlServer:
             return "RPRT 0\n", False
 
         if cmd_l in ("r", "\\reset"):
-            # Keep compatibility with clients that issue reset command.
-            return "RPRT 0\n", False
+            ok, reason = self.controller.reset_from_sensor()
+            if ok:
+                return "RPRT 0\n", False
+            self.logger.error("rotctl reset failed: %s. Closing client connection.", reason)
+            return "RPRT -1\n", True
 
         if cmd_l in ("q", "\\quit"):
             return "RPRT 0\n", True
