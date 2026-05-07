@@ -87,10 +87,30 @@ TRACKING_EPS_DEG = 0.1
 LOG_FILE = os.path.join(BASE_DIR, "az_el_closed_loop.log")
 ROTCTL_DEFAULT_HOST = "127.0.0.1"
 ROTCTL_DEFAULT_PORT = 4533
-AZ_OFFSET_DEG = 27.5
-EL_OFFSET_DEG = 0.0
+DEFAULT_AZ_OFFSET_DEG = 27.5
+DEFAULT_EL_OFFSET_DEG = 0.0
+OFFSET_FILE = os.path.join(BASE_DIR, "wt901_offsets.json")
 AZ_CONTROL_MIN_SPS = 160.0
 AZ_CONTROL_MIN_ERR_DEG = 2.0
+
+
+def load_offsets() -> tuple[float, float]:
+    """Load shared AZ/EL offsets from JSON file with safe fallback."""
+    az = float(DEFAULT_AZ_OFFSET_DEG)
+    el = float(DEFAULT_EL_OFFSET_DEG)
+    try:
+        if os.path.exists(OFFSET_FILE):
+            with open(OFFSET_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            az = float(data.get("az_offset_deg", az))
+            el = float(data.get("el_offset_deg", el))
+    except Exception:
+        # Keep controller running with defaults if offset file is missing/corrupt.
+        pass
+    return az, el
+
+
+AZ_OFFSET_DEG, EL_OFFSET_DEG = load_offsets()
 
 
 @dataclass
