@@ -84,6 +84,8 @@ TRACKING_EPS_DEG = 0.1
 LOG_FILE = os.path.join(BASE_DIR, "az_el_closed_loop.log")
 ROTCTL_DEFAULT_HOST = "127.0.0.1"
 ROTCTL_DEFAULT_PORT = 4533
+AZ_OFFSET_DEG = 113.0
+EL_OFFSET_DEG = 0.0
 
 
 @dataclass
@@ -846,13 +848,10 @@ class WT901AxisReader:
                 else None
             )
 
+            # Keep AZ behavior aligned with fix-compas.py:
+            # use absolute YAW from AZ sensor + static offset (no compass blending).
             az = yaw_cw
             src = "YAW"
-            if compass_cw is not None:
-                w = math.cos(math.radians(roll_tilt)) * math.cos(math.radians(pitch_tilt))
-                w = max(0.0, w)
-                az = (1.0 - w) * yaw_cw + w * compass_cw
-                src = f"BLEND({w:.2f})"
 
             az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
@@ -889,7 +888,7 @@ class WT901AxisReader:
 class WT901DualAddressReader:
     """
     Dual WT901 on one RS485 bus:
-    - 0x51 -> AZ (yaw/compass fusion)
+    - 0x51 -> AZ (yaw only + offset)
     - 0x50 -> EL (roll->elevation)
     """
 
@@ -1644,11 +1643,19 @@ def main():
         motor_az, motor_el = build_default_motors()
 
         # Dual WT901 on one RS485 bus:
-        # - 0x51 for AZ (compass/yaw fused azimuth)
+        # - 0x51 for AZ (yaw only + offset)
         # - 0x50 for EL (roll->elevation)
-        wt = WT901DualAddressReader(az_addr=0x51, el_addr=0x50, az_offset_deg=0.0, el_offset_deg=0.0)
+        wt = WT901DualAddressReader(
+            az_addr=0x51,
+            el_addr=0x50,
+            az_offset_deg=AZ_OFFSET_DEG,
+            el_offset_deg=EL_OFFSET_DEG,
+        )
         wt.open()
-        logger.info("WT901 connected. AZ addr=0x51 | EL addr=0x50 | zero_reset=disabled")
+        logger.info(
+            "WT901 connected. AZ addr=0x51 | EL addr=0x50 | az_offset=%.2f | zero_reset=disabled",
+            AZ_OFFSET_DEG,
+        )
 
         # Fail-fast startup validation per-address.
         az_boot = wt.read_az_with_retry(attempts=40, delay_s=0.05)
