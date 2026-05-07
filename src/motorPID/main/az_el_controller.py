@@ -80,6 +80,8 @@ AZ_WRONG_DIR_MIN_ERR_DEG = 0.8
 AZ_STALE_DELTA_DEG = 0.01
 AZ_STALE_MIN_CMD_SPS = 80.0
 AZ_STALE_CONFIRM_CYCLES = 6
+AUTO_RESET_ON_STALE_FAULT = True
+AUTO_RESET_COOLDOWN_S = 1.0
 AZ_SOFT_LIMIT_DEG = 280.0
 EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
@@ -1009,6 +1011,7 @@ class ClosedLoopAzElController:
         self._prev_az = None
         self._wrong_dir_hits = 0
         self._stale_az_hits = 0
+        self._last_auto_reset_attempt_t = 0.0
 
     @staticmethod
     def _speed_from_error(err_deg: float, kp: float, max_sps: float) -> float:
@@ -1426,7 +1429,23 @@ class RealtimeAzElController:
             if st_az["fault_latched"] or st_el["fault_latched"]:
                 self.motor_az.stop_smooth()
                 self.motor_el.stop_smooth()
-                self.logger.error("Fault latched in realtime loop | az=%s el=%s", st_az["fault_msg"], st_el["fault_msg"])
+                az_fault_msg = str(st_az["fault_msg"])
+                el_fault_msg = str(st_el["fault_msg"])
+                self.logger.error("Fault latched in realtime loop | az=%s el=%s", az_fault_msg, el_fault_msg)
+
+                stale_fault = (
+                    "stale while az motor commanded" in az_fault_msg.lower()
+                    or "stale while az motor commanded" in el_fault_msg.lower()
+                )
+                if AUTO_RESET_ON_STALE_FAULT and stale_fault:
+                    now = time.time()
+                    if now - self._last_auto_reset_attempt_t >= AUTO_RESET_COOLDOWN_S:
+                        self._last_auto_reset_attempt_t = now
+                        ok, reason = self.reset_from_sensor(attempts=40, delay_s=0.05)
+                        if ok:
+                            self.logger.info("Auto-reset success after stale AZ fault.")
+                        else:
+                            self.logger.error("Auto-reset failed after stale AZ fault: %s", reason)
                 time.sleep(0.1)
                 continue
 
