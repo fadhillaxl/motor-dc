@@ -34,7 +34,7 @@ from lib.protocol_resolver.roles.protocol_485_resolver import Protocol485Resolve
 INTERVAL = 0.05
 AZ_ADDR = 0x51
 EL_ADDR = 0x50
-DEFAULT_AZ_OFFSET_DEG = 27.5
+DEFAULT_AZ_OFFSET_DEG = 0.0
 DEFAULT_EL_OFFSET_DEG = 0.0
 OFFSET_FILE = os.path.join(BASE_DIR, "wt901_offsets.json")
 
