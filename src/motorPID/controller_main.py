@@ -41,7 +41,7 @@ except Exception as exc:
 # =============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SDK_CHS = os.path.abspath(
-    os.path.join(BASE_DIR, "..","..", "..", "Python-SDK-WT901C485", "chs")
+    os.path.join(BASE_DIR, "..", "Python-SDK-WT901C485", "chs")
 )
 if SDK_CHS not in sys.path:
     sys.path.insert(0, SDK_CHS)
