@@ -76,11 +76,14 @@ def angle_lerp(new, old):
 
 def map_roll_to_el(roll_deg, el_offset_deg=0.0):
     """
-    Mapping EL dari roll:
-    - roll ~= 90  -> EL = 0 (depan datar)
-    - roll ~= 0   -> EL = 90 (menghadap atas)
+    Mapping EL dari roll (90..180 -> 90..0):
+    - roll ~= 90  -> EL = 90 (menghadap atas)
+    - roll ~= 180 -> EL = 0  (depan datar)
     """
-    el = (90.0 - float(roll_deg)) + float(el_offset_deg)
+    r = float(roll_deg)
+    if r < -90.0:
+        r += 360.0
+    el = (180.0 - r) + float(el_offset_deg)
     return max(0.0, min(90.0, el))
 
 # =============================

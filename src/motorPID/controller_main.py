@@ -500,11 +500,14 @@ def angle_lerp(new: float, old: float | None, alpha: float) -> float:
 
 def map_roll_to_el(roll_deg: float, el_offset_deg: float = 0.0) -> float:
     """
-    Map roll to elevation with user convention:
-    - roll ~= 90  -> EL = 0 (front)
-    - roll ~= 0   -> EL = 90 (up)
+    Map roll (90..180) to elevation (90..0):
+    - roll ~= 90  -> EL = 90 (up)
+    - roll ~= 180 -> EL = 0  (front)
     """
-    el = (90.0 - float(roll_deg)) + float(el_offset_deg)
+    r = float(roll_deg)
+    if r < -90.0:
+        r += 360.0
+    el = (180.0 - r) + float(el_offset_deg)
     return max(EL_MIN_DEG, min(EL_MAX_DEG, el))
 
 
