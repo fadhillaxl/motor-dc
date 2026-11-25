@@ -154,6 +154,7 @@ class StepperConfig:
     soft_limit_min_deg: float | None = 0.0
     soft_limit_max_deg: float | None = 360.0
     az_wrap_enabled: bool = False  # False: tidak boleh lintas 0/360 (sesuai rotator non-continous)
+    circular_axis: bool = False
     az_offset_deg: float = 0.0     # Kalibrasi azimuth terhadap Utara kompas
     el_offset_deg: float = 0.0     # Kalibrasi elevasi terhadap referensi mekanik
     axis_gear_ratio: float = 1.0   # >1 jika ada reduksi gear (motor:output)
@@ -365,10 +366,7 @@ class WT901Reader:
                 self._retry_count = 0
                 self._last_error = ""
                 
-                # (3) Kalibrasi Sensor: Reset zero-point saat terkoneksi agar EL absolut terhadap gravitasi
-                self.reset_zero_point()
-                
-                self._logger.info("WT901 connected on attempt %d", attempt)
+                self._logger.info("WT901 connected on attempt %d (zero_reset=disabled)", attempt)
                 return
             except Exception as exc:
                 self._last_error = f"connect fail attempt {attempt}: {exc}"
@@ -442,90 +440,113 @@ class WT901Reader:
                     if parsed is None:
                         raise ValueError("WT901 UART checksum/frame invalid")
 
+    def _load_shared_offsets(self) -> tuple[float, float]:
+        offset_file = os.path.join(BASE_DIR, "main", "wt901_offsets.json")
+        az_off = float(self.cfg.declination_deg)
+        el_off = 0.0
+        try:
+            if os.path.exists(offset_file):
+                with open(offset_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                az_off = float(data.get("az_offset_deg", az_off))
+                el_off = float(data.get("el_offset_deg", el_off))
+        except Exception:
+            pass
+        return az_off, el_off
+
+    def _read_addr_fields(self, addr: int) -> dict | None:
+        self._device.ADDR = int(addr) & 0xFF
+        if hasattr(self._device, "readReg"):
+            regs = self._device.readReg(0x30, 41)
+            if not regs or len(regs) <= 0:
+                return None
+            self._validate_register_payload(regs)
+        roll = self._safe_get("AngleX" if hasattr(self._device, "get") else "angleX")
+        pitch = self._safe_get("AngleY" if hasattr(self._device, "get") else "angleY")
+        yaw = self._safe_get("AngleZ" if hasattr(self._device, "get") else "angleZ")
+        ax = self._safe_get("accX")
+        ay = self._safe_get("accY")
+        az_acc = self._safe_get("accZ")
+        gx = self._safe_get("gyroX")
+        gy = self._safe_get("gyroY")
+        gz = self._safe_get("gyroZ")
+        mx = self._safe_get("magX")
+        my = self._safe_get("magY")
+        mz = self._safe_get("magZ")
+        temp_c = self._safe_get("temperature")
+        if any(v is None for v in (roll, pitch, yaw)):
+            return None
+        return {
+            "roll": float(roll),
+            "pitch": float(pitch),
+            "yaw": float(yaw),
+            "ax": float(ax or 0.0),
+            "ay": float(ay or 0.0),
+            "az_acc": float(az_acc or 0.0),
+            "gx": float(gx or 0.0),
+            "gy": float(gy or 0.0),
+            "gz": float(gz or 0.0),
+            "mx": float(mx or 0.0),
+            "my": float(my or 0.0),
+            "mz": float(mz or 0.0),
+            "temp_c": temp_c,
+        }
+
     def _read_sample_from_sdk(self) -> WT901Sample:
         if self._device is None:
             raise RuntimeError("WT901 device belum diinisialisasi")
-        
-        # Sesuai pola absolutEL.py: pastikan kita memanggil readReg 
-        # (yang akan mengupdate memory map deviceModel internal)
-        if hasattr(self._device, "readReg"):
-            regs = self._device.readReg(0x30, 41)
-            self._validate_register_payload(regs)
 
-        # Mendukung SDK baru dan lama layaknya absolutEL.py
-        if hasattr(self._device, "get"):
-            roll = self._safe_get("AngleX")
-            pitch = self._safe_get("AngleY")
-            yaw = self._safe_get("AngleZ")
-            ax = self._safe_get("accX")  # getDeviceData names vs get() names bisa berbeda
-            ay = self._safe_get("accY")
-            az_acc = self._safe_get("accZ")
-            gx = self._safe_get("gyroX")
-            gy = self._safe_get("gyroY")
-            gz = self._safe_get("gyroZ")
-            mx = self._safe_get("magX")
-            my = self._safe_get("magY")
-            mz = self._safe_get("magZ")
-            temp_c = self._safe_get("temperature")
-        else:
-            roll = self._safe_get("angleX")
-            pitch = self._safe_get("angleY")
-            yaw = self._safe_get("angleZ")
-            ax = self._safe_get("accX")
-            ay = self._safe_get("accY")
-            az_acc = self._safe_get("accZ")
-            gx = self._safe_get("gyroX")
-            gy = self._safe_get("gyroY")
-            gz = self._safe_get("gyroZ")
-            mx = self._safe_get("magX")
-            my = self._safe_get("magY")
-            mz = self._safe_get("magZ")
-            temp_c = self._safe_get("temperature")
+        az_offset_deg, el_offset_deg = self._load_shared_offsets()
+        el_addr = int(self.cfg.address) & 0xFF
+        az_addr = 0x51 if el_addr == 0x50 else el_addr
 
-        # Validasi (4) penanganan error untuk data sensor yang tidak valid
-        if any(v is None for v in (roll, pitch, yaw, ax, ay, az_acc, mx, my, mz)):
+        el_pkt = self._read_addr_fields(el_addr)
+        az_pkt = self._read_addr_fields(az_addr) if az_addr != el_addr else el_pkt
+        if el_pkt is None and az_pkt is None:
             raise ValueError("Data sudut/sensor tidak lengkap (None)")
+        if az_pkt is None:
+            az_pkt = el_pkt
+        if el_pkt is None:
+            el_pkt = az_pkt
 
-        gx -= self._gyro_bias[0]
-        gy -= self._gyro_bias[1]
-        gz -= self._gyro_bias[2]
-        mx = (mx - self._hard_iron[0]) * self._soft_iron[0]
-        my = (my - self._hard_iron[1]) * self._soft_iron[1]
-        mz = (mz - self._hard_iron[2]) * self._soft_iron[2]
+        roll = az_pkt["roll"]
+        pitch = az_pkt["pitch"]
+        yaw = az_pkt["yaw"]
+        ax, ay, az_acc = az_pkt["ax"], az_pkt["ay"], az_pkt["az_acc"]
+        gx = az_pkt["gx"] - self._gyro_bias[0]
+        gy = az_pkt["gy"] - self._gyro_bias[1]
+        gz = az_pkt["gz"] - self._gyro_bias[2]
+        mx = (az_pkt["mx"] - self._hard_iron[0]) * self._soft_iron[0]
+        my = (az_pkt["my"] - self._hard_iron[1]) * self._soft_iron[1]
+        mz = (az_pkt["mz"] - self._hard_iron[2]) * self._soft_iron[2]
+        temp_c = az_pkt["temp_c"] if az_pkt["temp_c"] is not None else el_pkt["temp_c"]
 
-        # (1) Integrasi pembacaan magnetometer untuk azimuth dengan kompensasi kemiringan (tilt compensation)
+        # Tilt-compensated compass & CW conversion aligned with fix-compas.py / az_el_controller.py
         try:
-            roll_rad = math.radians(roll)
-            pitch_rad = math.radians(pitch)
-
-            # Transformasi NED/NWD asumsi standar
+            roll_tilt, pitch_tilt = roll, pitch
+            if abs(ay) + abs(az_acc) > 1e-6:
+                roll_tilt = math.degrees(math.atan2(ay, az_acc))
+            if abs(ax) + abs(az_acc) > 1e-6:
+                pitch_tilt = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az_acc * az_acc)))
+            roll_rad = math.radians(roll_tilt)
+            pitch_rad = math.radians(pitch_tilt)
             X_h = mx * math.cos(pitch_rad) + mz * math.sin(pitch_rad)
             Y_h = mx * math.sin(roll_rad) * math.sin(pitch_rad) + my * math.cos(roll_rad) - mz * math.sin(roll_rad) * math.cos(pitch_rad)
-
-            azimuth_rad = math.atan2(-Y_h, X_h)
-            azimuth = math.degrees(azimuth_rad)
-            if azimuth < 0:
-                azimuth += 360.0
-            
-            compass = self._wrap_360(azimuth + self.cfg.declination_deg)
+            heading = (math.degrees(math.atan2(Y_h, X_h)) + 360.0) % 360.0
+            compass = self._wrap_360(360.0 - heading + az_offset_deg)
         except Exception:
-            compass = self._wrap_360(yaw + self.cfg.declination_deg)
+            compass = self._wrap_360(360.0 - (yaw % 360.0) + az_offset_deg)
 
-        # Azimuth utama menggunakan nilai mentah YAW + kalibrasi deklinasi (bukan lagi full magnetometer compass)
-        az = self._wrap_360(yaw + self.cfg.declination_deg)
-        
-        # (2) Kalkulasi elevasi absolut menggunakan accelerometer. 
-        # (Meskipun WT901 sudah memberikan pitch yang difusi gravitasi setelah reset_zero_point,
-        # kita tambahkan verifikasi accelerometer murni sebagai cadangan / log).
-        # el_acc = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az_acc*az_acc)))
-        
-        el = max(-180.0, min(180.0, roll))
+        az = self._wrap_360(360.0 - (yaw % 360.0) + az_offset_deg)
+        el_roll = float(el_pkt["roll"])
+        el = max(0.0, min(180.0, (el_roll - 90.0) + el_offset_deg))
+
         sample = WT901Sample(
             timestamp=time.time(),
             az_deg=az,
             el_deg=el,
             compass_deg=compass,
-            roll_deg=roll,
+            roll_deg=el_roll,
             pitch_deg=pitch,
             yaw_deg=yaw,
             accel_g=(ax, ay, az_acc),
@@ -3086,31 +3107,31 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Motor 1 (sesuai mapping user)
+    # Motor 1 (AZ)
     cfg_m1 = StepperConfig(
         step_pin=17,  # PUL+
         dir_pin=27,   # DIR+
         en_pin=22,    # EN+
         steps_per_rev=200,
-        microstep=2,   # sesuai konfigurasi: microstep 2/A
+        microstep=8,
         max_speed_sps=2200.0,
         accel_sps2=3000.0,
-        # Default AZ dibuka full-rotation; batasi via perintah "limit az" jika diperlukan.
         soft_limit_min_deg=None,
         soft_limit_max_deg=None,
         az_wrap_enabled=True,
+        circular_axis=True,
     )
-    # Motor 2 (sesuai mapping user)
+    # Motor 2 (EL)
     cfg_m2 = StepperConfig(
         step_pin=23,  # PUL+
         dir_pin=24,   # DIR+
         en_pin=25,    # EN+
         steps_per_rev=200,
-        microstep=2,   # sesuai konfigurasi: microstep 2/A
+        microstep=8,
         max_speed_sps=2200.0,
         accel_sps2=3000.0,
         soft_limit_min_deg=0.0,
-        soft_limit_max_deg=180.0,
+        soft_limit_max_deg=90.0,
         axis_gear_ratio=max(1e-9, float(args.el_gear_ratio)),
     )
     logging.getLogger("motorPID.cfg").info(
@@ -3278,8 +3299,8 @@ def main():
                 return
             print(
                 "\n=== DUAL TB6600 KEYBOARD STEPPER CONTROL ===\n"
-                "Motor 1 (GPIO17/27/22): Arrow Left/Right atau A/D\n"
-                "Motor 2 (GPIO23/24/25): Arrow Up/Down  atau W/S\n"
+                "Motor 1 AZ (GPIO17/27/22): Arrow Left/Right atau A/D\n"
+                "Motor 2 EL (GPIO23/24/25): Arrow Up/Down  atau W/S\n"
                 "AZ default: full rotation (tanpa soft-limit)\n"
                 "Space            : Smooth stop kedua motor\n"
                 "E                : Emergency stop kedua motor (latch)\n"
@@ -3288,87 +3309,95 @@ def main():
                 "1/2/3/4/5       : Set microstep kedua motor = 1/2/4/8/16\n"
                 "Q               : Quit\n"
             )
-            while True:
-                now = time.time()
-                if now - last_report > 0.25:
-                    st1 = motor_1.get_status()
-                    st2 = motor_2.get_status()
-                    imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
-                    el_imu = el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None
-                    if imu:
-                        az_raw = parse_float_safe(imu.get("azimuth_deg"), None)
-                        az_pos = (az_raw % 360.0) if az_raw is not None else (st1["position_deg"] % 360.0)
-                        pose_tag = "IMU_AZ/IMU_EL"
-                    else:
-                        az_pos = st1["position_deg"] % 360.0
-                        pose_tag = "IMU_EL_ONLY" if el_imu is not None else "MOTOR"
-                    el_pos = parse_float_safe(imu.get("elevation_deg"), None) if imu else None
-                    if el_pos is None:
-                        el_pos = float(el_imu) if el_imu is not None else st2["position_deg"]
-                    fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
-                    fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
-                    imu_txt = ""
-                    if imu:
-                        imu_txt = f" | HDG={parse_float_safe(imu.get('compass_deg'), 0.0):6.2f}"
-                    sys.stdout.write(
-                        f"\rM1 POS={az_pos:7.2f} SPD={st1['current_speed_sps']:7.1f} "
-                        f"| M2 POS={el_pos:7.2f} SPD={st2['current_speed_sps']:7.1f} "
-                        f"| SRC={pose_tag} MS={st1['microstep']:2d}{fault1}{fault2}{imu_txt}       "
-                    )
-                    sys.stdout.flush()
-                    last_report = now
+            with RawTerminal():
+                while True:
+                    now = time.time()
+                    if now - last_report > 0.20:
+                        st1 = motor_1.get_status()
+                        st2 = motor_2.get_status()
+                        imu = imu_reader.get_latest_dict() if imu_reader is not None else {}
+                        el_imu = el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None
+                        if imu:
+                            az_raw = parse_float_safe(imu.get("azimuth_deg"), None)
+                            az_pos = (az_raw % 360.0) if az_raw is not None else (st1["position_deg"] % 360.0)
+                            pose_tag = "IMU_AZ/IMU_EL"
+                        else:
+                            az_pos = st1["position_deg"] % 360.0
+                            pose_tag = "IMU_EL_ONLY" if el_imu is not None else "MOTOR"
+                        el_pos = parse_float_safe(imu.get("elevation_deg"), None) if imu else None
+                        if el_pos is None:
+                            el_pos = float(el_imu) if el_imu is not None else st2["position_deg"]
+                        fault1 = f" F1={st1['fault_msg']}" if st1["fault_latched"] else ""
+                        fault2 = f" F2={st2['fault_msg']}" if st2["fault_latched"] else ""
+                        imu_txt = ""
+                        if imu:
+                            imu_txt = (
+                                f" | IMU AZ={az_pos:6.2f} EL={el_pos:6.2f} "
+                                f"HDG={parse_float_safe(imu.get('compass_deg'), 0.0):6.2f} "
+                                f"YAW={parse_float_safe(imu.get('yaw_deg'), 0.0):6.2f} "
+                                f"R_EL={parse_float_safe(imu.get('roll_deg'), 0.0):6.2f}"
+                            )
+                        sys.stdout.write(
+                            f"\rM1 POS={az_pos:7.2f} SPD={st1['current_speed_sps']:7.1f} "
+                            f"| M2 POS={el_pos:7.2f} SPD={st2['current_speed_sps']:7.1f} "
+                            f"| SRC={pose_tag} MS={st1['microstep']:2d}{fault1}{fault2}{imu_txt}       "
+                        )
+                        sys.stdout.flush()
+                        last_report = now
 
-                key = get_key()
+                    key = get_key_nonblocking(0.03)
+                    if key is None:
+                        continue
 
-                if key in ("\x1b[C", "d", "D"):
-                    motor_1.set_target_speed(abs(command_speed))
-                elif key in ("\x1b[D", "a", "A"):
-                    motor_1.set_target_speed(-abs(command_speed))
-                elif key in ("\x1b[A", "w", "W"):
-                    imu_cur = imu_reader.get_latest_dict() if imu_reader is not None else {}
-                    command_el_with_bounds(
-                        motor_2,
-                        command_speed,
-                        +1,
-                        el_min=0.0,
-                        el_max=180.0,
-                        current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
-                    )
-                elif key in ("\x1b[B", "s", "S"):
-                    imu_cur = imu_reader.get_latest_dict() if imu_reader is not None else {}
-                    command_el_with_bounds(
-                        motor_2,
-                        command_speed,
-                        -1,
-                        el_min=0.0,
-                        el_max=180.0,
-                        current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
-                    )
-                elif key == " ":
-                    motor_1.stop_smooth()
-                    motor_2.stop_smooth()
-                elif key in ("e", "E"):
-                    motor_1.emergency_stop("Emergency stop keyboard")
-                    motor_2.emergency_stop("Emergency stop keyboard")
-                elif key in ("r", "R"):
-                    motor_1.reset_fault()
-                    motor_2.reset_fault()
-                elif key == "+":
-                    command_speed = min(cfg_m1.max_speed_sps, command_speed + 100.0)
-                elif key == "-":
-                    command_speed = max(50.0, command_speed - 100.0)
-                elif key == "1":
-                    motor_1.set_microstep(1); motor_2.set_microstep(1)
-                elif key == "2":
-                    motor_1.set_microstep(2); motor_2.set_microstep(2)
-                elif key == "3":
-                    motor_1.set_microstep(4); motor_2.set_microstep(4)
-                elif key == "4":
-                    motor_1.set_microstep(8); motor_2.set_microstep(8)
-                elif key == "5":
-                    motor_1.set_microstep(16); motor_2.set_microstep(16)
-                elif key in ("q", "Q"):
-                    break
+                    if key in ("\x1b[C", "d", "D"):
+                        motor_1.set_target_speed(abs(command_speed))
+                    elif key in ("\x1b[D", "a", "A"):
+                        motor_1.set_target_speed(-abs(command_speed))
+                    elif key in ("\x1b[A", "w", "W"):
+                        imu_cur = imu_reader.get_latest_dict() if imu_reader is not None else {}
+                        command_el_with_bounds(
+                            motor_2,
+                            command_speed,
+                            +1,
+                            el_min=0.0,
+                            el_max=180.0,
+                            current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
+                        )
+                    elif key in ("\x1b[B", "s", "S"):
+                        imu_cur = imu_reader.get_latest_dict() if imu_reader is not None else {}
+                        command_el_with_bounds(
+                            motor_2,
+                            command_speed,
+                            -1,
+                            el_min=0.0,
+                            el_max=180.0,
+                            current_el_deg=(float(imu_cur["elevation_deg"]) if imu_cur else (el_imu_tracker.get_el_deg() if el_imu_tracker is not None else None)),
+                        )
+                    elif key == " ":
+                        motor_1.stop_smooth()
+                        motor_2.stop_smooth()
+                    elif key in ("e", "E"):
+                        motor_1.emergency_stop("Emergency stop keyboard")
+                        motor_2.emergency_stop("Emergency stop keyboard")
+                    elif key in ("r", "R"):
+                        motor_1.reset_fault()
+                        motor_2.reset_fault()
+                    elif key == "+":
+                        command_speed = min(cfg_m1.max_speed_sps, command_speed + 100.0)
+                    elif key == "-":
+                        command_speed = max(50.0, command_speed - 100.0)
+                    elif key == "1":
+                        motor_1.set_microstep(1); motor_2.set_microstep(1)
+                    elif key == "2":
+                        motor_1.set_microstep(2); motor_2.set_microstep(2)
+                    elif key == "3":
+                        motor_1.set_microstep(4); motor_2.set_microstep(4)
+                    elif key == "4":
+                        motor_1.set_microstep(8); motor_2.set_microstep(8)
+                    elif key == "5":
+                        motor_1.set_microstep(16); motor_2.set_microstep(16)
+                    elif key in ("q", "Q"):
+                        break
     except KeyboardInterrupt:
         pass
     except Exception as exc:

@@ -1681,29 +1681,42 @@ class RotctlServer:
         if cmd_l in ("_", "\\get_info"):
             return "AZ/EL WT901 TB6600 rotctl bridge\n", False
 
+        if cmd_l in ("\\dump_state", "dump_state"):
+            return (
+                "1\n"
+                "1\n"
+                "min_az=-180.000000\n"
+                "max_az=450.000000\n"
+                "min_el=0.000000\n"
+                "max_el=90.000000\n"
+                "south_zero=0\n"
+                "rot_type=AzEl\n"
+                "done\n"
+            ), False
+
         # Some clients probe unsupported commands; return generic command-rejected.
         return "RPRT -8\n", False
 
 
 def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
-    # Motor 1 (AZ) - switched to driver port set that was previously EL
+    # Motor 1 (AZ)
     cfg_m1 = StepperConfig(
-        step_pin=23,  # PUL+
-        dir_pin=24,   # DIR+
-        en_pin=25,    # EN+
+        step_pin=17,  # PUL+
+        dir_pin=27,   # DIR+
+        en_pin=22,    # EN+
         steps_per_rev=200,
         microstep=8,
-        max_speed_sps=1500.0,
+        max_speed_sps=2200.0,
         accel_sps2=3000.0,
         soft_limit_min_deg=None,
         soft_limit_max_deg=None,
         circular_axis=True,
     )
-    # Motor 2 (EL) - switched to driver port set that was previously AZ
+    # Motor 2 (EL)
     cfg_m2 = StepperConfig(
-        step_pin=17,  # PUL+
-        dir_pin=27,   # DIR+
-        en_pin=22,    # EN+
+        step_pin=23,  # PUL+
+        dir_pin=24,   # DIR+
+        en_pin=25,    # EN+
         steps_per_rev=200,
         microstep=8,
         max_speed_sps=2200.0,

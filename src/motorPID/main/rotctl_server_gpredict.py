@@ -91,15 +91,28 @@ class GpredictRotctlServer:
                         continue
                     logging.info("RX %s:%s -> %s", addr[0], addr[1], cmd)
 
-                    if cmd.startswith("P"):
+                    if cmd.startswith("P") or cmd.lower().startswith("\\set_pos"):
                         self._cmd_set_target(f, cmd)
-                    elif cmd == "p":
+                    elif cmd in ("p", "\\get_pos"):
                         self._cmd_get_position(f, addr)
-                    elif cmd == "S":
+                    elif cmd in ("S", "s", "\\stop"):
                         self._cmd_stop(f)
-                    elif cmd == "R":
+                    elif cmd in ("R", "r", "\\reset"):
                         self._cmd_reset_fault(f)
-                    elif cmd == "Q":
+                    elif cmd in ("_", "\\get_info"):
+                        f.write(b"AZ/EL WT901 TB6600 rotctl bridge\n")
+                    elif cmd.lower() in ("\\dump_state", "dump_state"):
+                        f.write(
+                            b"1\n1\n"
+                            b"min_az=-180.000000\n"
+                            b"max_az=450.000000\n"
+                            b"min_el=0.000000\n"
+                            b"max_el=90.000000\n"
+                            b"south_zero=0\n"
+                            b"rot_type=AzEl\n"
+                            b"done\n"
+                        )
+                    elif cmd in ("Q", "q", "\\quit"):
                         f.write(b"RPRT 0\n")
                         break
                     else:
