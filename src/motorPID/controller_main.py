@@ -84,7 +84,7 @@ AZ_STALE_MIN_CMD_SPS = 80.0
 AZ_STALE_CONFIRM_CYCLES = 40
 AUTO_RESET_ON_STALE_FAULT = True
 AUTO_RESET_COOLDOWN_S = 1.0
-AZ_SOFT_LIMIT_DEG = 250.0
+AZ_SOFT_LIMIT_DEG = 180.0
 EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
 TRACKING_EPS_DEG = 0.1
@@ -1814,12 +1814,12 @@ class KeyboardAzElController:
         self._el_until = 0.0
         self._msg = ""
         self._last_pkt = None
-        # Disable stepper soft limits in manual keyboard jog mode so arrow keys
-        # can always move both axes freely (even when EL is at/below 0 deg).
+        # AZ adalah sumbu circular dengan limit crossing di AZ_SOFT_LIMIT_DEG (180 deg),
+        # sedangkan EL dibatasi software limit switch pada 0..90 deg.
         self.motor_az.cfg.soft_limit_min_deg = None
         self.motor_az.cfg.soft_limit_max_deg = None
-        self.motor_el.cfg.soft_limit_min_deg = None
-        self.motor_el.cfg.soft_limit_max_deg = None
+        self.motor_el.cfg.soft_limit_min_deg = EL_MIN_DEG
+        self.motor_el.cfg.soft_limit_max_deg = EL_MAX_DEG
 
     # ---------------- public ----------------
     def run(self):
@@ -1888,6 +1888,22 @@ class KeyboardAzElController:
         az_dir = self._az_dir if now < self._az_until else 0
         el_dir = self._el_dir if now < self._el_until else 0
 
+        # --- limit switch AZ di 180 deg ---
+        if az_dir != 0 and curr_az is not None:
+            ahead = (curr_az + az_dir * 2.0) % 360.0
+            if self.az_limit._crosses_limit(curr_az, ahead, az_dir):
+                az_dir = 0
+                self._msg = f"AZ LIMIT SWITCH {AZ_SOFT_LIMIT_DEG:.0f} deg: gerak ke arah ini diblokir"
+
+        # --- limit switch EL di 0 dan 90 deg ---
+        if curr_el is not None:
+            if el_dir > 0 and curr_el >= EL_MAX_DEG - TRACKING_EPS_DEG:
+                el_dir = 0
+                self._msg = f"EL LIMIT SWITCH ATAS ({EL_MAX_DEG:.0f} deg)"
+            elif el_dir < 0 and curr_el <= EL_MIN_DEG + TRACKING_EPS_DEG:
+                el_dir = 0
+                self._msg = f"EL LIMIT SWITCH BAWAH ({EL_MIN_DEG:.0f} deg)"
+
         self.motor_az.set_target_speed(az_dir * self.speed * KEY_AZ_SIGN)
         self.motor_el.set_target_speed(el_dir * self.speed * KEY_EL_SIGN)
         if az_dir == 0:
@@ -1937,7 +1953,7 @@ class KeyboardAzElController:
             )
             put(9, f"Sumber AZ: {pkt['src']} | Last Saved (Worm Gear): {saved_txt}")
 
-        put(11, f"Jog speed : {self.speed:6.0f} sps")
+        put(11, f"Jog speed : {self.speed:6.0f} sps | Limit Switch: AZ={AZ_SOFT_LIMIT_DEG:.0f} deg, EL={EL_MIN_DEG:.0f}..{EL_MAX_DEG:.0f} deg")
         put(12, f"Motor AZ  : cmd={st_az['target_speed_sps']:8.1f}  act={st_az['current_speed_sps']:8.1f} sps"
                 f"  fault={'YA: ' + st_az['fault_msg'] if st_az['fault_latched'] else 'tidak'}")
         put(13, f"Motor EL  : cmd={st_el['target_speed_sps']:8.1f}  act={st_el['current_speed_sps']:8.1f} sps"
