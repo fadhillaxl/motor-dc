@@ -95,6 +95,8 @@ DEFAULT_AZ_OFFSET_DEG = 0.0
 DEFAULT_EL_OFFSET_DEG = 0.0
 OFFSET_FILE = os.path.join(BASE_DIR, "wt901_offsets.json")
 MAIN_OFFSET_FILE = os.path.join(BASE_DIR, "main", "wt901_offsets.json")
+POS_SAVE_MIN_DELTA_DEG = 0.05
+POS_SAVE_MIN_INTERVAL_S = 0.20
 AZ_CONTROL_MIN_SPS = 160.0
 AZ_CONTROL_MIN_ERR_DEG = 2.0
 
@@ -111,10 +113,12 @@ KEY_AZ_SIGN = 1.0             # ubah ke -1.0 jika arah AZ terbalik terhadap sens
 KEY_EL_SIGN = 1.0             # ubah ke -1.0 jika arah EL terbalik terhadap sensor
 
 
-def load_offsets() -> tuple[float, float]:
-    """Load shared AZ/EL offsets from JSON file with safe fallback."""
+def load_state() -> tuple[float, float, float | None, float | None]:
+    """Load shared AZ/EL offsets and last saved AZ/EL degrees from JSON file."""
     az = float(DEFAULT_AZ_OFFSET_DEG)
     el = float(DEFAULT_EL_OFFSET_DEG)
+    last_az: float | None = None
+    last_el: float | None = None
     for path in (OFFSET_FILE, MAIN_OFFSET_FILE):
         try:
             if os.path.exists(path):
@@ -122,31 +126,54 @@ def load_offsets() -> tuple[float, float]:
                     data = json.load(f)
                 az = float(data.get("az_offset_deg", az))
                 el = float(data.get("el_offset_deg", el))
+                if data.get("last_az_deg") is not None:
+                    last_az = float(data["last_az_deg"]) % 360.0
+                if data.get("last_el_deg") is not None:
+                    last_el = float(data["last_el_deg"])
                 break
         except Exception:
             # Keep controller running with defaults if offset file is missing/corrupt.
             pass
+    return az, el, last_az, last_el
+
+
+def load_offsets() -> tuple[float, float]:
+    """Load shared AZ/EL offsets from JSON file with safe fallback."""
+    az, el, _, _ = load_state()
     return az, el
 
 
-def save_offsets(az_offset_deg: float, el_offset_deg: float) -> None:
-    """Persist AZ/EL offsets to JSON file(s)."""
-    payload = {
+def save_offsets(
+    az_offset_deg: float,
+    el_offset_deg: float,
+    last_az_deg: float | None = None,
+    last_el_deg: float | None = None,
+) -> None:
+    """Persist AZ/EL offsets and last known AZ/EL position to JSON file(s) atomically."""
+    payload: dict = {
         "az_offset_deg": round(float(az_offset_deg) % 360.0, 4),
         "el_offset_deg": round(float(el_offset_deg), 4),
     }
+    if last_az_deg is not None:
+        payload["last_az_deg"] = round(float(last_az_deg) % 360.0, 4)
+    if last_el_deg is not None:
+        payload["last_el_deg"] = round(float(last_el_deg), 4)
+    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
     for path in (OFFSET_FILE, MAIN_OFFSET_FILE):
         try:
             parent = os.path.dirname(path)
             if os.path.isdir(parent):
-                with open(path, "w", encoding="utf-8") as f:
+                tmp_path = f"{path}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(payload, f, indent=2)
                     f.write("\n")
+                os.replace(tmp_path, path)
         except Exception:
             pass
 
 
-AZ_OFFSET_DEG, EL_OFFSET_DEG = load_offsets()
+AZ_OFFSET_DEG, EL_OFFSET_DEG, LAST_AZ_DEG, LAST_EL_DEG = load_state()
 
 
 @dataclass
@@ -968,6 +995,17 @@ class WT901AxisReader:
 
     def set_az_zero(self, current_raw_yaw_cw: float | None = None) -> float | None:
         """Set posisi saat ini sebagai 0.00 deg (Utara) untuk Yaw CW & Azimuth."""
+        return self.restore_az_position(0.0, current_raw_yaw_cw=current_raw_yaw_cw)
+
+    def restore_az_position(
+        self,
+        saved_az_deg: float,
+        current_raw_yaw_cw: float | None = None,
+    ) -> float | None:
+        """
+        Sinkronkan posisi Azimuth ke derajat tertentu (mis. 0.00 deg saat Set Zero
+        atau last_az_deg saat baru menyala karena worm gear tidak bergerak saat mati).
+        """
         raw_yaw_cw = current_raw_yaw_cw
         if raw_yaw_cw is None:
             if self.last_raw_yaw_cw is not None:
@@ -979,11 +1017,12 @@ class WT901AxisReader:
         if raw_yaw_cw is None:
             return None
         raw_yaw_cw = float(raw_yaw_cw) % 360.0
-        self.zero_yaw_cw = raw_yaw_cw
-        self.az_offset_deg = (-raw_yaw_cw) % 360.0
-        self.prev_yaw_cw = 0.0
-        self.az_deg = 0.0
-        self.last_az = 0.0
+        target_az = float(saved_az_deg) % 360.0
+        self.zero_yaw_cw = (raw_yaw_cw - target_az) % 360.0
+        self.az_offset_deg = (-self.zero_yaw_cw) % 360.0
+        self.prev_yaw_cw = target_az
+        self.az_deg = target_az
+        self.last_az = target_az
         return self.zero_yaw_cw
 
 
@@ -1013,11 +1052,17 @@ class WT901DualAddressReader:
             el_offset_deg=el_offset_deg,
             shared_device=self.az_reader.device,
         )
+        self.last_saved_az: float | None = LAST_AZ_DEG
+        self.last_saved_el: float | None = LAST_EL_DEG
+        self._latest_az: float | None = LAST_AZ_DEG
+        self._latest_el: float | None = LAST_EL_DEG
+        self._last_save_t: float = 0.0
 
     def open(self):
         self.az_reader.open()
 
     def close(self):
+        self.save_current_position(force=True)
         self.az_reader.close()
 
     def set_quiet(self, quiet: bool):
@@ -1025,11 +1070,75 @@ class WT901DualAddressReader:
         self.az_reader.quiet = bool(quiet)
         self.el_reader.quiet = bool(quiet)
 
+    def save_current_position(
+        self,
+        az_deg: float | None = None,
+        el_deg: float | None = None,
+        force: bool = False,
+    ) -> bool:
+        """
+        Simpan derajat AZ dan EL terakhir ke disk setiap ada pergerakan.
+        Saat force=False, tulis ke disk jika ada perubahan >= POS_SAVE_MIN_DELTA_DEG
+        dengan jeda minimum POS_SAVE_MIN_INTERVAL_S.
+        """
+        az = self._latest_az if az_deg is None else float(az_deg) % 360.0
+        el = self._latest_el if el_deg is None else float(el_deg)
+        if az is None or el is None:
+            return False
+
+        self._latest_az = az
+        self._latest_el = el
+        now = time.time()
+
+        if not force:
+            if (
+                self.last_saved_az is not None
+                and self.last_saved_el is not None
+                and abs(angle_diff(az, self.last_saved_az)) < POS_SAVE_MIN_DELTA_DEG
+                and abs(el - self.last_saved_el) < POS_SAVE_MIN_DELTA_DEG
+            ):
+                return False
+            if (now - self._last_save_t) < POS_SAVE_MIN_INTERVAL_S:
+                return False
+
+        save_offsets(
+            self.az_reader.az_offset_deg,
+            self.el_reader.el_offset_deg,
+            last_az_deg=az,
+            last_el_deg=el,
+        )
+        self.last_saved_az = az
+        self.last_saved_el = el
+        self._last_save_t = now
+        return True
+
     def set_az_zero(self, current_raw_yaw_cw: float | None = None) -> float | None:
-        """Set titik 0.00 deg (Utara) pada posisi saat ini dan simpan offset ke file."""
+        """Set titik 0.00 deg (Utara) pada posisi saat ini dan simpan ke file."""
         zero_yaw = self.az_reader.set_az_zero(current_raw_yaw_cw=current_raw_yaw_cw)
         if zero_yaw is not None:
-            save_offsets(self.az_reader.az_offset_deg, self.el_reader.el_offset_deg)
+            el_now = self._latest_el if self._latest_el is not None else 0.0
+            self.save_current_position(az_deg=0.0, el_deg=el_now, force=True)
+        return zero_yaw
+
+    def restore_last_position(
+        self,
+        last_az_deg: float,
+        last_el_deg: float | None = None,
+        current_raw_yaw_cw: float | None = None,
+    ) -> float | None:
+        """
+        Pulihkan derajat AZ terakhir saat startup agar tidak perlu Set Zero
+        setiap mati-nyala (worm gear menjaga posisi mekanik tetap sama).
+        """
+        zero_yaw = self.az_reader.restore_az_position(
+            saved_az_deg=last_az_deg,
+            current_raw_yaw_cw=current_raw_yaw_cw,
+        )
+        if zero_yaw is not None:
+            el_val = self._latest_el if last_el_deg is None else float(last_el_deg)
+            if el_val is None:
+                el_val = 0.0
+            self.save_current_position(az_deg=float(last_az_deg) % 360.0, el_deg=el_val, force=True)
         return zero_yaw
 
     @staticmethod
@@ -1057,7 +1166,12 @@ class WT901DualAddressReader:
             az_pkt = self.az_reader.read()
             el_pkt = self.el_reader.read()
             if az_pkt is not None and el_pkt is not None:
-                return self._merge_packets(az_pkt, el_pkt, self.az_addr, self.el_addr)
+                merged = self._merge_packets(az_pkt, el_pkt, self.az_addr, self.el_addr)
+                # Auto-save last AZ & EL degree setiap ada perubahan posisi (worm gear lock)
+                self.save_current_position(az_deg=merged["az"], el_deg=merged["el"], force=False)
+                merged["saved_az"] = self.last_saved_az
+                merged["saved_el"] = self.last_saved_el
+                return merged
             time.sleep(max(0.0, float(delay_s)))
         return None
 
@@ -1314,6 +1428,8 @@ class ClosedLoopAzElController:
         if end_packet is None:
             raise RuntimeError("Gagal membaca posisi akhir AZ/EL dari WT901.")
         end_az, end_el, _, _ = end_packet
+        if hasattr(self.wt, "save_current_position"):
+            self.wt.save_current_position(az_deg=end_az, el_deg=end_el, force=True)
 
         end_err_az = angle_diff(target_az_deg, end_az)
         end_err_el = target_el_deg - end_el
@@ -1445,8 +1561,12 @@ class RealtimeAzElController:
             self._target_az = self._curr_az
             self._target_el = self._curr_el
             self._hold_follow = True
+            curr_az = self._curr_az
+            curr_el = self._curr_el
         self.motor_az.stop_smooth()
         self.motor_el.stop_smooth()
+        if hasattr(self.wt, "save_current_position"):
+            self.wt.save_current_position(az_deg=curr_az, el_deg=curr_el, force=True)
         self.logger.info("Stop motion requested.")
 
     def reset_from_sensor(self, attempts: int = 40, delay_s: float = 0.05) -> tuple[bool, str]:
@@ -1590,6 +1710,9 @@ class RealtimeAzElController:
             if in_tol:
                 self.motor_az.stop_smooth()
                 self.motor_el.stop_smooth()
+                if self._last_cmd_az_dir != 0 and hasattr(self.wt, "save_current_position"):
+                    self.wt.save_current_position(az_deg=curr_az, el_deg=curr_el, force=True)
+                self._last_cmd_az_dir = 0
                 self.recovery.on_cycle_ok()
             else:
                 cmd_az = self._speed_from_error(err_az, CONTROL_KP_AZ, max_speed_az)
@@ -1704,6 +1827,8 @@ class KeyboardAzElController:
         self._el_until = 0.0
         self.motor_az.stop_smooth()
         self.motor_el.stop_smooth()
+        if hasattr(self.wt, "save_current_position"):
+            self.wt.save_current_position(force=True)
 
     def _handle_key(self, key) -> bool:
         """Return False jika user minta keluar."""
@@ -1753,6 +1878,7 @@ class KeyboardAzElController:
 
     def _apply_commands(self, curr_az: float | None = None, curr_el: float | None = None):
         now = time.time()
+        was_moving = (self._az_dir != 0) or (self._el_dir != 0)
         az_dir = self._az_dir if now < self._az_until else 0
         el_dir = self._el_dir if now < self._el_until else 0
 
@@ -1762,6 +1888,8 @@ class KeyboardAzElController:
             self._az_dir = 0
         if el_dir == 0:
             self._el_dir = 0
+        if was_moving and az_dir == 0 and el_dir == 0 and hasattr(self.wt, "save_current_position"):
+            self.wt.save_current_position(az_deg=curr_az, el_deg=curr_el, force=True)
 
     def _draw(self, stdscr, pkt):
         stdscr.erase()
@@ -1794,7 +1922,14 @@ class KeyboardAzElController:
                    f"{pkt.get('el_roll_raw', float('nan')):8.2f} / {pkt.get('el_pitch_raw', float('nan')):8.2f} deg")
             put(8, f"[EL 0x{pkt.get('el_addr', 0):02X}] Tilt R/P   : "
                    f"{pkt.get('el_roll_tilt', float('nan')):8.2f} / {pkt.get('el_pitch_tilt', float('nan')):8.2f} deg (dari ACC)")
-            put(9, f"Sumber AZ: {pkt['src']}")
+            saved_az = pkt.get("saved_az", getattr(self.wt, "last_saved_az", None))
+            saved_el = pkt.get("saved_el", getattr(self.wt, "last_saved_el", None))
+            saved_txt = (
+                f"AZ={saved_az:.2f} deg, EL={saved_el:.2f} deg"
+                if (saved_az is not None and saved_el is not None)
+                else "-"
+            )
+            put(9, f"Sumber AZ: {pkt['src']} | Last Saved (Worm Gear): {saved_txt}")
 
         put(11, f"Jog speed : {self.speed:6.0f} sps")
         put(12, f"Motor AZ  : cmd={st_az['target_speed_sps']:8.1f}  act={st_az['current_speed_sps']:8.1f} sps"
@@ -2122,6 +2257,19 @@ def main():
         if args.zero_az:
             zero_yaw = wt.set_az_zero(current_raw_yaw_cw=az_boot.get("raw_yaw_cw"))
             logger.info("Startup AZ zero (Utara=0.00 deg) set at raw Yaw CW=%.2f deg", zero_yaw or 0.0)
+        elif LAST_AZ_DEG is not None:
+            zero_yaw = wt.restore_last_position(
+                last_az_deg=LAST_AZ_DEG,
+                last_el_deg=el_boot["el"] if LAST_EL_DEG is None else LAST_EL_DEG,
+                current_raw_yaw_cw=az_boot.get("raw_yaw_cw"),
+            )
+            logger.info(
+                "Restored last saved worm-gear position | last_az=%.2f deg last_el=%.2f deg (raw Yaw CW=%.2f -> Zero@%.2f)",
+                LAST_AZ_DEG,
+                el_boot["el"] if LAST_EL_DEG is None else LAST_EL_DEG,
+                az_boot.get("raw_yaw_cw", 0.0),
+                zero_yaw or 0.0,
+            )
 
         # Sync internal motor positions from absolute sensor to avoid false soft-limit trips.
         boot_data = wt.read_with_retry(attempts=40, delay_s=0.05)
