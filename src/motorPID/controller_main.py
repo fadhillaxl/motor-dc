@@ -89,7 +89,7 @@ EL_MIN_DEG = 0.0
 EL_MAX_DEG = 90.0
 TRACKING_EPS_DEG = 0.1
 LOG_FILE = os.path.join(BASE_DIR, "az_el_closed_loop.log")
-ROTCTL_DEFAULT_HOST = "127.0.0.1"
+ROTCTL_DEFAULT_HOST = "0.0.0.0"
 ROTCTL_DEFAULT_PORT = 4533
 DEFAULT_AZ_OFFSET_DEG = 0.0
 DEFAULT_EL_OFFSET_DEG = 0.0
@@ -2116,9 +2116,9 @@ class RotctlServer:
 def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
     # Motor 1 (AZ)
     cfg_m1 = StepperConfig(
-        step_pin=17,  # PUL+
-        dir_pin=27,   # DIR+
-        en_pin=22,    # EN+
+        step_pin=23,  # PUL+
+        dir_pin=24,   # DIR+
+        en_pin=25,    # EN+
         steps_per_rev=200,
         microstep=8,
         max_speed_sps=2200.0,
@@ -2129,9 +2129,9 @@ def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
     )
     # Motor 2 (EL)
     cfg_m2 = StepperConfig(
-        step_pin=23,  # PUL+
-        dir_pin=24,   # DIR+
-        en_pin=25,    # EN+
+        step_pin=17,  # PUL+
+        dir_pin=27,   # DIR+
+        en_pin=22,    # EN+
         steps_per_rev=200,
         microstep=8,
         max_speed_sps=2200.0,
