@@ -964,8 +964,9 @@ class WT901AxisReader:
                 az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
 
-            # EL pakai mapping ROLL -> EL: depan=0, atas=90.
+            # EL pakai mapping ROLL (90..180) -> EL (90..0): 180.0 - roll
             el = map_roll_to_el(roll, self.el_offset_deg)
+            el_tilt = map_roll_to_el(roll_tilt, self.el_offset_deg)
 
             return {
                 "roll": roll,
@@ -973,6 +974,7 @@ class WT901AxisReader:
                 "roll_tilt": roll_tilt,
                 "pitch_tilt": pitch_tilt,
                 "el_roll": el,
+                "el_tilt": el_tilt,
                 "raw_yaw_cw": raw_yaw_cw,
                 "yaw_cw": yaw_cw,
                 "delta_yaw_cw": delta_yaw_cw,
@@ -1149,10 +1151,10 @@ class WT901DualAddressReader:
         out = dict(az_pkt)
         out["el"] = float(el_pkt["el"])
         out["el_roll"] = float(el_pkt["el_roll"])
-        # Data IMU mentah sensor EL (untuk ditampilkan di mode keyboard)
-        out["el_roll_raw"] = float(el_pkt["roll"])
+        # Tampilkan Roll & Tilt Roll sensor EL yang sudah dikonversi (180.00 - roll)
+        out["el_roll_raw"] = float(el_pkt["el_roll"])
         out["el_pitch_raw"] = float(el_pkt["pitch"])
-        out["el_roll_tilt"] = float(el_pkt["roll_tilt"])
+        out["el_roll_tilt"] = float(el_pkt["el_tilt"])
         out["el_pitch_tilt"] = float(el_pkt["pitch_tilt"])
         out["el_addr"] = int(el_addr)
         out["az_addr"] = int(az_addr)
