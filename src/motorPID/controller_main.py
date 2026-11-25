@@ -755,6 +755,7 @@ class WT901AxisReader:
         self.alpha = alpha
         self.quiet = quiet  # True -> jangan print (dipakai saat curses aktif)
         self.last_az = None
+        self.last_raw_yaw_cw: float | None = None
         self.prev_yaw_cw: float | None = None
         self.az_deg: float | None = None
         self.zero_yaw_cw: float = (-self.az_offset_deg) % 360.0
@@ -907,17 +908,20 @@ class WT901AxisReader:
                     pitch_tilt,
                 )
 
-            yaw_cw = (360.0 - yaw) % 360.0
+            raw_yaw_cw = (360.0 - yaw) % 360.0
+            self.last_raw_yaw_cw = raw_yaw_cw
+            # Yaw CW relatif terhadap titik Set Zero (0.00 deg = Utara)
+            yaw_cw = (raw_yaw_cw - self.zero_yaw_cw) % 360.0
             compass_cw = (
                 (360.0 - compass + self.az_offset_deg) % 360.0
                 if compass is not None
                 else None
             )
 
-            # Hitung azimuth dari akumulasi perubahan (delta) IMU Yaw CW
+            # Hitung azimuth (0.00 deg = Utara) dari akumulasi perubahan (delta) IMU Yaw CW
             if self.prev_yaw_cw is None or self.az_deg is None:
                 delta_yaw_cw = 0.0
-                self.az_deg = (yaw_cw - self.zero_yaw_cw) % 360.0
+                self.az_deg = yaw_cw
             else:
                 delta_yaw_cw = angle_diff(yaw_cw, self.prev_yaw_cw)
                 self.az_deg = (self.az_deg + delta_yaw_cw) % 360.0
@@ -939,6 +943,7 @@ class WT901AxisReader:
                 "roll_tilt": roll_tilt,
                 "pitch_tilt": pitch_tilt,
                 "el_roll": el,
+                "raw_yaw_cw": raw_yaw_cw,
                 "yaw_cw": yaw_cw,
                 "delta_yaw_cw": delta_yaw_cw,
                 "zero_yaw_cw": self.zero_yaw_cw,
@@ -961,22 +966,22 @@ class WT901AxisReader:
             time.sleep(max(0.0, float(delay_s)))
         return None
 
-    def set_az_zero(self, current_yaw_cw: float | None = None) -> float | None:
-        """Set posisi Yaw CW saat ini sebagai titik 0.00 deg Azimuth."""
-        yaw_cw = current_yaw_cw
-        if yaw_cw is None:
-            if self.prev_yaw_cw is not None:
-                yaw_cw = self.prev_yaw_cw
+    def set_az_zero(self, current_raw_yaw_cw: float | None = None) -> float | None:
+        """Set posisi saat ini sebagai 0.00 deg (Utara) untuk Yaw CW & Azimuth."""
+        raw_yaw_cw = current_raw_yaw_cw
+        if raw_yaw_cw is None:
+            if self.last_raw_yaw_cw is not None:
+                raw_yaw_cw = self.last_raw_yaw_cw
             else:
                 pkt = self.read_with_retry(attempts=15, delay_s=0.02)
                 if pkt is not None:
-                    yaw_cw = pkt["yaw_cw"]
-        if yaw_cw is None:
+                    raw_yaw_cw = pkt["raw_yaw_cw"]
+        if raw_yaw_cw is None:
             return None
-        yaw_cw = float(yaw_cw) % 360.0
-        self.zero_yaw_cw = yaw_cw
-        self.prev_yaw_cw = yaw_cw
-        self.az_offset_deg = (-yaw_cw) % 360.0
+        raw_yaw_cw = float(raw_yaw_cw) % 360.0
+        self.zero_yaw_cw = raw_yaw_cw
+        self.az_offset_deg = (-raw_yaw_cw) % 360.0
+        self.prev_yaw_cw = 0.0
         self.az_deg = 0.0
         self.last_az = 0.0
         return self.zero_yaw_cw
@@ -1020,9 +1025,9 @@ class WT901DualAddressReader:
         self.az_reader.quiet = bool(quiet)
         self.el_reader.quiet = bool(quiet)
 
-    def set_az_zero(self, current_yaw_cw: float | None = None) -> float | None:
-        """Set titik 0 Azimuth pada Yaw CW saat ini dan simpan offset ke file."""
-        zero_yaw = self.az_reader.set_az_zero(current_yaw_cw=current_yaw_cw)
+    def set_az_zero(self, current_raw_yaw_cw: float | None = None) -> float | None:
+        """Set titik 0.00 deg (Utara) pada posisi saat ini dan simpan offset ke file."""
+        zero_yaw = self.az_reader.set_az_zero(current_raw_yaw_cw=current_raw_yaw_cw)
         if zero_yaw is not None:
             save_offsets(self.az_reader.az_offset_deg, self.el_reader.el_offset_deg)
         return zero_yaw
@@ -1721,17 +1726,18 @@ class KeyboardAzElController:
         elif key in (ord("-"), ord("_")):
             self.speed = max(KEY_JOG_MIN_SPS, self.speed - KEY_JOG_STEP_SPS)
         elif key in (ord("z"), ord("Z"), ord("0")):
-            curr_yaw_cw = self._last_pkt["yaw_cw"] if self._last_pkt is not None else None
-            zero_yaw = self.wt.set_az_zero(current_yaw_cw=curr_yaw_cw)
+            curr_raw_yaw = self._last_pkt.get("raw_yaw_cw") if self._last_pkt is not None else None
+            zero_yaw = self.wt.set_az_zero(current_raw_yaw_cw=curr_raw_yaw)
             if zero_yaw is None:
-                self._msg = "SET ZERO AZ GAGAL: sensor AZ tidak terbaca"
+                self._msg = "SET ZERO UTARA GAGAL: sensor AZ tidak terbaca"
             else:
                 if self._last_pkt is not None:
                     self._last_pkt["az"] = 0.0
+                    self._last_pkt["yaw_cw"] = 0.0
                     self._last_pkt["delta_yaw_cw"] = 0.0
                     self._last_pkt["zero_yaw_cw"] = zero_yaw
                 self.motor_az.set_position_deg(0.0)
-                self._msg = f"SET ZERO AZ: AZ=0.00 deg (ref Yaw CW={zero_yaw:.2f} deg)"
+                self._msg = f"SET ZERO UTARA: AZ=0.00 deg & Yaw CW=0.00 deg (Utara @ raw {zero_yaw:.2f} deg)"
         elif key in (ord("r"), ord("R")):
             self._stop_all()
             pkt = self.wt.read_with_retry(attempts=40, delay_s=0.05)
@@ -1776,13 +1782,14 @@ class KeyboardAzElController:
         if pkt is None:
             put(3, "IMU: (sensor tidak terbaca)")
         else:
-            put(3, f"AZ (dari dYawCW) : {pkt['az']:8.2f} deg    EL (roll->el) : {pkt['el']:8.2f} deg")
+            put(3, f"AZ (0=Utara)     : {pkt['az']:8.2f} deg    EL (roll->el) : {pkt['el']:8.2f} deg")
             put(4, f"[AZ 0x{pkt.get('az_addr', 0):02X}] Roll/Pitch : {pkt['roll']:8.2f} / {pkt['pitch']:8.2f} deg")
             put(5, f"[AZ 0x{pkt.get('az_addr', 0):02X}] Tilt R/P   : {pkt['roll_tilt']:8.2f} / {pkt['pitch_tilt']:8.2f} deg (dari ACC)")
             cmp_txt = "-" if pkt["compass_cw"] is None else f"{pkt['compass_cw']:.2f}"
             d_yaw = pkt.get("delta_yaw_cw", 0.0)
             z_yaw = pkt.get("zero_yaw_cw", 0.0)
-            put(6, f"[AZ 0x{pkt.get('az_addr', 0):02X}] Yaw CW     : {pkt['yaw_cw']:8.2f} deg    dYaw CW : {d_yaw:+7.2f} deg (Zero@{z_yaw:.2f}) | Cmp: {cmp_txt}")
+            raw_yaw = pkt.get("raw_yaw_cw", pkt["yaw_cw"])
+            put(6, f"[AZ 0x{pkt.get('az_addr', 0):02X}] Yaw CW     : {pkt['yaw_cw']:8.2f} deg    dYaw CW : {d_yaw:+7.2f} deg (Raw:{raw_yaw:.2f} Zero@{z_yaw:.2f}) | Cmp: {cmp_txt}")
             put(7, f"[EL 0x{pkt.get('el_addr', 0):02X}] Roll/Pitch : "
                    f"{pkt.get('el_roll_raw', float('nan')):8.2f} / {pkt.get('el_pitch_raw', float('nan')):8.2f} deg")
             put(8, f"[EL 0x{pkt.get('el_addr', 0):02X}] Tilt R/P   : "
@@ -2113,8 +2120,8 @@ def main():
             raise RuntimeError("Gagal membaca sensor EL pada address 0x50.")
 
         if args.zero_az:
-            zero_yaw = wt.set_az_zero(current_yaw_cw=az_boot["yaw_cw"])
-            logger.info("Startup AZ zero set at Yaw CW=%.2f deg (AZ=0.00 deg)", zero_yaw or 0.0)
+            zero_yaw = wt.set_az_zero(current_raw_yaw_cw=az_boot.get("raw_yaw_cw"))
+            logger.info("Startup AZ zero (Utara=0.00 deg) set at raw Yaw CW=%.2f deg", zero_yaw or 0.0)
 
         # Sync internal motor positions from absolute sensor to avoid false soft-limit trips.
         boot_data = wt.read_with_retry(attempts=40, delay_s=0.05)
