@@ -64,15 +64,15 @@ except Exception as exc:
 POSITION_TOL_DEG = 0.5
 CONTROL_INTERVAL_S = 0.05
 CONTROL_TIMEOUT_S = 120.0
-CONTROL_KP_AZ = 18.0
-CONTROL_KP_EL = 18.0
-CONTROL_MIN_SPS = 100.0
-CONTROL_MAX_SPS_AZ = 300.0
-CONTROL_MAX_SPS_EL = 300.0
+CONTROL_KP_AZ = 35.0
+CONTROL_KP_EL = 35.0
+CONTROL_MIN_SPS = 200.0
+CONTROL_MAX_SPS_AZ = 600.0
+CONTROL_MAX_SPS_EL = 600.0
 CONTROL_DEADZONE_DEG = 0.5
 CONTROL_SOFT_ZONE_DEG = 1.2
-CONTROL_SOFT_MIN_ERR_DEG = 0.8
-CONTROL_SOFT_MIN_SPS = 60.0
+CONTROL_SOFT_MIN_ERR_DEG = 0.6
+CONTROL_SOFT_MIN_SPS = 180.0
 CONTROL_LOCK_HITS = 4
 CONTROL_SETTLE_TIME_S = 0.25
 AZ_WRONG_DIR_MIN_CMD_SPS = 30.0
@@ -81,7 +81,7 @@ AZ_WRONG_DIR_CONFIRM_CYCLES = 6
 AZ_WRONG_DIR_MIN_ERR_DEG = 0.8
 AZ_STALE_DELTA_DEG = 0.01
 AZ_STALE_MIN_CMD_SPS = 80.0
-AZ_STALE_CONFIRM_CYCLES = 6
+AZ_STALE_CONFIRM_CYCLES = 40
 AUTO_RESET_ON_STALE_FAULT = True
 AUTO_RESET_COOLDOWN_S = 1.0
 AZ_SOFT_LIMIT_DEG = 250.0
@@ -97,8 +97,8 @@ OFFSET_FILE = os.path.join(BASE_DIR, "wt901_offsets.json")
 MAIN_OFFSET_FILE = os.path.join(BASE_DIR, "main", "wt901_offsets.json")
 POS_SAVE_MIN_DELTA_DEG = 0.05
 POS_SAVE_MIN_INTERVAL_S = 0.20
-AZ_CONTROL_MIN_SPS = 160.0
-AZ_CONTROL_MIN_ERR_DEG = 2.0
+AZ_CONTROL_MIN_SPS = 260.0
+AZ_CONTROL_MIN_ERR_DEG = 1.0
 
 # =============================
 # KEYBOARD MODE SETTINGS
@@ -319,13 +319,14 @@ class TB6600Stepper:
         with self._lock:
             self._target_speed_sps = 0.0
 
-    def emergency_stop(self, reason: str = "Emergency stop"):
+    def emergency_stop(self, reason: str = "Emergency stop", disable_driver: bool = False):
         with self._lock:
             self._target_speed_sps = 0.0
             self._current_speed_sps = 0.0
             self._fault_latched = True
             self._fault_msg = reason
-        self.enable_driver(False)
+        if disable_driver:
+            self.enable_driver(False)
 
     def reset_fault(self):
         with self._lock:
@@ -2137,6 +2138,7 @@ def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
         step_pin=17,  # PUL+
         dir_pin=27,   # DIR+
         en_pin=22,    # EN+
+        dir_active_high=False,
         steps_per_rev=200,
         microstep=8,
         max_speed_sps=2200.0,
