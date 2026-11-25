@@ -78,10 +78,10 @@ def map_roll_to_el(roll_deg, el_offset_deg=0.0):
     """
     Mapping EL dari roll:
     - roll ~= 90  -> EL = 0 (depan datar)
-    - roll ~= 180 -> EL = 90 (menghadap atas)
+    - roll ~= 0   -> EL = 90 (menghadap atas)
     """
-    el = (float(roll_deg) - 90.0) + float(el_offset_deg)
-    return max(0.0, min(180.0, el))
+    el = (90.0 - float(roll_deg)) + float(el_offset_deg)
+    return max(0.0, min(90.0, el))
 
 # =============================
 # DEVICE

@@ -502,9 +502,9 @@ def map_roll_to_el(roll_deg: float, el_offset_deg: float = 0.0) -> float:
     """
     Map roll to elevation with user convention:
     - roll ~= 90  -> EL = 0 (front)
-    - roll ~= 180 -> EL = 90 (up)
+    - roll ~= 0   -> EL = 90 (up)
     """
-    el = (float(roll_deg) - 90.0) + float(el_offset_deg)
+    el = (90.0 - float(roll_deg)) + float(el_offset_deg)
     return max(EL_MIN_DEG, min(EL_MAX_DEG, el))
 
 
