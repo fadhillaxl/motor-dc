@@ -501,14 +501,14 @@ def angle_lerp(new: float, old: float | None, alpha: float) -> float:
 
 def map_roll_to_el(roll_deg: float, el_offset_deg: float = 0.0) -> float:
     """
-    Map roll (90..180) to elevation (90..0):
-    - roll ~= 90  -> EL = 90 (up)
-    - roll ~= 180 -> EL = 0  (front)
+    Map roll (90..180) to elevation (0..90):
+    - roll ~= 90  -> EL = 0  (front)
+    - roll ~= 180 -> EL = 90 (up)
     """
     r = float(roll_deg)
     if r < -90.0:
         r += 360.0
-    el = (180.0 - r) + float(el_offset_deg)
+    el = (r - 90.0) + float(el_offset_deg)
     return max(EL_MIN_DEG, min(EL_MAX_DEG, el))
 
 
@@ -965,7 +965,7 @@ class WT901AxisReader:
                 az = angle_lerp(az, self.last_az, self.alpha)
             self.last_az = az
 
-            # EL pakai mapping ROLL (90..180) -> EL (90..0): 180.0 - roll
+            # EL pakai mapping ROLL (90..180) -> EL (0..90): roll - 90.0
             el = map_roll_to_el(roll, self.el_offset_deg)
             el_tilt = map_roll_to_el(roll_tilt, self.el_offset_deg)
 
@@ -2154,7 +2154,7 @@ def build_default_motors() -> tuple[TB6600Stepper, TB6600Stepper]:
         step_pin=17,  # PUL+
         dir_pin=27,   # DIR+
         en_pin=22,    # EN+
-        dir_active_high=False,
+        dir_active_high=True,
         steps_per_rev=200,
         microstep=8,
         max_speed_sps=2200.0,
